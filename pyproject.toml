@@ -1,0 +1,22 @@
+[project]
+name = "carton-mcp"
+version = "0.1.0"
+description = "CartOn - Cartographic knowledge graph mapping for concept networks"
+authors = [{name = "HEAVEN System"}]
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "mcp>=1.0.0",
+    "heaven-base>=0.1.0",
+    "neo4j>=5.0.0",
+    "GitPython>=3.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.mcp]
+name = "carton"
+description = "CartOn - Map your knowledge graph with Zettelkasten concepts and Neo4j storage"

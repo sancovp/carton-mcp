@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "carton": {
+      "command": "python",
+      "args": ["/home/GOD/carton_mcp/server.py"],
+      "env": {
+        "GITHUB_PAT": "your_github_personal_access_token_here",
+        "REPO_URL": "https://github.com/your-org/your-wiki-repo",
+        "HEAVEN_DATA_DIR": "/tmp/heaven_data",
+        "BRANCH": "main",
+        "NEO4J_URI": "bolt://host.docker.internal:7687",
+        "NEO4J_USER": "neo4j",
+        "NEO4J_PASSWORD": "password"
+      }
+    }
+  }
+}
