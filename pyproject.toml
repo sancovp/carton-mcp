@@ -1,6 +1,6 @@
 [project]
 name = "carton-mcp"
-version = "0.1.0"
+version = "0.1.36"
 description = "CartOn - Cartographic knowledge graph mapping for concept networks"
 authors = [{name = "HEAVEN System"}]
 readme = "README.md"
