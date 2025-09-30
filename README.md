@@ -1,3 +1,5 @@
+[![Part of STARSYSTEM](https://img.shields.io/badge/Part%20of-STARSYSTEM-blue)](https://github.com/sancovp/starsystem-metarepo)
+
 # Carton MCP
 
 A Zettelkasten-style knowledge management system that provides both a **core library** for concept management and an **MCP server** for agent-driven knowledge operations.
