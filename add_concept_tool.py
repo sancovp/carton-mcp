@@ -25,12 +25,15 @@ def run_git_command(cmd: list[str], cwd: str) -> Dict[str, str]:
             cwd=cwd,
             capture_output=True,
             text=True,
-            check=True
+            check=False  # Changed: removed check=True to prevent false failures
         )
+        # Changed: check return code manually instead of relying on check=True
+        if result.returncode != 0:
+            return {"error": result.stderr.strip()}
         return {"output": result.stdout.strip()}
-    except subprocess.CalledProcessError as e:
-        traceback.print_exc()
-        return {"error": e.stderr.strip()}
+    except Exception as e:
+        # Changed: catch all exceptions instead of just CalledProcessError
+        return {"error": str(e)}
 
 def setup_git_repo(config: ConceptConfig, base_path: str) -> Dict[str, str]:
     """ALWAYS start fresh by deleting and cloning the remote repo to base_path."""

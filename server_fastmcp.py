@@ -121,6 +121,55 @@ def get_concept_network(concept_name: str, depth: int = 1) -> str:
         return json.dumps({"success": False, "error": str(e)})
 
 @mcp.tool()
+def get_concept(concept_name: str) -> str:
+    """Get complete concept information including description and all relationships
+    
+    Retrieves the full concept data in one call - both the concept description
+    and all its relationships. This is the standard way to research a concept
+    for blog writing, analysis, or understanding its place in the knowledge graph.
+    
+    Args:
+        concept_name: Name of the concept to retrieve (exact match on n property)
+        
+    Returns:
+        JSON string with complete concept data: name, description, and relationships
+    """
+    try:
+        # Query for concept with all its relationships
+        # Prioritize nodes with descriptions to handle duplicates
+        cypher_query = """
+        MATCH (c:Wiki) WHERE c.n = $concept_name AND c.d IS NOT NULL
+        OPTIONAL MATCH (c)-[r]->(related:Wiki)
+        RETURN c.n as name, c.d as description, 
+               collect({type: type(r), target: related.n}) as relationships
+        """
+        result = utils.query_wiki_graph(cypher_query, {"concept_name": concept_name})
+        
+        if result.get("success") and result.get("data"):
+            concept_data = result["data"][0]
+            # Filter out empty relationships (from OPTIONAL MATCH)
+            relationships = [rel for rel in concept_data.get("relationships", []) if rel.get("type")]
+            
+            formatted_result = {
+                "success": True,
+                "concept": {
+                    "name": concept_data.get("name"),
+                    "description": concept_data.get("description"),
+                    "relationships": relationships
+                }
+            }
+            return json.dumps(formatted_result, indent=2)
+        else:
+            return json.dumps({
+                "success": False, 
+                "error": f"Concept '{concept_name}' not found in knowledge graph"
+            })
+            
+    except Exception as e:
+        traceback.print_exc()
+        return json.dumps({"success": False, "error": str(e)})
+
+@mcp.tool()
 def list_missing_concepts() -> str:
     """List all missing concepts that are referenced but don't exist yet
     
@@ -156,6 +205,59 @@ def create_missing_concepts(concepts_data: list) -> str:
         result = utils.create_missing_concepts(concepts_data)
         return json.dumps(result, indent=2)
     except Exception as e:
+        traceback.print_exc()
+        return json.dumps({"success": False, "error": str(e)})
+
+@mcp.tool()
+def get_recent_concepts(n: int = 20) -> str:
+    """Get the N most recently created/updated concepts from the knowledge graph
+    
+    Returns a chronological list of recently added or modified concepts with timestamps.
+    Useful for reviewing recent work, understanding current context, and maintaining
+    awareness of knowledge graph evolution.
+    
+    Args:
+        n: Number of recent concepts to retrieve (default: 20, max: 100)
+        
+    Returns:
+        JSON string with recent concepts list including names and timestamps
+    """
+    try:
+        # Limit to reasonable maximum
+        n = min(n, 100)
+        
+        query = """
+        MATCH (c:Wiki) 
+        WHERE c.t IS NOT NULL 
+        RETURN c.n as name, toString(c.t) as timestamp 
+        ORDER BY c.t DESC 
+        LIMIT $n
+        """
+        
+        result = utils.query_wiki_graph(query, {"n": n})
+        
+        if result.get("success", False):
+            concepts = result.get("data", [])
+            
+            # Format for readability
+            formatted_concepts = []
+            for i, concept in enumerate(concepts, 1):
+                formatted_concepts.append({
+                    "rank": i,
+                    "name": concept["name"],
+                    "timestamp": concept["timestamp"]
+                })
+            
+            return json.dumps({
+                "success": True,
+                "count": len(formatted_concepts),
+                "recent_concepts": formatted_concepts
+            }, indent=2)
+        else:
+            return json.dumps({"success": False, "error": "Failed to query recent concepts"})
+            
+    except Exception as e:
+        logger.error(f"Error getting recent concepts: {e}")
         traceback.print_exc()
         return json.dumps({"success": False, "error": str(e)})
 
