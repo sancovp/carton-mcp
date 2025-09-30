@@ -1,3 +1,4 @@
+![](https://raw.githubusercontent.com/sancovp/carton-mcp/refs/heads/main/carton_small.png)
 [![Part of STARSYSTEM](https://img.shields.io/badge/Part%20of-STARSYSTEM-blue)](https://github.com/sancovp/starsystem-metarepo)
 
 # Carton MCP
