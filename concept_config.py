@@ -8,15 +8,21 @@ logger = logging.getLogger(__name__)
 class ConceptConfig:
     """Simple config class for Idea Concepts MCP."""
     
-    def __init__(self, 
-                 github_pat: str, 
-                 repo_url: str, 
-                 neo4j_url: str,
-                 neo4j_username: str,
-                 neo4j_password: str,
-                 branch: str = "main", 
+    def __init__(self,
+                 github_pat: str = None,
+                 repo_url: str = None,
+                 neo4j_url: str = None,
+                 neo4j_username: str = None,
+                 neo4j_password: str = None,
+                 branch: str = "main",
                  base_path: str = None,
                  neo4j_database: str = "neo4j"):
+        # Env var fallbacks for cross-MCP usage
+        github_pat = github_pat or os.getenv("GITHUB_PAT", "")
+        repo_url = repo_url or os.getenv("CARTON_REPO_URL", "")
+        neo4j_url = neo4j_url or os.getenv("NEO4J_URI", "bolt://host.docker.internal:7687")
+        neo4j_username = neo4j_username or os.getenv("NEO4J_USER", "neo4j")
+        neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "password")
         # GitHub config
         self.github_pat = github_pat
         self.repo_url = repo_url

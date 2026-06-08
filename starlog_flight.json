@@ -1,0 +1,49 @@
+{
+  "domain": "starlog_session",
+  "version": "v1",
+  "description": "",
+  "directories": {},
+  "root_files": [
+    {
+      "sequence_number": 1,
+      "filename": "01_check.md",
+      "title": "Check STARLOG Project",
+      "content": "STARLOG System - Development Session Tracking Flow\n\nStep 1: Check if directory is a STARLOG project\nUse: check(path)\n\nThis verifies if the current directory is already set up as a STARLOG project.",
+      "piece_type": "instruction",
+      "dependencies": []
+    },
+    {
+      "sequence_number": 2,
+      "filename": "02_init_or_orient.md",
+      "title": "Initialize or Orient",
+      "content": "Step 2: Setup project context\n\nIf NOT a STARLOG project:\n\u2192 Use: init_project(path, name, description) - Creates project structure with registries and HPI template\n\nIf IS a STARLOG project:\n\u2192 Use: orient(path) - Returns full Captain's Log XML context for existing projects",
+      "piece_type": "instruction",
+      "dependencies": []
+    },
+    {
+      "sequence_number": 3,
+      "filename": "03_start_session.md",
+      "title": "Start STARLOG Session",
+      "content": "Step 3: Begin tracked development session\nUse: start_starlog(session_data, path)\n\nBegin tracked development session with goals and context. This starts the formal logging process.",
+      "piece_type": "instruction",
+      "dependencies": []
+    },
+    {
+      "sequence_number": 4,
+      "filename": "04_work_loop.md",
+      "title": "Work Loop - Development Activities",
+      "content": "Step 4: Work Loop - Choose tools as needed during development:\n\n\u2022 update_debug_diary(entry, path) - Log real-time discoveries, bugs, insights during work\n\u2022 view_debug_diary(path) - Check current project status and recent entries  \n\u2022 view_starlog(path) - Review session history and past work\n\u2022 rules(path) - View project guidelines and standards\n\u2022 add_rule(rule, path) - Create new project guideline or standard\n\nUse these tools throughout your development work to track progress and maintain documentation.",
+      "piece_type": "instruction",
+      "dependencies": []
+    },
+    {
+      "sequence_number": 5,
+      "filename": "05_end_session.md",
+      "title": "End STARLOG Session",
+      "content": "Step 5: Complete session with summary\nUse: end_starlog(session_id, summary, path)\n\nComplete session with summary and outcomes. This formally closes the development session and saves all context.\n\nSTARLOG creates Captain's Log style XML output for AI context injection.",
+      "piece_type": "instruction",
+      "dependencies": []
+    }
+  ],
+  "entry_point": "01_check.md"
+}
