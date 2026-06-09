@@ -5,11 +5,9 @@
 
 <!-- SCALABLE-PUBLISHING:AUTOGEN START (managed block — do not edit between these markers) -->
 
-![Stars](https://img.shields.io/github/stars/sancovp/carton-mcp.svg?style=social) ![Updated](https://img.shields.io/badge/updated-2025_10_01-lightgrey.svg)
+![License](https://img.shields.io/badge/license-Other-blue.svg) ![Stars](https://img.shields.io/github/stars/sancovp/carton-mcp.svg?style=social) ![Updated](https://img.shields.io/badge/updated-2026_06_08-lightgrey.svg)
 
-⭐ 1 stars • 🕑 Updated 2025-10-01
-
-[Marketplace](https://github.com/sancovp/sancrev-marketplace) • [Docs](https://sancovp.github.io/aisaac/)
+⭐ 1 stars • 🕑 Updated 2026-06-08
 
 📦 Auto-published from the monorepo • [CHANGELOG](./CHANGELOG.md) • [sancovp/carton-mcp](https://github.com/sancovp/carton-mcp)
 
