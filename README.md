@@ -5,9 +5,9 @@
 
 <!-- SCALABLE-PUBLISHING:AUTOGEN START (managed block — do not edit between these markers) -->
 
-![License](https://img.shields.io/badge/license-Other-blue.svg) ![Stars](https://img.shields.io/github/stars/sancovp/carton-mcp.svg?style=social) ![Updated](https://img.shields.io/badge/updated-2026_06_08-lightgrey.svg)
+![License](https://img.shields.io/badge/license-Other-blue.svg) ![Stars](https://img.shields.io/github/stars/sancovp/carton-mcp.svg?style=social) ![Updated](https://img.shields.io/badge/updated-2026_06_09-lightgrey.svg)
 
-⭐ 1 stars • 🕑 Updated 2026-06-08
+⭐ 1 stars • 🕑 Updated 2026-06-09
 
 📦 Auto-published from the monorepo • [CHANGELOG](./CHANGELOG.md) • [sancovp/carton-mcp](https://github.com/sancovp/carton-mcp)
 
