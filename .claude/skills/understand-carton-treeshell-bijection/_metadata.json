@@ -1,0 +1,8 @@
+{
+  "domain": "Treeshell_Architecture",
+  "subdomain": "Node_Sync",
+  "category": "understand",
+  "what": "'''Bidirectional population pattern between CartON KG and TreeShell navigation nodes'''",
+  "when": "'''When customizing TreeShell nodes or understanding how configs resolve'''",
+  "produces": "Architecture_Understanding"
+}

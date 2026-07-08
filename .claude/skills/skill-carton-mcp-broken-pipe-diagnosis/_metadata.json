@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Mcp_Operations",
+  "subdomain": "Process_Recovery",
+  "category": "single_turn_process",
+  "what": "'''How to diagnose and fix broken pipe on CartON write path'''",
+  "when": "'''When add_concept returns Errno 32 Broken pipe but get_concept still works'''",
+  "produces": "Restored_Carton_Write_Path"
+}

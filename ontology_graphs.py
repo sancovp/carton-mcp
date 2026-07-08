@@ -1,4 +1,29 @@
 # ontology_graphs.py
+#
+# ============================================================================
+# SOMA-UNIFICATION SPLIT [done 2026-06-16 disable → 2026-06-22 P5 delete] — see journal
+#   Scalable_Publishing_Giint_Architecture_Soma_Unification_Removal +
+#   Soma_Validation_Architecture / Dchain_Depth_Build (P5).
+# STATUS: ENACTED. The ontology TYPE-SYSTEM / _Unnamed fabrication that used to live in this
+# module is REPLACED by SOMA (gnosys-vault GIINT presence d-chains, PROVEN LIVE FIX-4): the
+# missing-child mereology gap is COMPUTED + surfaced as unmet_requirement in the SOMA verdict,
+# never fabricated here. Per Isaac: "EVERY SINGLE THING THAT MENTIONS SYSTEM TYPE OR ONTOLOGY
+# SHOULD NOT EXIST OUTSIDE OF SOMA."
+#
+# DELETED (P5, 2026-06-22 — replace-before-remove; zero live callers verified):
+#   ONTOLOGY_SCHEMAS dict, ensure_ontology_completeness (the fabricator),
+#   _parent_has_child_via_rel, _get_is_a_types. (Their dead caller block in
+#   carton_utils.enforce_ontology_invariants was tombstoned in the same pass.)
+#
+# WHAT THIS MODULE IS NOW (all KEEP — no SOMA replacement, still live):
+#   _normalize, _concept_exists                 — used by the Task-HC writer
+#   _auto_create_task_hypercluster              — world-graph Task-HC writer; daemon calls it
+#                                                 directly for giint_task
+#   get_expanded_metagraph + format_metagraph_for_memory — MEMORY.md compiler
+#                                                 (consumed by substrate_projector.py)
+#   get_seed_ship_stats                         — dashboard stats
+#                                                 (consumed by starlog-mcp/score_compiler.py)
+# ============================================================================
 """
 CartON Ontology Object Graphs — Self-Healing Type System
 
@@ -37,297 +62,7 @@ logger = logging.getLogger(__name__)
 # Children can themselves be ontology types, causing recursive creation.
 # ============================================================
 
-ONTOLOGY_SCHEMAS = {
-    # ================================================================
-    # SEED SHIP — Root graph node (one per user, hardcoded)
-    # HAS: starsystems, kardashev map, SANCTUM
-    # ================================================================
-
-    "Seed_Ship": {
-        "description": "Root graph node for user's fleet. One per user. HAS starsystems, kardashev map, and SANCTUM.",
-        "required_children": [
-            {
-                "suffix": "Starsystems",
-                "is_a": ["Starsystem_Registry"],
-                "instantiates": "Starsystem_Registry_Template",
-                "rel_from_parent": "has_part",
-                "description": "Registry of all starsystem concepts in this Seed Ship",
-            },
-            {
-                "suffix": "Kardashev_Map",
-                "is_a": ["Kardashev_Map"],
-                "instantiates": "Kardashev_Map_Template",
-                "rel_from_parent": "has_part",
-                "description": "Navy organization and Kardashev progression for this Seed Ship",
-            },
-            {
-                "suffix": "Sanctum",
-                "is_a": ["Sanctum"],
-                "instantiates": "Sanctum_Template",
-                "rel_from_parent": "has_part",
-                "description": "Life architecture system for this Seed Ship's user",
-            },
-        ],
-        "expected_relationships": [
-            "has_part",     # starsystems, kardashev, sanctum
-            "has_state",    # Binary: Wasteland or Sanctuary
-        ],
-    },
-
-    # ================================================================
-    # STARSYSTEM HIERARCHY (from starlog_mcp + llm_intelligence_mcp)
-    # ================================================================
-
-    "Starsystem_Collection": {
-        "description": "A STARSYSTEM is a colonized repository with full collection hierarchy",
-        "required_children": [
-            {
-                "suffix": "Task_Collections",
-                "is_a": ["Collection_Category"],
-                "instantiates": "Task_Collection_Category",
-                "rel_from_parent": "has_part",
-                "description": "Active task hyperclusters for this starsystem",
-            },
-            {
-                "suffix": "Done_Signal_Collections",
-                "is_a": ["Collection_Category"],
-                "instantiates": "Done_Signal_Collection_Category",
-                "rel_from_parent": "has_part",
-                "description": "Agent-claimed done hyperclusters (unverified)",
-            },
-            {
-                "suffix": "Completed_Collections",
-                "is_a": ["Collection_Category"],
-                "instantiates": "Completed_Collection_Category",
-                "rel_from_parent": "has_part",
-                "description": "CE-verified completed hyperclusters",
-            },
-            {
-                "suffix": "Architecture_Collections",
-                "is_a": ["Collection_Category"],
-                "instantiates": "Architecture_Collection_Category",
-                "rel_from_parent": "has_part",
-                "description": "Architecture knowledge collections for this starsystem",
-            },
-            {
-                "suffix": "Bug_Collections",
-                "is_a": ["Collection_Category"],
-                "instantiates": "Bug_Collection_Category",
-                "rel_from_parent": "has_part",
-                "description": "Bug tracking collections for this starsystem",
-            },
-            {
-                "strip_prefix": "Starsystem_",
-                "child_prefix": "GIINT_Project_",
-                "suffix": "Unnamed",
-                "is_a": ["GIINT_Project"],
-                "instantiates": "GIINT_Project",
-                "rel_from_parent": "has_giint_project",
-                "description": "GIINT project for this starsystem — rename when scope clarifies",
-            },
-        ],
-        # Expected relationships for scoring (not auto-created, but reward_system queries for these)
-        "expected_relationships": [
-            "has_part",         # collection categories (auto-created above)
-            "has_skill",        # Skill concepts linked to starsystem (discovered)
-            "has_agent",        # Agent concepts (discovered)
-            "has_flight_config",# Flight_Config concepts (discovered)
-            "has_persona",      # Persona concepts (discovered)
-            "has_mcp_server",   # MCP_Server concepts (discovered)
-            "depends_on",       # inter-starsystem relations
-            "uses",             # inter-starsystem relations
-            "integrates_with",  # inter-starsystem relations
-        ],
-    },
-
-    "Hypercluster": {
-        "description": "A hypercluster is created BY a GIINT task. Contains the full work graph.",
-        "required_children": [],
-        # Hypercluster doesn't auto-create GIINT_Project — that's specified by the creator.
-        # But it MUST be part of a Task_Collections category.
-        "expected_relationships": [
-            "has_giint_project",  # link to the GIINT_Project
-            "has_status",         # Active, Done_Signal, Completed
-            "part_of",            # must be in a Collection_Category
-        ],
-    },
-
-    "Collection_Category": {
-        "description": "A category container within a starsystem collection.",
-        "required_children": [],
-        # Collection categories hold hyperclusters — no auto-children.
-    },
-
-    # ================================================================
-    # GIINT HIERARCHY (from llm_intelligence_mcp/carton_sync.py)
-    # PROJECT → FEATURE → COMPONENT → DELIVERABLE → TASK
-    # ================================================================
-
-    "GIINT_Project": {
-        "description": "Top-level project containing full GIINT hierarchy",
-        "required_children": [
-            {
-                "strip_prefix": "GIINT_Project_",
-                "child_prefix": "GIINT_Feature_",
-                "is_a": ["GIINT_Feature"],
-                "instantiates": "GIINT_Feature",
-                "rel_from_parent": "has_feature",
-                "description": "Feature for this project — rename when scope clarifies",
-            },
-        ],
-        "expected_relationships": [
-            "has_feature",    # downward: HAS_FEATURE → GIINT_Feature
-            "part_of",        # upward: PART_OF → Hypercluster
-        ],
-    },
-
-    "GIINT_Feature": {
-        "description": "A feature within a GIINT project.",
-        "required_children": [
-            {
-                "strip_prefix": "GIINT_Feature_",
-                "child_prefix": "GIINT_Component_",
-                "is_a": ["GIINT_Component"],
-                "instantiates": "GIINT_Component",
-                "rel_from_parent": "has_component",
-                "description": "Component for this feature — rename when scope clarifies",
-            },
-        ],
-        "expected_relationships": [
-            "has_component",  # downward: HAS_COMPONENT → GIINT_Component
-            "part_of",        # upward: PART_OF → GIINT_Project
-        ],
-    },
-
-    "GIINT_Component": {
-        "description": "A buildable component within a feature.",
-        "required_children": [
-            {
-                "strip_prefix": "GIINT_Component_",
-                "child_prefix": "GIINT_Deliverable_",
-                "is_a": ["GIINT_Deliverable"],
-                "instantiates": "GIINT_Deliverable",
-                "rel_from_parent": "has_deliverable",
-                "description": "Deliverable for this component — rename when scope clarifies",
-            },
-        ],
-        "expected_relationships": [
-            "has_deliverable",  # downward: HAS_DELIVERABLE → GIINT_Deliverable
-            "part_of",          # upward: PART_OF → GIINT_Feature
-        ],
-    },
-
-    "GIINT_Deliverable": {
-        "description": "A shippable deliverable within a component.",
-        "required_children": [],
-        # Tasks come from TreeKanban — NEVER auto-created.
-        "expected_relationships": [
-            "has_task",  # downward: HAS_TASK → GIINT_Task
-            "part_of",   # upward: PART_OF → GIINT_Component
-        ],
-    },
-
-    "GIINT_Task": {
-        "description": "Atomic work item within a deliverable. Creates its own Hypercluster.",
-        "required_children": [],
-        # Tasks auto-create a Hypercluster in the starsystem's Task_Collections.
-        # This is handled by auto_create_hypercluster (not a simple suffix child).
-        "auto_create_hypercluster": True,
-        "expected_relationships": [
-            "part_of",     # upward: PART_OF → GIINT_Deliverable
-            "has_status",  # Ready, In_Progress, Done
-        ],
-    },
-
-    # ================================================================
-    # NAVY HIERARCHY (from starlog_mcp/_sync_kardashev_to_carton)
-    # Kardashev_Map → Fleet → Squadron → Starship
-    # ================================================================
-
-    "Kardashev_Map": {
-        "description": "Top-level container for the fleet/squadron/starship organization",
-        "required_children": [],
-        # Fleets are dynamic — created from kardashev_map.json, not auto-created
-    },
-
-    "Navy_Fleet": {
-        "description": "Fleet containing squadrons and optionally loose starships",
-        "required_children": [],
-        "expected_relationships": [
-            "has_squadron",        # HAS_SQUADRON → Navy_Squadron
-            "has_loose_starship",  # HAS_LOOSE_STARSHIP → Navy_Starship
-            "has_admiral",         # whether fleet has an admiral
-            "part_of",             # PART_OF → Kardashev_Map
-        ],
-    },
-
-    "Navy_Squadron": {
-        "description": "Squadron containing starship members",
-        "required_children": [],
-        "expected_relationships": [
-            "has_member",   # HAS_MEMBER → Navy_Starship
-            "has_leader",   # whether squadron has a leader
-            "part_of",      # PART_OF → Kardashev_Map (or Fleet via HAS_SQUADRON)
-        ],
-    },
-
-    "Navy_Starship": {
-        "description": "Individual starship linked to a starsystem path. Kardashev level computed from state.",
-        "required_children": [],
-        "expected_relationships": [
-            "has_kardashev_level",  # HAS_KARDASHEV_LEVEL → Kardashev_{Level}
-            "part_of",              # PART_OF → Kardashev_Map + Starsystem
-        ],
-        # Kardashev levels (computed, not stored):
-        # Unterraformed → Planetary (has .claude/) → Colonized (has starlog.hpi)
-        # → Civilized (has GIINT project) → Stellar (emanation ≥ 0.6)
-    },
-
-    # ================================================================
-    # REWARD SYSTEM SCORING TYPES (from starsystem-mcp/reward_system.py)
-    # These are "discovered" types — not auto-created, but queried for scoring.
-    # Including them here so the ontology knows they exist as types.
-    # ================================================================
-
-    "Skill": {
-        "description": "A skill package that can be equipped by an agent",
-        "required_children": [],
-        "expected_relationships": [
-            "part_of",      # linked to starsystem or domain
-            "describes",    # what component this skill describes
-            "has_domain",   # domain classification
-            "has_category", # understand, preflight, single_turn_process
-        ],
-    },
-
-    "Flight_Config": {
-        "description": "Replayable workflow template for structured task execution",
-        "required_children": [],
-        "expected_relationships": [
-            "part_of",     # linked to starsystem
-            "automates",   # what it automates
-            "has_domain",  # domain classification
-        ],
-    },
-
-    "Persona": {
-        "description": "Agent persona configuration with equipped skills and flights",
-        "required_children": [],
-        "expected_relationships": [
-            "configures",  # what starsystem this persona configures
-            "has_skill",   # skills equipped in this persona
-        ],
-    },
-
-    "MCP_Server": {
-        "description": "Model Context Protocol server providing tools",
-        "required_children": [],
-        "expected_relationships": [
-            "part_of",           # linked to starsystem
-            "provides_tools_to", # what it provides tools to
-        ],
-    },
-}
+# [P5 DELETED 2026-06-22] ONTOLOGY_SCHEMAS — the Python placeholder-type dict that drove the deleted fabricator. The GIINT/collection structural type system now lives in SOMA (gnosys-vault d-chains), per 'EVERY SINGLE THING THAT MENTIONS SYSTEM TYPE OR ONTOLOGY SHOULD NOT EXIST OUTSIDE OF SOMA'.
 
 
 def _normalize(name: str) -> str:
@@ -351,187 +86,10 @@ def _concept_exists(concept_name: str, shared_connection) -> bool:
         return False
 
 
-def _get_is_a_types(concept_name: str, shared_connection) -> List[str]:
-    """Get all IS_A types for a concept from Neo4j."""
-    if not shared_connection:
-        return []
-    try:
-        result = shared_connection.execute_query(
-            "MATCH (n:Wiki {n: $name})-[:IS_A]->(t:Wiki) RETURN t.n as type_name",
-            {"name": concept_name}
-        )
-        if result:
-            return [r["type_name"] for r in result if isinstance(r, dict)]
-        return []
-    except Exception:
-        return []
+# [P5 DELETED 2026-06-22] _parent_has_child_via_rel + _get_is_a_types — helpers used ONLY by the deleted ensure_ontology_completeness fabricator. Their job (the mereology-presence gap) now lives in SOMA's GIINT presence d-chain premises.
 
 
-def ensure_ontology_completeness(
-    concept_name: str,
-    is_a_list: List[str],
-    relationship_dict: Dict[str, List[str]],
-    shared_connection=None,
-    _depth: int = 0,
-) -> List[str]:
-    """
-    Check if a concept's ontology type requires children, create if missing.
-
-    This is the self-healing heart of CartON's type system. When you say
-    IS_A Starsystem_Collection, you GET all the collection categories.
-    No questions asked.
-
-    Args:
-        concept_name: The concept being created/checked
-        is_a_list: What types this concept IS
-        relationship_dict: Current relationships
-        shared_connection: Neo4j connection for existence checks
-        _depth: Recursion guard (max 5 levels)
-
-    Returns:
-        List of auto-created concept names (for logging)
-    """
-    if _depth > 5:
-        logger.warning(f"[ONTOLOGY] Max recursion depth reached for {concept_name}")
-        return []
-
-    if not shared_connection:
-        # Can't check existence without connection — skip silently
-        return []
-
-    # Normalize concept_name to match CartON storage (GIINT_ → Giint_)
-    concept_name = _normalize(concept_name)
-
-    # Skip _Template concepts — they are schemas, not instances.
-    # ensure_instances_have_is_a already skips these, but this function
-    # can be called directly. Without this guard, Starsystem_Collection_Template
-    # gets treated as a Starsystem_Collection instance and spawns infinite children.
-    if concept_name.endswith("_Template") or "_Collections_" in concept_name or concept_name.endswith("_Collections"):
-        return []
-
-    created = []
-
-    for type_name in is_a_list:
-        schema = ONTOLOGY_SCHEMAS.get(type_name)
-        if not schema:
-            continue
-
-        required_children = schema.get("required_children", [])
-        if not required_children:
-            continue
-
-        for child_spec in required_children:
-            # Derive child name using one of two strategies:
-            # 1. strip_prefix/child_prefix: GIINT types (GIINT_Project_X → GIINT_Feature_X_Default)
-            # 2. suffix only: Collection types (Starsystem_X_Collection → Starsystem_X_Task_Collections)
-            strip_prefix = child_spec.get("strip_prefix")
-            child_prefix = child_spec.get("child_prefix", "")
-
-            if strip_prefix and concept_name.upper().startswith(strip_prefix.upper()):
-                # GIINT strategy: replace prefix, keep base name
-                # Case-insensitive because CartON normalizes GIINT_ → Giint_
-                # e.g. GIINT_Project_Memory_System → GIINT_Feature_Memory_System
-                base_name = concept_name[len(strip_prefix):]
-                suffix = child_spec.get("suffix", "Unnamed")
-                # Strip _Collection suffix (from starsystem collection naming)
-                if base_name.endswith("_Collection"):
-                    base_name = base_name[:-len("_Collection")]
-                # Strip existing suffix to prevent compounding (_Unnamed_Unnamed)
-                if suffix and base_name.endswith(f"_{suffix}"):
-                    base_name = base_name[:-len(f"_{suffix}")]
-                child_name = _normalize(f"{child_prefix}{base_name}_{suffix}")
-            else:
-                # Collection strategy: strip _Collection suffix, append child suffix
-                base_name = concept_name
-                if base_name.endswith("_Collection"):
-                    base_name = base_name[:-len("_Collection")]
-                child_name = _normalize(f"{base_name}_{child_spec['suffix']}")
-
-            # Already exists? Skip.
-            if _concept_exists(child_name, shared_connection):
-                continue
-            # Also check the full-name variant (in case it was created that way)
-            full_child_name = f"{concept_name}_{child_spec.get('suffix', 'Unnamed')}"
-            if full_child_name != child_name and _concept_exists(full_child_name, shared_connection):
-                continue
-
-            # Build child relationships
-            # Use specific instantiates from spec if provided, else derive from IS_A
-            instantiates_target = child_spec.get("instantiates", f"{child_spec['is_a'][0]}_Template")
-            child_rels = [
-                {"relationship": "is_a", "related": child_spec["is_a"]},
-                {"relationship": "part_of", "related": [concept_name]},
-                {"relationship": "instantiates", "related": [instantiates_target]},
-            ]
-
-            child_desc = child_spec.get("description", f"Auto-created child for {concept_name}")
-
-            # Queue the child concept through add_concept_tool_func
-            try:
-                from carton_mcp.add_concept_tool import add_concept_tool_func
-                result = add_concept_tool_func(
-                    concept_name=child_name,
-                    description=child_desc,
-                    relationships=child_rels,
-                    hide_youknow=True,
-                    shared_connection=shared_connection,
-                    _skip_ontology_healing=True,
-                )
-                created.append(child_name)
-                print(f"[ONTOLOGY] Auto-created: {child_name} (required by {concept_name})", file=sys.stderr)
-
-                # Create parent→child relationship (e.g., HAS_FEATURE, HAS_COMPONENT)
-                rel_from_parent = child_spec.get("rel_from_parent")
-                if rel_from_parent:
-                    try:
-                        rel_type = rel_from_parent.upper()
-                        parent_child_query = """
-                        MATCH (p:Wiki {n: $parent}), (c:Wiki {n: $child})
-                        MERGE (p)-[r:%s]->(c)
-                        SET r.ts = datetime()
-                        """ % rel_type
-                        shared_connection.execute_query(parent_child_query, {
-                            "parent": concept_name, "child": child_name
-                        })
-                        print(f"[ONTOLOGY] Linked: {concept_name} -{rel_type}-> {child_name}", file=sys.stderr)
-                    except Exception as link_err:
-                        print(f"[ONTOLOGY] WARN: Could not link parent→child: {link_err}", file=sys.stderr)
-
-                # Recurse: the child might ALSO be an ontology type
-                # BUT: never recurse on _Unnamed children — they are scaffolding
-                # placeholders, not real concepts that need their own children.
-                # Recursing on them causes infinite explosion (scaffolding scaffolding).
-                if "_Unnamed" not in child_name:
-                    child_is_a = child_spec["is_a"]
-                    child_rel_dict = {
-                        "is_a": child_spec["is_a"],
-                        "part_of": [concept_name],
-                    }
-                    sub_created = ensure_ontology_completeness(
-                        child_name,
-                        child_is_a,
-                        child_rel_dict,
-                        shared_connection=shared_connection,
-                        _depth=_depth + 1,
-                    )
-                    created.extend(sub_created)
-
-            except Exception as e:
-                logger.warning(f"[ONTOLOGY] Failed to auto-create {child_name}: {e}")
-                print(f"[ONTOLOGY] WARN: Could not auto-create {child_name}: {e}", file=sys.stderr)
-
-        # GIINT_Task special: auto-create Hypercluster in starsystem Task_Collections
-        if schema.get("auto_create_hypercluster"):
-            try:
-                created.extend(
-                    _auto_create_task_hypercluster(
-                        concept_name, relationship_dict, shared_connection
-                    )
-                )
-            except Exception as e:
-                logger.warning(f"[ONTOLOGY] HC auto-create failed for {concept_name}: {e}")
-
-    return created
+# [P5 DELETED 2026-06-22] ensure_ontology_completeness — the _Unnamed fabricator. REPLACED by SOMA's gnosys-vault GIINT presence d-chains (the missing-child gap is COMPUTED + surfaced as unmet_requirement, not fabricated). zero live callers (its disabled body already returned []; daemon Phase 2.5 + the disabled server enforce-thread no longer reach it). The Task-HC writer _auto_create_task_hypercluster (below) STAYS.
 
 
 def _auto_create_task_hypercluster(
@@ -982,7 +540,8 @@ def get_seed_ship_stats(shared_connection) -> Dict[str, Any]:
     """
     Query Seed Ship stats using ontology schema knowledge.
 
-    Uses ONTOLOGY_SCHEMAS to know what to count — not raw Cypher assumptions.
+    (Counts via direct Cypher queries below; the "Uses ONTOLOGY_SCHEMAS" claim was
+    stale docstring prose — this function never referenced that dict. DISABLED 2026-06-16.)
     The ontology module knows: Seed_Ship HAS Starsystems, Kardashev_Map, Sanctum.
     Starsystems contain Starsystem_Collection types. HCs are Hypercluster types.
     GIINT_Tasks have has_status. Learnings = Pattern_ + Inclusion_Map_ prefixes.

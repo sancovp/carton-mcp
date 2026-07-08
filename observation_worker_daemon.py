@@ -32,9 +32,6 @@ from carton_mcp.add_concept_tool import _add_observation_worker, get_observation
 # Batch size for UNWIND operations - M4 can handle 20k but we use 2k for safety
 UNWIND_BATCH_SIZE = 2000
 
-# Module-level ChromaDB cache — same pattern as server_fastmcp._rag_cache
-_rag_cache: dict = {}
-
 
 def create_wiki_files_for_concepts(concepts_data: list) -> dict:
     """
@@ -116,6 +113,168 @@ def create_wiki_files_for_concepts(concepts_data: list) -> dict:
     }
 
 
+def _carton_undo_dir_for_today() -> Path:
+    """Per-day undo-log dir: $HEAVEN_DATA_DIR/carton_undo/<YYYY-MM-DD>/.
+
+    Also performs the DAILY CLEAR: any carton_undo/<date>/ dir whose date is not
+    today is removed (the undo log is intentionally ephemeral — undo is a same-day
+    safety net, not durable history). Best-effort; never raises.
+    """
+    from datetime import datetime
+    import shutil
+    heaven_data = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
+    base = Path(heaven_data) / 'carton_undo'
+    today = datetime.now().strftime('%Y-%m-%d')
+    # Daily rotation: drop any date-dir that is not today's.
+    try:
+        if base.exists():
+            for d in base.iterdir():
+                if d.is_dir() and d.name != today:
+                    shutil.rmtree(d, ignore_errors=True)
+    except Exception as e:
+        print(f"[KV-EDIT] undo daily-clear skipped: {e}", file=sys.stderr)
+    today_dir = base / today
+    today_dir.mkdir(parents=True, exist_ok=True)
+    return today_dir
+
+
+def _apply_carton_kv_edits(concept_rows: list, graph) -> None:
+    """CartON KV 'edit' mode (Python pre-step — Cypher can't do EditHelper str_replace).
+
+    For each row with update_mode == 'edit': fetch the CURRENT n.d, write the PRE-edit
+    n.d to a per-node daily undo log, then surgically str-replace old_str_for_edit_case
+    -> the row's description (new_str) via EditHelper (exactly-once enforced; raises
+    ToolError on 0 or >1 match). On success the row is rewritten as a 'replace' whose
+    description is the edited n.d (so the UNWIND CASE writes the whole edited n.d, and the
+    fence-preservation guard — which only acts on replace rows — finds every fence still
+    present byte-identical and carries nothing forward). On ANY failure (no current n.d,
+    0/>1 match, EditHelper error) the row is set to update_mode='skip' so n.d is left
+    UNCHANGED, and the error is recorded on the row for surfacing. Wrapped so a single bad
+    edit can never break the whole batch write.
+
+    Mutates concept_rows in place. Reuses heaven_base EditHelper via a temp-file round-trip
+    (EditHelper operates on a FILE).
+    """
+    import tempfile
+    try:
+        from heaven_base.tools.network_edit_tool import EditHelper
+        from heaven_base.baseheaventool import ToolError
+    except Exception as e:
+        # EditHelper unavailable — fail every edit row safely (n.d unchanged) rather than guess.
+        for row in concept_rows:
+            if row.get('update_mode') == 'edit':
+                row['update_mode'] = 'skip'
+                row['kv_edit_error'] = f"EditHelper unavailable: {e}"
+                print(f"[KV-EDIT] EditHelper import failed, skipping edit for {row['name']}: {e}", file=sys.stderr)
+        return
+
+    for row in concept_rows:
+        if row.get('update_mode') != 'edit':
+            continue
+        name = row['name']
+        old_str = row.get('old_str_for_edit_case')
+        new_str = row.get('description', '')
+        if old_str is None:
+            row['update_mode'] = 'skip'
+            row['kv_edit_error'] = "edit mode requires old_str_for_edit_case (was None)"
+            print(f"[KV-EDIT] {name}: no old_str_for_edit_case — n.d unchanged", file=sys.stderr)
+            continue
+        # Fetch the CURRENT n.d (the file content EditHelper will edit).
+        try:
+            cur = graph.execute_query("MATCH (c:Wiki {n: $n}) RETURN c.d AS d LIMIT 1", {"n": name})
+            current_nd = cur[0]['d'] if (cur and cur[0].get('d')) else None
+        except Exception as e:
+            row['update_mode'] = 'skip'
+            row['kv_edit_error'] = f"could not read current n.d: {e}"
+            print(f"[KV-EDIT] {name}: read n.d failed — n.d unchanged: {e}", file=sys.stderr)
+            continue
+        if not current_nd:
+            row['update_mode'] = 'skip'
+            row['kv_edit_error'] = "node has no existing n.d to edit"
+            print(f"[KV-EDIT] {name}: no existing n.d — n.d unchanged", file=sys.stderr)
+            continue
+        # UNDO LOG: write the PRE-edit n.d before touching anything.
+        try:
+            undo_dir = _carton_undo_dir_for_today()
+            undo_file = undo_dir / f"{name}.json"
+            from datetime import datetime
+            undo_file.write_text(json.dumps({
+                "node": name,
+                "pre_edit_d": current_nd,
+                "old_str": old_str,
+                "new_str": new_str,
+                "ts": datetime.now().isoformat(),
+            }, indent=2))
+        except Exception as e:
+            # Undo log is a safety net; if it can't be written, REFUSE the edit (don't edit
+            # without the ability to undo).
+            row['update_mode'] = 'skip'
+            row['kv_edit_error'] = f"undo-log write failed, edit refused: {e}"
+            print(f"[KV-EDIT] {name}: undo-log write failed — edit refused: {e}", file=sys.stderr)
+            continue
+        # Surgical str-replace via EditHelper on a temp file (exactly-once enforced).
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as tf:
+                tf.write(current_nd)
+                tmp_path = Path(tf.name)
+            EditHelper().str_replace(tmp_path, old_str, new_str)
+            edited_nd = tmp_path.read_text()
+            row['description'] = edited_nd
+            row['update_mode'] = 'replace'  # write the whole edited n.d via the UNWIND CASE
+            print(f"[KV-EDIT] {name}: applied surgical edit (old->new), n.d rewritten", file=sys.stderr)
+        except ToolError as e:
+            # 0 or >1 match (or other EditHelper refusal) — n.d UNCHANGED.
+            row['update_mode'] = 'skip'
+            row['kv_edit_error'] = f"str_replace refused (0 or >1 match): {e}"
+            print(f"[KV-EDIT] {name}: str_replace refused — n.d unchanged: {e}", file=sys.stderr)
+        except Exception as e:
+            row['update_mode'] = 'skip'
+            row['kv_edit_error'] = f"str_replace failed: {e}"
+            print(f"[KV-EDIT] {name}: str_replace failed — n.d unchanged: {e}", file=sys.stderr)
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+
+def _compute_region(c: dict) -> str | None:
+    """Map a concept's SOMA verdict into its CartON REGION enum (the VERTICAL proof axis).
+
+    CartON is the regioned KG (Isaac 2026-06-16): every node carries a mutable `region` property
+    whose value is one of soup | code | system_type | ont (the SOMA-verdict gradient) — plus `cb`
+    (the one non-SOMA region, out of scope this sprint). It is a SCRATCH-lane property (work-state
+    reflected from the verdict, NOT ontological meaning — meaning stays in the is_a/part_of graph),
+    queryable via query_by_properties.
+
+    TREESHELL IS NOT A REGION (Isaac 2026-06-19 — the unify-treeshell decision). `treeshell` is the
+    CODE-OBJECT LENS — one of four lenses (AGENT/DOMAIN/PLACE/CODE-OBJECT) on the HORIZONTAL axis,
+    ORTHOGONAL to this vertical proof-region. A TreeShell node carries `is_a TreeShell_Node` (the
+    lens marker, queryable as a graph edge) AND gets a real vertical region here from its SOMA
+    verdict (node_sync now routes through add_concept_tool_func -> SOMA -> code). So the old
+    `is_a TreeShell_Node -> region='treeshell'` early-return is REMOVED: it conflated the two axes
+    (it shadowed the verdict, so a treeshell node could never be code/system_type). Now they are
+    independent — region = the vertical verdict; the lens = the is_a edge.
+
+    Returns the region, or None when this write carries no verdict/structural signal (so the daemon
+    must NOT clobber an already-climbed region — see the coalesce in the UNWIND). `ont` is not set
+    here yet (SOMA does not surface is_ont to carton); the enum reserves it for that refinement.
+    """
+    rels = c.get('relationships') or {}
+    is_a = [str(t).lower().replace(' ', '_') for t in (rels.get('is_a') or [])]
+    if any(t.startswith('cb_') or t.startswith('crystal_ball') for t in is_a):
+        return 'cb'
+    if c.get('is_system_type'):
+        return 'system_type'
+    if c.get('is_code'):
+        return 'code'
+    if c.get('is_soup'):
+        return 'soup'
+    return None  # no verdict signal on this write -> don't clobber the existing region
+
+
 def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
     """
     Batch create concepts using UNWIND - 900x faster than individual queries.
@@ -157,11 +316,25 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
             'canonical': name.lower().replace(' ', '_'),
             'description': c.get('description', f'No description for {name}'),
             'timestamp': c.get('timestamp'),  # Pass through original timestamp if available
-            'update_mode': c.get('desc_update_mode', 'append'),  # append/prepend/replace
+            'update_mode': c.get('desc_update_mode', 'append'),  # append/prepend/replace/edit
+            'old_str_for_edit_case': c.get('old_str_for_edit_case'),  # CartON KV 'edit' mode: str-replace target within n.d
+            'removed_fences': c.get('removed_fences', []),  # CartON KV fence-preservation guard
             'source': c.get('source', 'agent'),  # Timeline source — who/what created this concept
-            # NOTE: layer is determined by REQUIRES_EVOLUTION relationship, not a property
-            # SOUP = has REQUIRES_EVOLUTION, ONT = no REQUIRES_EVOLUTION
+            'region': _compute_region(c),  # CartON region enum (soup/code/system_type/ont/cb/treeshell); None = no signal, don't clobber
+            # NOTE: the SOUP-vs-not "layer" is ALSO mirrored by the REQUIRES_EVOLUTION relationship
+            # (legacy); `region` is the queryable partition property (the regioned-KG reification).
         })
+
+    # CartON KV 'edit' mode (surgical str-replace within n.d). Runs FIRST: it converts each
+    # successful 'edit' row into a 'replace' row whose description is the edited n.d, so the
+    # downstream dedup (append-only), fence-preservation guard (replace-only), and UNWIND CASE
+    # all see a normal replace. A failed edit becomes a 'skip' (n.d unchanged). Wrapped inside
+    # the helper so it can never break the batch write.
+    try:
+        if graph and any(r.get('update_mode') == 'edit' for r in concept_rows):
+            _apply_carton_kv_edits(concept_rows, graph)
+    except Exception as kv_edit_err:
+        print(f"[KV-EDIT] edit pre-step skipped (batch continues): {kv_edit_err}", file=sys.stderr)
 
     # Section-level dedup: before UNWIND, fetch existing descriptions and strip
     # sections that already exist. Prevents identical paragraphs from accumulating
@@ -225,6 +398,26 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
         except Exception as dedup_err:
             print(f"[DEDUP] Pre-dedup query failed (continuing without dedup): {dedup_err}", file=sys.stderr)
 
+    # CartON KV FENCE-PRESERVATION GUARD (Python pre-step — Cypher can't extract fences).
+    # A REPLACE re-derivation of n.d must NOT silently delete a CartonObj fence. For each
+    # replace row, fetch the CURRENT n.d and carry forward (verbatim) any fence present in the
+    # old n.d but absent by name from the incoming description — EXCEPT names explicitly listed
+    # in removed_fences (the remove_fence op). append/prepend already keep old n.d, so only
+    # replace is at risk. Wrapped so it can never break the write.
+    try:
+        from carton_mcp.carton_kv import carry_forward_fences
+        for row in concept_rows:
+            if row.get('update_mode') != 'replace':
+                continue
+            cur = graph.execute_query(
+                "MATCH (c:Wiki {n: $n}) RETURN c.d AS d LIMIT 1", {"n": row['name']})
+            old_nd = cur[0]['d'] if (cur and cur[0].get('d')) else ''
+            if old_nd and 'CartonObj' in old_nd:
+                row['description'] = carry_forward_fences(
+                    old_nd, row['description'], row.get('removed_fences', []))
+    except Exception as e:
+        print(f"[UNWIND] fence-preservation guard skipped: {e}", file=sys.stderr)
+
     # UNWIND: Create all concept nodes at once (set linked=false for new concepts)
     # Use original timestamp if provided, otherwise use current datetime
     # desc_update_mode: append (default) | prepend | replace | skip (deduped)
@@ -239,6 +432,8 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
                 THEN c.description
             WHEN c.update_mode = 'skip'
                 THEN n.d
+            WHEN c.update_mode = 'replace'
+                THEN c.description
             WHEN n.d = c.description
                 THEN n.d
             WHEN c.description CONTAINS n.d
@@ -255,6 +450,7 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
         SET n.last_modified = datetime()
         SET n.linked = false
         SET n.source = CASE WHEN n.source IS NULL THEN c.source ELSE n.source END
+        SET n.region = coalesce(c.region, n.region, 'soup')
         """
         graph.execute_query(create_query, {'concepts': concept_rows})
         print(f"[UNWIND] Created {len(concept_rows)} concept nodes", file=sys.stderr)
@@ -314,96 +510,98 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
 
     print(f"[UNWIND] Created {total_rels} relationships across {len(rels_by_type)} types", file=sys.stderr)
 
-    # Check for SOUP items that can be promoted now that new concepts exist
-    promoted = check_and_promote_soup_items(graph, [c['name'] for c in concept_rows])
-    if promoted > 0:
-        print(f"[UNWIND] Promoted {promoted} SOUP items to ONT", file=sys.stderr)
+    # TIMELINE-STUB TYPING (Isaac 2026-06-20: "user message etc on timeline have no is_a ...
+    # those should be fixed they are obvious"). A timeline node referenced ONLY as a relationship
+    # TARGET (e.g. summarizes/surfaced_from/part_of) — never written as a SOURCE carrying its own
+    # is_a — is born as a bare AUTO-CREATED stub by the MERGE above with NO is_a edge. Yet its TYPE
+    # is unambiguous from its name prefix (User_Message_* IS_A User_Message, etc.). Type any
+    # still-untyped timeline-prefixed node AMONG THIS BATCH'S rel targets, by prefix. Bounded to the
+    # targets just touched (cheap, index-backed n-lookup), idempotent (MERGE), additive (never
+    # touches n.d, never deletes). The HAS_INSTANCES inverse mirrors the writer's IS_A inverse_map
+    # above. Order is load-bearing: 'Iteration_Summary_' is matched BEFORE 'Iteration_' (prefix
+    # overlap) — first matching WHEN wins. The existing untyped nodes were repaired by a one-time
+    # backfill (scripts/backfill_timeline_is_a.py); this is the SOURCE half that stops recurrence.
+    try:
+        batch_targets = list({r['target'] for rels in rels_by_type.values() for r in rels})
+        if batch_targets:
+            graph.execute_query("""
+            UNWIND $targets AS name
+            MATCH (n:Wiki {n: name}) WHERE NOT (n)-[:IS_A]->()
+            WITH n, CASE
+                WHEN n.n STARTS WITH 'Iteration_Summary_'       THEN 'Iteration_Summary'
+                WHEN n.n STARTS WITH 'User_Message_'            THEN 'User_Message'
+                WHEN n.n STARTS WITH 'Agent_Message_'           THEN 'Agent_Message'
+                WHEN n.n STARTS WITH 'Tool_Call_'               THEN 'Tool_Call'
+                WHEN n.n STARTS WITH 'Unnamed_Conversation_At_' THEN 'Conversation'
+                WHEN n.n STARTS WITH 'Conversation_'            THEN 'Conversation'
+                WHEN n.n STARTS WITH 'Iteration_'               THEN 'Iteration'
+                ELSE null END AS typ
+            WHERE typ IS NOT NULL
+            MERGE (t:Wiki {n: typ})
+            MERGE (n)-[:IS_A]->(t)
+            MERGE (t)-[:HAS_INSTANCES]->(n)
+            """, {'targets': batch_targets})
+    except Exception as e:
+        print(f"[UNWIND] timeline stub typing skipped: {e}", file=sys.stderr)
+
+    # CartON KV: a concept whose description carries an is_schema=true CartonObj fence is auto-typed
+    # IS_A Carton_Kv_Schema (browsable SOUP registry); schema=X refs get USED_BY_KV edges. Cheap
+    # 'CartonObj' substring gate; wrapped so it can never break the write.
+    try:
+        from carton_mcp.carton_utils import register_kv_schemas
+        for c in concepts_data:
+            desc = c.get('description', '') or ''
+            if 'CartonObj' in desc:
+                register_kv_schemas(c.get('name', ''), desc, graph)
+    except Exception as e:
+        print(f"[UNWIND] KV schema registration skipped: {e}", file=sys.stderr)
+
+    # NODE PROPERTIES (the 🏷 property channel — scratch lane, the-property-layer-doctrine).
+    # Applied HERE, AFTER the node MERGE (lines above) created/updated every node, so the
+    # node is GUARANTEED to exist (set_concept_properties MATCHes, never MERGEs) — this is
+    # exactly what removes the old race that forced sm config into n.d as <sm_spec> JSON:
+    # the daemon writes the node and sets its properties in the SAME drain, in order. Each
+    # producer (add_concept_tool_func, dragonbones db_carton) carries `properties` in the
+    # queue JSON; here we apply them via the canonical property surface (reserved-key refuse,
+    # scalar/flat-list validation, best-effort SOMA trail for ontology-bearing nodes). Wrapped
+    # so a property failure can NEVER break the concept/relationship write (the node already
+    # landed). Properties are rare (sm gates / scratch state), so per-concept calls are fine.
+    props_applied = 0
+    try:
+        from carton_mcp.carton_utils import set_concept_properties
+        for c in concepts_data:
+            props = c.get('properties') or {}
+            if not props:
+                continue
+            cname = normalize_concept_name(c.get('name', ''))
+            if not cname:
+                continue
+            res = set_concept_properties(cname, props, mode="merge", shared_connection=graph)
+            if res.get('success'):
+                props_applied += len(res.get('updated_keys') or [])
+                if res.get('refused_keys'):
+                    print(f"[PROPS] {cname}: refused reserved keys {res['refused_keys']}", file=sys.stderr)
+            else:
+                errors.append(f"set_properties({cname}) failed: {res.get('error')}")
+                print(f"[PROPS] ERROR {cname}: {res.get('error')}", file=sys.stderr)
+        if props_applied:
+            print(f"[PROPS] Set {props_applied} node properties across the batch", file=sys.stderr)
+    except Exception as e:
+        print(f"[PROPS] property application skipped (batch continues): {e}", file=sys.stderr)
+
+    # SOUP→CODE promotion is SOMA's job now: the SOMA verdict's is_code flag drives
+    # the inline REQUIRES_EVOLUTION removal (Phase 2.5a). The old youknow-based
+    # background re-validation (check_and_promote_soup_items) was DISABLED and is
+    # removed — youknow (:8102) is dead; SOMA is the validator.
+    promoted = 0
 
     return {
         'concepts_created': len(concept_rows),
         'relationships_created': total_rels,
         'errors': errors,
-        'promoted': promoted
+        'promoted': promoted,
+        'properties_set': props_applied
     }
-
-
-def check_and_promote_soup_items(graph, new_concept_names: list) -> int:
-    """DISABLED: SOMA validates inline. No background polling needed."""
-    return 0
-    if not new_concept_names:
-        return 0
-
-    promoted_count = 0
-
-    try:
-        # Find SOUP items whose reason mentions any of the new concepts
-        # The reason contains what's missing, e.g., "Pet is_a ? (unknown)"
-        query = """
-        MATCH (s:Wiki)-[r:REQUIRES_EVOLUTION]->(re:Wiki {n: "Requires_Evolution"})
-        WHERE any(name IN $new_names WHERE r.reason CONTAINS name)
-        RETURN s.n as name, r.reason as reason
-        """
-        result = graph.execute_query(query, {'new_names': new_concept_names})
-
-        if not result:
-            return 0
-
-        for record in result:
-            name = record.get('name') if isinstance(record, dict) else record['name']
-            reason = record.get('reason') if isinstance(record, dict) else record['reason']
-
-            # Re-validate via YOUKNOW — the reasoner confirms chain now completes
-            try:
-                from youknow_kernel.compiler import youknow as youknow_validate
-                # Reconstruct statement from ALL concept relationships in Neo4j
-                # Must query ALL rels so Skills (22 fields) can be fully re-validated
-                rel_query = """
-                MATCH (c:Wiki {n: $name})-[r]->(t:Wiki)
-                WHERE type(r) <> 'REQUIRES_EVOLUTION'
-                RETURN type(r) as rel, t.n as target
-                """
-                rels = graph.execute_query(rel_query, {'name': name})
-                if rels:
-                    # Build statement: "Name is_a X, part_of Y, produces Z"
-                    triples = []
-                    for rel_rec in rels:
-                        rel_type = (rel_rec.get('rel') if isinstance(rel_rec, dict) else rel_rec['rel']).lower()
-                        target = rel_rec.get('target') if isinstance(rel_rec, dict) else rel_rec['target']
-                        if target:
-                            triples.append(f"{rel_type} {target}")
-                    if triples:
-                        statement = f"{name} {', '.join(triples)}"
-                        yk_result = youknow_validate(statement)
-                        if yk_result == "OK":
-                            # Chain completes — promote to ONT
-                            promote_query = """
-                            MATCH (s:Wiki {n: $name})-[r:REQUIRES_EVOLUTION]->(re:Wiki {n: "Requires_Evolution"})
-                            DELETE r
-                            """
-                            graph.execute_query(promote_query, {'name': name})
-                            promoted_count += 1
-                            print(f"[Promote] {name}: SOUP → ONT (youknow confirmed)", file=sys.stderr)
-                        else:
-                            print(f"[Promote] {name}: still SOUP — {yk_result[:80]}", file=sys.stderr)
-                        continue
-            except ImportError:
-                print(f"[Promote] youknow_kernel not available — skipping re-validation for {name}", file=sys.stderr)
-            except Exception as e:
-                print(f"[Promote] YOUKNOW re-validation failed for {name}: {e}", file=sys.stderr)
-
-            # Fallback: if youknow not available, still promote (old behavior)
-            promote_query = """
-            MATCH (s:Wiki {n: $name})-[r:REQUIRES_EVOLUTION]->(re:Wiki {n: "Requires_Evolution"})
-            DELETE r
-            """
-            graph.execute_query(promote_query, {'name': name})
-            promoted_count += 1
-            print(f"[Promote] {name}: SOUP → ONT (fallback — youknow unavailable)", file=sys.stderr)
-
-    except Exception as e:
-        print(f"[Promote] Error checking SOUP items: {e}", file=sys.stderr)
-
-    return promoted_count
 
 
 def parse_queue_file_to_concepts(queue_file: Path) -> list:
@@ -447,7 +645,11 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
                 'description': data.get('description', ''),
                 'relationships': rels_dict,
                 'timestamp': data.get('timestamp'),  # Pass through original timestamp
-                'desc_update_mode': data.get('desc_update_mode', 'append'),  # append/prepend/replace
+                'desc_update_mode': data.get('desc_update_mode', 'append'),  # append/prepend/replace/edit
+                # CartON KV 'edit' mode: the old_str to surgically str-replace within the existing
+                # n.d (the description above is the new_str). Applied by batch_create_concepts_neo4j.
+                'old_str_for_edit_case': data.get('old_str_for_edit_case'),
+                'removed_fences': data.get('removed_fences', []),  # CartON KV fence-preservation guard (MAIN worker-loop path; the raw_concept branch in process_queue_file already forwards it)
                 'skip_ontology_healing': data.get('skip_ontology_healing', False),
                 # YOUKNOW CODE decision — triggers substrate projection in Phase 2.5a
                 'is_code': data.get('is_code', False),
@@ -462,6 +664,33 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
                 'source': data.get('source', 'agent'),
                 # Target descs — cached KV from EC desc= on +{} claims
                 'target_descs': data.get('target_descs', {}),
+                # RELEASE-LAW projection effects (FIX-5 step 3): the release_effect
+                # facts SOMA surfaced in the verdict, [{handler, arg}]. Phase 2.5a
+                # imports + dispatches each AFTER the neo4j write (gated on is_system_type).
+                'release_effects': data.get('release_effects', []),
+                # AUTHORIZATION-TYPED fillable requests (the carton brain, Isaac 2026-06-28):
+                # SOMA gaps whose fill authority is NOT observing_agent, parsed by add_concept_tool
+                # via the SOMA SDK into [{authorization, concept, gap, expected_type, reason,
+                # reply_contract, request_id}]. Phase 2.5d durably PARKS each (the passive/pull
+                # leg of the request/resume protocol). Mirrors release_effects above — without
+                # this line they are DROPPED here and never reach any dispatch.
+                'fillable_requests': data.get('fillable_requests', []),
+                # CARTON-BUNDLE-BACK composed triples (Isaac 2026-06-28): SOMA's backward-chain
+                # compose DEDUCED these [{concept, prop, value}] and surfaced them in the composed=
+                # verdict section; add_concept_tool parsed them. Phase 2.5e MERGEs each as a neo4j
+                # edge AFTER the node write so carton's KG realizes SOMA's deductions. Mirrors
+                # release_effects above — without this line they are DROPPED and never reach the KG.
+                'composed_triples': data.get('composed_triples', []),
+                # L3b PURE-MEREO SUGGESTIONS (Isaac 2026-06-28): unique admissible candidates SOMA
+                # found for still-empty slots with no authorizing d-chain; [{concept, prop,
+                # expected_type, candidate, reviewer_role}]. Phase 2.5f durably PARKS each for review
+                # (mints a run-id for L3c). Mirrors composed_triples — without this line they are
+                # DROPPED and no review item is ever created.
+                'compose_suggestions': data.get('compose_suggestions', []),
+                # NODE PROPERTIES (the 🏷 property channel). batch_create_concepts_neo4j
+                # applies these via set_concept_properties AFTER the node MERGE (node
+                # exists in the same drain → no race). Scalars/flat-lists only. {} when none.
+                'properties': data.get('properties', {}),
             })
     elif data.get('concepts') and isinstance(data['concepts'], list):
         # Concepts list format: {"concepts": [{name, description, relationships}, ...]}
@@ -622,6 +851,8 @@ def process_queue_file(queue_file: Path, shared_connection=None) -> bool:
                 'name': observation_data['concept_name'],
                 'description': observation_data.get('description', ''),
                 'relationships': rel_dict,
+                'desc_update_mode': observation_data.get('desc_update_mode', 'append'),  # forward replace/append/prepend to batch_create (default append = unchanged behavior)
+                'removed_fences': observation_data.get('removed_fences', []),  # CartON KV: intentionally-deleted fences (fence-preservation guard must NOT carry these back)
                 'timestamp': observation_data.get('timestamp')  # Pass through original timestamp
             }]
             batch_result = batch_create_concepts_neo4j(concept_data, shared_connection)
@@ -787,15 +1018,10 @@ def sync_rag_incremental(changed_files: list[str] | None = None):
         if not wiki_dir.exists():
             return
 
-        from carton_mcp.smart_chroma_rag import SmartChromaRAG, route_concept_to_collection
-
-        def _get_rag(collection_name):
-            if collection_name not in _rag_cache:
-                _rag_cache[collection_name] = SmartChromaRAG(
-                    persist_dir=str(chroma_dir),
-                    collection_name=collection_name,
-                )
-            return _rag_cache[collection_name]
+        # Chroma via the daemon (urllib-only client, ZERO chroma import in this worker process —
+        # the daemon owns chromadb/langchain/onnxruntime). The worker keeps the aho-corasick linker
+        # automaton in memory but no longer loads the chroma neural stack.
+        from carton_mcp.chroma_client import chroma_index as _daemon_index, chroma_route as _daemon_route
 
         if changed_files:
             # Fast path: route each file to its correct collection
@@ -807,13 +1033,12 @@ def sync_rag_incremental(changed_files: list[str] | None = None):
                 # Extract concept name from path: .../ConceptName/ConceptName_itself.md
                 fname = os.path.basename(fpath)
                 concept_name = fname.replace("_itself.md", "") if "_itself.md" in fname else ""
-                coll = route_concept_to_collection(concept_name) if concept_name else "domain_knowledge"
+                coll = _daemon_route(concept_name) if concept_name else "domain_knowledge"
                 by_collection.setdefault(coll, []).append(fpath)
             for coll, paths in by_collection.items():
-                rag = _get_rag(coll)
                 for fpath in paths:
                     try:
-                        result = rag.ingest_path(doc_path=fpath, upsert=True)
+                        result = _daemon_index(coll, fpath, upsert=True)
                         if result.get("status") == "success":
                             added += result.get("files_added", 0) + result.get("files_updated", 0)
                     except Exception as e:
@@ -822,12 +1047,7 @@ def sync_rag_incremental(changed_files: list[str] | None = None):
         else:
             # Fallback: mtime-based incremental scan into domain_knowledge
             print("[Worker] RAG incremental sync (mtime-based)...", file=sys.stderr)
-            rag = _get_rag("domain_knowledge")
-            result = rag.ingest_path(
-                doc_path=str(wiki_dir),
-                glob="**/*_itself.md",
-                upsert=True
-            )
+            result = _daemon_index("domain_knowledge", str(wiki_dir), upsert=True, glob="**/*_itself.md")
             if result.get("status") == "success":
                 print(
                     f"[Worker] RAG sync complete: "
@@ -929,6 +1149,80 @@ def _ensure_neo4j_alive(conn):
         return _create_shared_neo4j()
 
 
+# CONNECTS_TO: /tmp/active_hypercluster.txt (read/write) — actuated shadow of the
+# Seed_Ship.active_hypercluster graph property; also read by substrate_projector.compile_memory_tier.
+_ACTIVE_HC_FILE = Path("/tmp/active_hypercluster.txt")
+
+
+def _sync_active_hypercluster(shared_connection) -> bool:
+    """FIRST CARTON AUTOMATION — graph property = control surface, file = actuated shadow.
+
+    Pattern: property-condition -> action (abstraction-cypher lineage). This is the first
+    instance of the graph-property-condition→action pattern (pseudo-SOMA triggers): a value
+    on the graph is the single control surface, and the always-running daemon actuates the
+    filesystem + recompiles memory to match it.
+
+    Set via: set_properties('Seed_Ship', {'active_hypercluster': 'Hypercluster_X'}).
+
+    Reads Seed_Ship.active_hypercluster. If it differs from /tmp/active_hypercluster.txt AND
+    names a real typed Hypercluster, writes the file and recompiles MEMORY.md tier 0. NEVER
+    points the file at a non-existent HC. Entirely exception-safe — the worker loop can NEVER
+    die from this (any error logs and returns False).
+
+    Returns True iff the file was updated (and a recompile fired); False otherwise.
+    """
+    try:
+        if shared_connection is None:
+            return False
+
+        # Read the control-surface property (parameterless, cheap single-node query).
+        prop_result = shared_connection.execute_query(
+            "MATCH (s:Wiki {n:'Seed_Ship'}) RETURN s.active_hypercluster AS hc"
+        )
+        records = prop_result[0] if isinstance(prop_result, tuple) else prop_result
+        prop_hc = None
+        if records:
+            rec = records[0]
+            prop_hc = rec.get('hc') if isinstance(rec, dict) else rec['hc']
+        if not prop_hc or not str(prop_hc).strip():
+            return False  # property missing/empty — no action, file left alone
+        prop_hc = str(prop_hc).strip()
+
+        # Read current file content (missing file == "").
+        try:
+            file_hc = _ACTIVE_HC_FILE.read_text().strip() if _ACTIVE_HC_FILE.exists() else ""
+        except Exception:
+            file_hc = ""
+
+        if prop_hc == file_hc:
+            return False  # already in sync — idempotent no-op
+
+        # VALIDATE the target exists and is typed as a Hypercluster before touching the file.
+        valid_result = shared_connection.execute_query(
+            "MATCH (h:Wiki {n:$hc})-[:IS_A]->(:Wiki {n:'Hypercluster'}) RETURN h.n AS n",
+            {'hc': prop_hc}
+        )
+        valid_records = valid_result[0] if isinstance(valid_result, tuple) else valid_result
+        if not valid_records:
+            print(f"[CartonAutomation] WARNING: active_hypercluster property names a non-HC: "
+                  f"{prop_hc} — file NOT updated", file=sys.stderr)
+            return False
+
+        # Valid + changed: actuate the file, then recompile tier 0.
+        _ACTIVE_HC_FILE.write_text(prop_hc)
+        print(f"[CartonAutomation] active HC -> {prop_hc} (property-driven)", file=sys.stderr)
+        try:
+            from carton_mcp.substrate_projector import compile_memory_tier
+            compile_memory_tier(0, shared_connection=shared_connection)
+        except Exception as compile_err:
+            print(f"[CartonAutomation] tier-0 recompile failed (non-blocking): {compile_err}", file=sys.stderr)
+        return True
+
+    except Exception as e:
+        print(f"[CartonAutomation] _sync_active_hypercluster error (non-fatal): {e}", file=sys.stderr)
+        return False
+
+
 _STOP_WORDS = frozenset({
     "a", "an", "the", "and", "or", "of", "in", "to", "for", "with", "that",
     "this", "it", "as", "at", "by", "from", "on", "are", "is", "was", "were",
@@ -973,7 +1267,7 @@ def compute_description_score(description: str, concept_cache: list) -> int:
 
 
 CHAT_SOURCES = {"agent", "dragonbones_hook", "session_start"}
-SYSTEM_SOURCES = {"observation_daemon", "precompact", "hierarchical_summarizer", "linker", "substrate_projector"}
+SYSTEM_SOURCES = {"observation_daemon", "precompact", "hierarchical_summarizer", "linker", "substrate_projector", "webbing_agent"}
 ODYSSEY_SOURCES = {"narrative_organ", "odyssey_organ"}
 
 # CONNECTS_TO: /tmp/heaven_data/active_conversation.json (read/write) — tracks active conversation for timeline linking
@@ -1294,6 +1588,19 @@ def worker_daemon():
     import time as _time; _time.sleep(2)  # wait for server ready
     print("[Worker] ChromaDB HTTP server started on port 8101", file=sys.stderr)
 
+    # Also start the chroma DAEMON (:8190) — the SOLE importer of chromadb/langchain/onnxruntime in the
+    # whole system. It owns the EMBEDDER + exposes embed/query/index/add_texts over HTTP. Every client
+    # (carton MCP, flight-predictor, skill-manager, heaven, AND this worker's own sync_rag_incremental)
+    # calls it via the urllib-only chroma_client, so NOTHING else imports the chroma neural stack. The
+    # :8101 server above is just the vector STORE the daemon talks to.
+    _chroma_daemon_port = os.getenv('CHROMA_DAEMON_PORT', '8190')
+    _subprocess.Popen(
+        ["python3", "-m", "carton_mcp.chroma_daemon", "--port", str(_chroma_daemon_port)],
+        stdout=open("/tmp/chroma_daemon.log", "w"),
+        stderr=_subprocess.STDOUT,
+    )
+    print(f"[Worker] chroma daemon (embedder) started on port {_chroma_daemon_port}", file=sys.stderr)
+
     # Verify environment variables
     required_env = ['NEO4J_URI', 'NEO4J_USER', 'NEO4J_PASSWORD']
     optional_env = ['GITHUB_PAT', 'REPO_URL']
@@ -1325,6 +1632,12 @@ def worker_daemon():
 
     while True:
         try:
+            # FIRST CARTON AUTOMATION (property-condition -> action): sync the active-HC
+            # control surface (Seed_Ship.active_hypercluster graph property) to its actuated
+            # file shadow once per loop iteration — cheap single-node query, runs even when the
+            # queue is empty. Exception-safe internally; can NEVER kill this loop.
+            _sync_active_hypercluster(shared_neo4j)
+
             # Get all JSON files in queue directory
             queue_files = sorted(queue_dir.glob('*.json'))
 
@@ -1389,9 +1702,18 @@ def worker_daemon():
                             for target_name, target_desc in td.items():
                                 try:
                                     shared_neo4j.execute_query(
+                                        # FRONTIER SIGNAL (Isaac 2026-06-19): a cell is still on the
+                                        # metacompilation FRONTIER (an unfilled auto-stub) only when there
+                                        # is NOTHING AFTER the auto-created string — i.e. it STARTS WITH the
+                                        # 'AUTO CREATED' marker AND still ENDS WITH 'Not yet fully defined.'
+                                        # (the marker's last sentence). Once a cell is FILLED (real content
+                                        # appended after the marker), it no longer ends with that sentence,
+                                        # so it is NOT frontier and must NOT be clobbered. The marker stays
+                                        # as the birth-record (referenced-into-existence) — filled-ness is
+                                        # the STRUCTURAL signal (content-after-marker), not the marker itself.
                                         """MERGE (n:Wiki {n: $name})
                                         SET n.d = CASE
-                                            WHEN n.d IS NULL OR n.d = '' OR n.d STARTS WITH 'AUTO CREATED'
+                                            WHEN n.d IS NULL OR n.d = '' OR (n.d STARTS WITH 'AUTO CREATED' AND n.d ENDS WITH 'Not yet fully defined.')
                                             THEN $desc ELSE n.d END,
                                             n.t = datetime()""",
                                         {'name': target_name, 'desc': target_desc}
@@ -1402,33 +1724,40 @@ def worker_daemon():
                 elif not shared_neo4j:
                     print("[Worker] ERROR: No Neo4j connection — files stay in queue", file=sys.stderr)
 
-                # Phase 2.5: Enforce GIINT ontology completeness (auto-create superstructure)
+                # REFACTOR-PLAN [SOMA-UNIFICATION 2026-06-16] — THE SOLE LIVE CALLER of the carton
+                #   ontology fabricator. journal Scalable_Publishing_Giint_Architecture_Soma_Unification_Removal (14:10).
+                #   CHANGE: the ensure_ontology_completeness call below fabricates the project/feature/component
+                #   _Unnamed mereology skeletons — that gap is now computed by SOMA's gnosys-vault GIINT
+                #   presence d-chains (PROVEN LIVE, FIX-4), so this fabrication is REDUNDANT.
+                #   ENACT (once verified): comment-out the ensure_ontology_completeness block; REPLACE with a
+                #   DIRECT call to ontology_graphs._auto_create_task_hypercluster for giint_task concepts ONLY
+                #   (Task-HC creation has NO SOMA replacement — the one piece that must stay). Keep Phase 2.5a
+                #   (release_effect dispatch) + 2.5c (PBML) untouched. Then delete the skip_ontology_healing parse (L~409).
+                # Phase 2.5: GIINT _Unnamed fabrication DISABLED 2026-06-16 (SOMA-unification).
+                #   The old ensure_ontology_completeness call here fabricated project/feature/component
+                #   _Unnamed mereology skeletons. That gap is now COMPUTED by SOMA's gnosys-vault GIINT
+                #   presence d-chains (PROVEN LIVE, FIX-4) and surfaced as unmet_requirement in the verdict,
+                #   not fabricated over → fabrication REMOVED (replace-before-remove satisfied).
+                #   RE-HOMED here: Task-HC creation for giint_task (NO SOMA equivalent) via a direct
+                #   _auto_create_task_hypercluster call. journal Soma_Unification_Removal.
                 if all_concepts and neo4j_succeeded:
                     try:
-                        from carton_mcp.ontology_graphs import ensure_ontology_completeness
-                        GIINT_TYPES = {"giint_project", "giint_feature", "giint_component",
-                                       "giint_deliverable", "giint_task"}
+                        from carton_mcp.ontology_graphs import _auto_create_task_hypercluster
                         for c in all_concepts:
-                            # Skip concepts auto-created by ensure_ontology_completeness
-                            # (they already have their hierarchy — re-running would double-scaffold)
                             if c.get("skip_ontology_healing", False):
                                 continue
                             rels = c.get("relationships", {})
                             if isinstance(rels, list):
                                 rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
                             c_isa = [t.lower() for t in rels.get("is_a", [])]
-                            if not GIINT_TYPES.intersection(c_isa):
-                                continue
-                            auto_created = ensure_ontology_completeness(
-                                concept_name=c.get("name", ""),
-                                is_a_list=rels.get("is_a", []),
-                                relationship_dict=rels,
-                                shared_connection=shared_neo4j,
-                            )
-                            if auto_created:
-                                print(f"[Worker] GIINT superstructure: {c.get('name','')} → {auto_created}", file=sys.stderr)
+                            # giint_task Task-HC creation has NO SOMA equivalent → keep (re-homed direct call).
+                            # _auto_create_task_hypercluster is idempotent (_concept_exists guard) + ignores rels.
+                            if "giint_task" in c_isa:
+                                hc = _auto_create_task_hypercluster(c.get("name", ""), rels, shared_neo4j)
+                                if hc:
+                                    print(f"[Worker] Task-HC: {c.get('name','')} → {hc}", file=sys.stderr)
                     except Exception as ont_err:
-                        print(f"[Worker] GIINT ontology enforcement error: {ont_err}", file=sys.stderr)
+                        print(f"[Worker] Task-HC creation error: {ont_err}", file=sys.stderr)
 
                 # Phase 2.5a: Auto-crystallize valid concepts (SOMA decided).
                 # Doc 28 fix: route projection on is_system_type + is_a, not the
@@ -1452,36 +1781,114 @@ def worker_daemon():
                                 print(f"[Worker] SOUP→CODE: {c['name']} REQUIRES_EVOLUTION removed", file=sys.stderr)
                             except Exception as e:
                                 print(f"[Worker] REQUIRES_EVOLUTION removal failed for {c['name']}: {e}", file=sys.stderr)
-                    try:
-                        from carton_mcp.substrate_projector import project_to_skill, SkillSubstrate, project_to_rule, RuleSubstrate
-                        for c in all_concepts:
-                            # Projection only fires for SYSTEM_TYPE — CODE concepts
-                            # still have unmet d-chains and are not fully admitted.
-                            if not c.get("is_system_type"):
+                    # RELEASE-LAW dispatch (FIX-5 step 3) — SOMA surfaced
+                    # release_effect(handler, arg) facts in the verdict for the
+                    # projection d-chains (dchain_skill_project / dchain_rule_project);
+                    # add_concept_tool parsed them into c["release_effects"]. SOMA does
+                    # NOT run them (it is the inner reflection — it cannot act outward
+                    # mid-process; it releases the verdict UP). WE — the outer Python
+                    # layer that called /event — import + run each handler now, AFTER
+                    # the neo4j write, so the projector can read the concept off our
+                    # shared connection. This REPLACES the prior hardcoded is_a routing:
+                    # the d-chain decides WHAT projects; the daemon just dispatches
+                    # whatever handler each fact names (universal — no domain knowledge).
+                    # GATED on is_system_type: a SOUP/CODE skill is still in d-chain
+                    # scope so SOMA surfaces its release_effect, but an incomplete
+                    # concept must NOT project.
+                    import importlib as _importlib
+                    _eff_seen = set()
+                    for c in all_concepts:
+                        if not c.get("is_system_type"):
+                            continue
+                        for eff in (c.get("release_effects") or []):
+                            handler = (eff.get("handler") or "").strip()
+                            # arg = the CartON neo4j node name (c.name). SOMA's
+                            # release_effect arg is the SOMA-normalized (lowercase_
+                            # underscore) form of THIS SAME concept — it does NOT match
+                            # the Title_Case neo4j node the projector reads via
+                            # get_concept_content. This queue file is for exactly one
+                            # concept and its release_effects all pertain to it, so c.name
+                            # is the correct, resolvable node name. (The eff.arg is kept in
+                            # the verdict only as a human-readable trace of which concept.)
+                            arg = c.get("name", "").strip()
+                            if not handler or not arg or (handler, arg) in _eff_seen:
                                 continue
-                            # Extract is_a from the concept's relationships. The
-                            # dict-of-lists shape is the parsed form; the list shape
-                            # appears when relationships pass through untouched.
-                            rels = c.get("relationships", {})
-                            if isinstance(rels, list):
-                                rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
-                            c_isa = [t.lower().replace(" ", "_") for t in rels.get("is_a", [])]
+                            _eff_seen.add((handler, arg))
                             try:
-                                if "skill" in c_isa:
-                                    result = project_to_skill(SkillSubstrate(), c.get("name", ""), shared_connection=shared_neo4j)
-                                    print(f"[Worker] 🔮 SYSTEM_TYPE → Skill crystallized: {c.get('name','')} → {result}", file=sys.stderr)
-                                    log_system_event(shared_connection, "skill_crystallized", f"SYSTEM_TYPE → Skill: {c.get('name','')} → {result}", "substrate_projector")
-                                elif "claude_code_rule" in c_isa:
-                                    rule_result = project_to_rule(RuleSubstrate(), c.get("name", ""), shared_connection=shared_neo4j)
-                                    print(f"[Worker] 🛡️ SYSTEM_TYPE → Rule projected: {c.get('name','')} → {rule_result}", file=sys.stderr)
-                                    log_system_event(shared_connection, "rule_projected", f"SYSTEM_TYPE → Rule: {c.get('name','')} → {rule_result}", "substrate_projector")
-                                # Future is_a routes: flight_config, persona, mcp_server, etc.
-                                else:
-                                    print(f"[Worker] SYSTEM_TYPE is_a={c_isa} not yet handled for {c.get('name','')}", file=sys.stderr)
+                                mod_path, fn_name = handler.split(":", 1)
+                                fn = getattr(_importlib.import_module(mod_path), fn_name)
+                                res = fn(arg, shared_connection=shared_neo4j)
+                                print(f"[Worker] 🔮 release_effect {handler}({arg}) → {res}", file=sys.stderr)
+                                # NOTE: the worker-loop neo4j handle is shared_neo4j (NOT
+                                # shared_connection — the old is_a-routing code referenced an
+                                # undefined `shared_connection` here, a latent NameError that
+                                # never fired because that path apparently never ran live).
+                                log_system_event(shared_neo4j, "release_effect_dispatched", f"{handler}({arg}) → {res}", "soma_release")
                             except Exception as e:
-                                print(f"[Worker] SYSTEM_TYPE crystallization failed for {c.get('name','')}: {e}", file=sys.stderr)
-                    except ImportError:
-                        print("[Worker] substrate_projector not available, skipping crystallization", file=sys.stderr)
+                                print(f"[Worker] release_effect dispatch failed {handler}({arg}): {e}", file=sys.stderr)
+
+                # Phase 2.5d: SOMA authorization-typed request PARK (the carton brain, passive leg).
+                # add_concept_tool parsed SOMA's soma_requests= block into c["fillable_requests"]
+                # (typed by WHO is authorized to fill: human_* / system_deduction / …). Durably PARK
+                # each so it survives restarts and waits for its filler — the durable suspension the
+                # request/resume protocol needs (a human answers later as a NEW SOMA event → SOMA
+                # re-derives → the parked chain advances; re-derivation IS the resume). The ACTIVE fill
+                # (manufacture an LLM expert, POST the answer back, re-derive) runs through
+                # soma_sdk.resolve() + default_fillers when a reachable SOMA_URL + an llm_call are
+                # wired; until then this PARK leg alone runs and nothing is dropped. Logic lives in the
+                # library (soma_fillers.park_fillable_requests); the daemon just dispatches + logs.
+                if all_concepts and neo4j_succeeded:
+                    try:
+                        from carton_mcp.soma_fillers import park_fillable_requests
+                        _parked = park_fillable_requests(all_concepts)
+                        for _rid in _parked:
+                            print(f"[Worker] 🧠 soma_request parked → {_rid}", file=sys.stderr)
+                        if _parked and shared_neo4j:
+                            log_system_event(shared_neo4j, "soma_requests_parked",
+                                             f"{len(_parked)} parked", "soma_request")
+                    except Exception as e:
+                        print(f"[Worker] soma_request park error: {e}", file=sys.stderr)
+
+                # Phase 2.5e: CARTON-BUNDLE-BACK — realize SOMA's DEDUCED composed triples into the KG.
+                # add_concept_tool parsed SOMA's composed= verdict section into c["composed_triples"]
+                # ([{concept, prop, value}]). SOMA's backward-chain compose (L3a) found these matches in
+                # the store and DEDUCED graph additions the user never stated (e.g. SOMA inferred
+                # spaghetti's cuisine is italian from its ingredients). SOMA is the INNER reflection: it
+                # releases the deductions UP and never touches carton's KG. WE — the outer layer — MERGE
+                # each as a directed :PROP edge here (AFTER the node write), or carton stays dumb (Isaac:
+                # "that's literally SOMA's job"). The logic lives in the library
+                # (soma_fillers.realize_composed_triples, unit-testable via an injected execute); the
+                # daemon just dispatches + logs (mirrors Phase 2.5d / park_fillable_requests).
+                if all_concepts and neo4j_succeeded and shared_neo4j:
+                    try:
+                        from carton_mcp.soma_fillers import realize_composed_triples
+                        _realized = realize_composed_triples(all_concepts, shared_neo4j.execute_query)
+                        for (_s, _r, _v) in _realized:
+                            print(f"[Worker] 🧬 composed (SOMA-deduced) → ({_s})-[:{_r}]->({_v})", file=sys.stderr)
+                        if _realized:
+                            log_system_event(shared_neo4j, "soma_composed_realized",
+                                             f"{len(_realized)} deduced triples realized into KG", "soma_compose")
+                    except Exception as e:
+                        print(f"[Worker] composed realize error: {e}", file=sys.stderr)
+
+                # Phase 2.5f: L3b PURE-MEREO SUGGESTION PARK (the review queue, passive leg).
+                # add_concept_tool parsed SOMA's compose_suggestions= block into c["compose_suggestions"]
+                # (a unique admissible candidate for a still-empty slot with NO authorizing d-chain).
+                # SOMA did NOT compose it (that is L3a); it SUGGESTS it. We durably PARK each for review
+                # (mints a stable run-id for the L3c reviewer event). INERT — parking only, no graph
+                # mutation. Logic in the library (soma_fillers.park_compose_suggestions); daemon
+                # dispatches + logs (mirrors Phase 2.5d / 2.5e).
+                if all_concepts and neo4j_succeeded:
+                    try:
+                        from carton_mcp.soma_fillers import park_compose_suggestions
+                        _sg_parked = park_compose_suggestions(all_concepts)
+                        for _rid in _sg_parked:
+                            print(f"[Worker] 🔎 compose-suggestion parked for review → {_rid}", file=sys.stderr)
+                        if _sg_parked and shared_neo4j:
+                            log_system_event(shared_neo4j, "compose_suggestions_parked",
+                                             f"{len(_sg_parked)} parked for review", "soma_suggestion")
+                    except Exception as e:
+                        print(f"[Worker] compose-suggestion park error: {e}", file=sys.stderr)
 
                 # Phase 2.5b REMOVED 2026-05-12: legacy rule bypass path that
                 # gated on substring(is_a, "claude_code_rule") and bypassed YOUKNOW

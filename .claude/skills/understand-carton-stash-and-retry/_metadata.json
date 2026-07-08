@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Infrastructure",
+  "subdomain": "Validation_Ux",
+  "category": "understand",
+  "what": "'''Server-side payload stashing on validation failure with incremental merge on retry'''",
+  "when": "'''When add_concept or add_observation_batch fails GIINT/template/YOUKNOW validation'''",
+  "produces": "Merged_Concept_Payload"
+}

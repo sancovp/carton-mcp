@@ -1,0 +1,8 @@
+{
+  "domain": "Memory_Architecture",
+  "subdomain": "Memory_Projection_Pattern",
+  "category": "understand",
+  "what": "'''The concept that all memory artifacts (MEMORY.md",
+  "when": "'''When designing or improving how the agent's persistent memory works across sessions'''",
+  "produces": "Memory_Projection_Architecture"
+}

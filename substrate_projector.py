@@ -15,6 +15,11 @@ import shutil
 import yaml
 import logging
 
+# metastack RenderablePiece — the typed self-rendering piece base. Used by the
+# PublishManifest template (carton -> publish-manifest.json render). pydantic_stack_core
+# is the metastack package (starsystem/metastack/pydantic_stack_core).
+from pydantic_stack_core import RenderablePiece
+
 logger = logging.getLogger(__name__)
 
 
@@ -323,7 +328,7 @@ def _project_giint_hierarchy_rule(utils, ss_path: str, rules_dir) -> None:
 
     if not result.get("success") or not result.get("data"):
         logger.info("No GIINT hierarchy found for %s", ss_concept)
-        return
+        return "no-hierarchy"
 
     # Build tree from flat rows
     projects = {}
@@ -342,7 +347,7 @@ def _project_giint_hierarchy_rule(utils, ss_path: str, rules_dir) -> None:
                 projects[proj][feat].append(comp)
 
     if not projects:
-        return
+        return "no-hierarchy"
 
     # Render as markdown
     lines = ["# GIINT Hierarchy", "", "This starsystem's project structure:", ""]
@@ -365,8 +370,18 @@ def _project_giint_hierarchy_rule(utils, ss_path: str, rules_dir) -> None:
                 lines.append("- *(No components yet)*")
             lines.append("")
 
-    Path(rules_dir / "giint-hierarchy.md").write_text("\n".join(lines) + "\n")
-    logger.info("Projected GIINT hierarchy rule to %s", rules_dir / "giint-hierarchy.md")
+    content = "\n".join(lines) + "\n"
+    target = Path(rules_dir) / "giint-hierarchy.md"
+    # Diff-and-write (B1, 2026-06-15): re-render on every fire, write only if the
+    # content changed. The projection d-chain fires on create AND update (sibling
+    # projects under the same starsystem each re-render the whole tree), so the
+    # write must be idempotent — converge on identical content, no churn.
+    if target.exists() and target.read_text() == content:
+        logger.info("GIINT hierarchy rule unchanged: %s", target)
+        return "unchanged"
+    target.write_text(content)
+    logger.info("Projected GIINT hierarchy rule to %s", target)
+    return "projected"
 
 
 def project_to_skill(substrate: SkillSubstrate, concept_name: str, shared_connection=None) -> str:
@@ -626,15 +641,11 @@ def project_to_skill(substrate: SkillSubstrate, concept_name: str, shared_connec
     chromadb_msg = ""
     if substrate.write_to_chromadb:
         try:
-            import chromadb
-            chroma_path = os.path.join(
-                os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data"), "skill_chroma"
-            )
-            client = chromadb.PersistentClient(path=chroma_path)
-            collection = client.get_or_create_collection(
-                name="skillgraphs",
-                metadata={"hnsw:space": "cosine"}
-            )
+            # Write skillgraphs via the chroma daemon (ZERO chroma import here). NOTE: this UNIFIES the
+            # store — this used to write to a SEPARATE PersistentClient 'skill_chroma' dir while
+            # carton_utils read the ':8101 chroma_db' skillgraphs collection (a split-brain). Both now use
+            # the daemon's single ':8101' skillgraphs collection, so writes here are read by enforce_ontology.
+            from carton_mcp.chroma_client import chroma_coll_upsert
 
             # Skillgraph naming convention: Skillgraph_{Title_Case}
             sg_name = "Skillgraph_" + concept_name.replace("-", "_")
@@ -684,11 +695,8 @@ def project_to_skill(substrate: SkillSubstrate, concept_name: str, shared_connec
             if agent_type:
                 meta["agent"] = agent_type
 
-            collection.upsert(
-                ids=[f"skillgraph:{skill_name}"],
-                documents=[doc_text],
-                metadatas=[meta]
-            )
+            chroma_coll_upsert("skillgraphs", ids=[f"skillgraph:{skill_name}"],
+                               documents=[doc_text], metadatas=[meta])
             chromadb_msg = " + ChromaDB skillgraph written"
         except Exception as e:
             chromadb_msg = f" (ChromaDB failed: {e})"
@@ -797,13 +805,12 @@ def project_to_skill(substrate: SkillSubstrate, concept_name: str, shared_connec
             rule_content = f"# Use {skill_name}\n\nUse the `{skill_name}` skill when: {when_text or 'working in this domain'}.\n"
             (rules_dir / f"use-{skill_name}.md").write_text(rule_content)
 
-            # Project GIINT hierarchy rule if not already present
-            hierarchy_rule_path = rules_dir / "giint-hierarchy.md"
-            if not hierarchy_rule_path.exists():
-                try:
-                    _project_giint_hierarchy_rule(utils, ss_path, rules_dir)
-                except Exception:
-                    logger.exception("Failed to project GIINT hierarchy rule to %s", ss_path)
+            # NOTE: the GIINT hierarchy rule is NO LONGER projected here. SOMA owns
+            # the rule (the gnosys_vault giint_project presence d-chains) and the
+            # dchain_giint_project_render_hierarchy projection d-chain releases the
+            # effect carton_mcp.substrate_projector:project_giint_hierarchy, which
+            # the carton observation worker daemon dispatches. Skill projection no
+            # longer side-branches into GIINT rendering. (2026-06-15 logic→d-chain.)
 
             projected_to.append(ss_path)
             logger.info("Projected skill '%s' to starsystem %s", skill_name, ss_path)
@@ -823,7 +830,7 @@ PROJECTORS = {
     "registry": project_to_registry,
     "env": project_to_env,
     "skill": project_to_skill,
-    "rule": lambda substrate, concept_name: project_to_rule(substrate, concept_name),
+    "rule": lambda substrate, concept_name, shared_connection=None: project_to_rule(substrate, concept_name, shared_connection),
 }
 
 
@@ -970,9 +977,14 @@ def project_to_rule(substrate: RuleSubstrate, concept_name: str, shared_connecti
     if not has_content.strip():
         return f"skipped: {concept_name} has no body content"
 
-    # Never project stub descriptions as rule files
-    if has_content.strip().startswith("AUTO CREATED:"):
-        return f"skipped: {concept_name} has stub description, not projecting"
+    # (FIX, Isaac 2026-06-15) The "AUTO CREATED:" stub band-aid was REMOVED here.
+    # A claude_code_rule whose has_content is a _Unnamed placeholder is now caught
+    # AT THE SOURCE by SOMA: has_content -> _Unnamed no longer satisfies the code
+    # arg (soma_partials missing_code_restriction), so the rule is soup + raises
+    # failure_error (dchain_rule_no_unnamed_value), and dchain_rule_project is gated
+    # on missing_slot so it never surfaces a release_effect — the daemon never
+    # dispatches a _Unnamed rule to this projector. The downstream string-check was
+    # treating the symptom; the gate is now in the logic program where it belongs.
 
     # Resolve scope
     scope_target = first_rel("HAS_SCOPE")
@@ -1012,66 +1024,534 @@ def project_to_rule(substrate: RuleSubstrate, concept_name: str, shared_connecti
 
     # Compute filename
     filename = _rule_concept_to_filename(concept_name)
-    target_path = os.path.join(target_dir, filename)
 
-    # Render new content
-    new_body = _render_rule_file_content(has_content, has_paths)
-
-    # Diff against existing
-    if os.path.exists(target_path):
-        try:
-            existing = Path(target_path).read_text()
-        except Exception as e:
-            return f"skipped: cannot read existing {target_path}: {e}"
-        if existing == new_body:
-            return f"unchanged: {target_path}"
-        action = "updated"
-    else:
-        action = "created"
-
-    # Write
+    # FIX-5: write via the SINGLE rule writer (paia_builder.rule_cli.write_rule) so the
+    # SOMA rule projection and the user-facing `rules` CLI produce byte-identical files
+    # (one writer, Isaac 2026-06-15 "the rule projector calls the CLI inside").
+    # write_rule renders content + frontmatter via render_rule_body, which is kept
+    # byte-identical to the legacy _render_rule_file_content here, and diffs (unchanged
+    # if no change). target_dir overrides the scope dir (this projector resolved a
+    # possibly-starsystem dir already); name is the filename stem.
+    from paia_builder.rule_cli import ClaudeCodeRule, write_rule
+    rule = ClaudeCodeRule(
+        name=filename[:-3] if filename.endswith(".md") else filename,
+        scope=scope,
+        content=has_content,
+        paths=has_paths,
+    )
     try:
-        os.makedirs(target_dir, exist_ok=True)
-        Path(target_path).write_text(new_body)
+        result = write_rule(rule, target_dir=target_dir)
     except Exception as e:
-        return f"failed: cannot write {target_path}: {e}"
+        return f"failed: cannot write rule {concept_name}: {e}"
+    logger.info("Rule projected: %s -> %s/%s (%s)", concept_name, target_dir, filename, result.split(":", 1)[0])
+    return result
 
-    logger.info("Rule projected: %s -> %s (%s)", concept_name, target_path, action)
-    return f"{action}: {target_path}"
+
+# ── release_effect dispatch entrypoints (FIX-5: projection-as-d-chain) ──────────
+# These are NOT new projectors — they are thin single-argument shims so the SOMA
+# projection d-chains can dispatch the CANONICAL rich projectors above through the
+# universal release_effect bridge (soma_prolog/util_deps/dchain.py calls a handler
+# as ``fn(concept_name)`` — one positional). The d-chain surfaces a plain fact
+# ``release_effect('carton_mcp.substrate_projector:project_skill', C)``; the bridge
+# imports this module and calls the shim, which constructs the default substrate
+# and calls the existing projector. shared_connection defaults to None so the
+# projector opens its own Neo4j connection (the dispatch runs inside the SOMA
+# daemon, not the carton worker, so there is no shared connection to pass). The
+# projectors are idempotent (they diff against the existing file / Neo4j state), so
+# re-firing on an update event is safe. Update DETECTION is the carton observation
+# daemon's job (it re-submits changed concepts) — the d-chain just fires.
+def project_skill(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for dchain_skill_project → rich project_to_skill.
+
+    Dispatched by the carton observation worker daemon (the RELEASE-LAW outer
+    layer) which passes its shared neo4j connection so the projector reads the
+    concept off the same connection it just wrote it on (FIX-5 step 3)."""
+    return project_to_skill(SkillSubstrate(), concept_name, shared_connection=shared_connection)
 
 
-def render_through_template(concept_name: str, template_name: str) -> str:
+def project_rule(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for dchain_rule_project → rich project_to_rule.
+
+    Dispatched by the carton observation worker daemon (the RELEASE-LAW outer
+    layer) which passes its shared neo4j connection (FIX-5 step 3)."""
+    return project_to_rule(RuleSubstrate(), concept_name, shared_connection=shared_connection)
+
+
+def project_giint_hierarchy(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for dchain_giint_project_render_hierarchy.
+
+    The GIINT-hierarchy RULE — what a project's structure IS — lives in SOMA as
+    the giint_project presence d-chains (gnosys_vault.giint). This is only the
+    projection EFFECT they release: when a giint_project is CODE-complete, render
+    the starsystem's full Project→Feature→Component tree into its
+    .claude/rules/giint-hierarchy.md. It REPLACES the old skill-projection
+    side-branch (project_to_skill used to call _project_giint_hierarchy_rule
+    inline); SOMA now owns the rule and the daemon dispatches this effect.
+
+    concept_name = the firing giint_project node (c.name). It is the TRIGGER; the
+    render covers ALL projects under the same starsystem (diff-write makes
+    sibling-project fires converge on identical content — no clobbering). The real
+    filesystem ss_path is recovered from the project node's description
+    ("GIINT Project: <id>. Location: <dir>." — carton_sync.py sets it; HAS_PATH is
+    title-normalized + lossy so it cannot give the real path). No-ops gracefully
+    when ss_path is missing or not on disk (many graph projects are stale/test)."""
+    from pathlib import Path
+    from carton_mcp.carton_utils import CartOnUtils
+
+    utils = CartOnUtils(shared_connection=shared_connection)
+    desc_res = utils.query_wiki_graph(
+        "MATCH (p:Wiki {n: $name}) RETURN p.d AS descr", {"name": concept_name}
+    )
+    if not desc_res.get("success") or not desc_res.get("data"):
+        return f"giint-hierarchy skipped: project '{concept_name}' not found"
+    descr = desc_res["data"][0].get("descr") or ""
+    # Raw path survives ONLY in n.d ("...Location: <dir>."). First line, before any
+    # ⟐ provenance separator; the trailing '.' is the carton_sync delimiter.
+    m = re.search(r"Location:\s*(.+?)\.\s*$", descr, re.M)
+    if not m:
+        return f"giint-hierarchy skipped: no Location in '{concept_name}' description"
+    ss_path = m.group(1).strip()
+    if not ss_path or not Path(ss_path).is_dir():
+        return f"giint-hierarchy skipped: ss_path '{ss_path}' not on disk"
+    rules_dir = Path(ss_path) / ".claude" / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    status = _project_giint_hierarchy_rule(utils, ss_path, rules_dir) or "no-hierarchy"
+    return f"giint-hierarchy {status} for {concept_name} → {rules_dir / 'giint-hierarchy.md'}"
+
+
+# GIINT level prefixes (case-insensitive), title-cased as carton stores them.
+# Mirrors automation/dragonbones/dragonbones/compiler.py GIINT_PREFIXES — the
+# registry-write logic this handler ports out of dragonbones.
+_GIINT_REGISTRY_PREFIXES = {
+    "giint_project_": "project",
+    "giint_feature_": "feature",
+    "giint_component_": "component",
+    "giint_deliverable_": "deliverable",
+    "giint_task_": "task",
+}
+
+
+def _strip_giint_level(name: str):
+    """Strip a GIINT level prefix (case-insensitive), return (level, stripped) or (None, name)."""
+    name_lower = name.lower()
+    for prefix, level in _GIINT_REGISTRY_PREFIXES.items():
+        if name_lower.startswith(prefix):
+            return level, name[len(prefix):]
+    return None, name
+
+
+def _walk_giint_part_of_chain(utils, concept_name: str) -> list:
+    """Walk PART_OF from a GIINT concept up to its GIINT_Project_, reading neo4j.
+
+    Returns the chain TOP-DOWN: [Giint_Project_X, Giint_Feature_Y, ..., concept].
+    Mirrors automation/dragonbones/dragonbones/compiler.py:_walk_hierarchy, but reads
+    every parent from the graph (the handler runs in the carton worker, not the
+    in-memory dragonbones batch). At each hop it follows the FIRST PART_OF target
+    that is itself a GIINT_ level concept, stopping at (and including) the project.
     """
-    Render concept through a metastack template.
+    chain = [concept_name]
+    current = concept_name
+    seen = {concept_name}
 
-    Args:
-        concept_name: Carton concept name
-        template_name: Registered metastack template name (e.g., 'reference_document')
+    for _ in range(5):  # Task→Deliverable→Component→Feature→Project (max 5 levels)
+        if current.lower().startswith("giint_project_"):
+            break
+        res = utils.query_wiki_graph(
+            "MATCH (c:Wiki {n: $name})-[:PART_OF]->(p:Wiki) "
+            "WHERE toLower(p.n) STARTS WITH 'giint_' "
+            "RETURN p.n AS parent",
+            {"name": current},
+        )
+        if not res.get("success") or not res.get("data"):
+            break
+        # Prefer the next-level-up GIINT parent; take the first GIINT_ parent found.
+        parent = None
+        for row in res["data"]:
+            cand = row.get("parent")
+            if cand and _strip_giint_level(cand)[0] is not None:
+                parent = cand
+                break
+        if not parent or parent in seen:
+            break
+        seen.add(parent)
+        chain.append(parent)
+        current = parent
+        if parent.lower().startswith("giint_project_"):
+            break
 
-    Returns:
-        Rendered content from template
+    chain.reverse()  # top-down: Project > Feature > Component > Deliverable > Task
+    return chain
+
+
+def project_giint_registry(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for the giint_* registry-write d-chains.
+
+    PORTS the GIINT registry-write that dragonbones compiler.py did inline
+    (_walk_hierarchy + _sync_to_giint_registry) into a SOMA effect d-chain handler:
+    when a GIINT-typed concept is added (its add_concept POSTs to SOMA, the per-level
+    registry d-chain fires), this writes the matching node into the GIINT JSON
+    registry via llm_intelligence.projects.{create_project, add_feature_to_project,
+    add_component_to_feature, add_deliverable_to_component, add_task_to_deliverable}.
+
+    concept_name = the firing GIINT concept node (c.name, Title_Case). The handler
+    walks its PART_OF chain up to the GIINT_Project_, derives the
+    project/feature/component/deliverable/task params (stripping GIINT prefixes the
+    same case-insensitive way compiler.py does), resolves the project's filesystem
+    dir from the project node's description ("...Location: <dir>." — carton_sync.py
+    sets it), and calls the registry function matching THIS concept's own level.
+
+    Best-effort / never-raises (logs + returns on any error), mirroring the other
+    projectors. The registry functions are idempotent at the data level (a re-add of
+    an existing project/feature/... returns an "already exists" error which is logged
+    and ignored), so firing on create AND update is safe — the same idempotency
+    pattern as project_giint_hierarchy."""
+    from carton_mcp.carton_utils import CartOnUtils
+
+    try:
+        level, _ = _strip_giint_level(concept_name)
+        if not level:
+            return f"giint-registry skipped: {concept_name} is not a GIINT level concept"
+
+        utils = CartOnUtils(shared_connection=shared_connection)
+
+        # Walk PART_OF up to the project, build {level: stripped_name} params.
+        chain = _walk_giint_part_of_chain(utils, concept_name)
+        params = {}
+        for name in chain:
+            lvl, stripped = _strip_giint_level(name)
+            if lvl:
+                params[lvl] = stripped
+
+        if "project" not in params:
+            return f"giint-registry skipped: {concept_name} chain has no GIINT_Project_ ({chain})"
+
+        # Lazy import — a missing llm_intelligence must not break the dispatch.
+        try:
+            from llm_intelligence.projects import (
+                create_project, add_feature_to_project, add_component_to_feature,
+                add_deliverable_to_component, add_task_to_deliverable,
+            )
+        except ImportError as e:
+            return f"giint-registry skipped: llm_intelligence unavailable ({e})"
+
+        project_id = params["project"]
+
+        if level == "project":
+            # Resolve the real filesystem dir from the project node's description
+            # ("...Location: <dir>." — carton_sync.py sets it; HAS_PATH is lossy).
+            project_dir = ""
+            desc_res = utils.query_wiki_graph(
+                "MATCH (p:Wiki {n: $name}) RETURN p.d AS descr", {"name": concept_name}
+            )
+            if desc_res.get("success") and desc_res.get("data"):
+                descr = desc_res["data"][0].get("descr") or ""
+                m = re.search(r"Location:\s*(.+?)\.\s*$", descr, re.M)
+                if m:
+                    project_dir = m.group(1).strip()
+            result = create_project(project_id=project_id, project_dir=project_dir or "/tmp")
+        elif level == "feature" and "feature" in params:
+            result = add_feature_to_project(project_id, params["feature"])
+        elif level == "component" and "feature" in params and "component" in params:
+            result = add_component_to_feature(project_id, params["feature"], params["component"])
+        elif level == "deliverable" and all(k in params for k in ("feature", "component", "deliverable")):
+            result = add_deliverable_to_component(
+                project_id, params["feature"], params["component"], params["deliverable"]
+            )
+        elif level == "task" and all(k in params for k in ("feature", "component", "deliverable", "task")):
+            result = add_task_to_deliverable(
+                project_id, params["feature"], params["component"], params["deliverable"],
+                params["task"], assignee="AI-Only", agent_id="gnosys",
+            )
+        else:
+            return f"giint-registry skipped: {concept_name} incomplete chain for level={level} ({params})"
+
+        msg = result.get("message", result.get("error", "")) if isinstance(result, dict) else str(result)
+        logger.info("GIINT registry write: %s (level=%s) → %s", concept_name, level, msg)
+        return f"giint-registry {level} for {concept_name} → {msg}"
+    except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
+        logger.warning("GIINT registry write failed for %s: %s", concept_name, e)
+        return f"giint-registry error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def _step_spec_from_row(st: dict) -> dict:
+    """Build ONE `create_sm_chain` step spec from a raw Traversal_Step property row (as read from
+    neo4j by `project_state_machine`'s query): `{id, required_pattern, text, next, branch_to,
+    branch_pattern, branch_weight}`.
+
+    PURE (no I/O, no neo4j) — the onion-architecture core of the branching-vs-scalar-`next`
+    decision `project_state_machine` needs (see its docstring's BRANCHING section for the full
+    resolved-technical-question writeup; this function only implements the decision).
+
+    If `branch_to` is a non-empty list, builds the NEW parallel-flat-list branches form: each
+    `branches[i] = {"to": branch_to[i], "required_pattern": branch_pattern[i], "weight":
+    branch_weight[i]}`, zipped by index. `branch_pattern`/`branch_weight` being absent entirely OR
+    shorter than `branch_to` degrades each missing index to `None`/`1.0` respectively (never
+    raises — logged via the module `logger`, matching this file's best-effort/never-raises
+    projector contract).
+
+    Otherwise (no `branch_to`) returns the step UNCHANGED in the OLD scalar-`next` shape — this
+    is the regression-critical path: an SM authored only with `next`/`required_pattern` (every
+    existing dragonbones-authored SM, since dragonbones cannot author `branch_to` yet) must
+    produce the EXACT SAME step spec as before this function existed.
+    """
+    branch_to = st.get("branch_to")
+    if isinstance(branch_to, list) and branch_to:
+        branch_pattern = st.get("branch_pattern")
+        branch_pattern = branch_pattern if isinstance(branch_pattern, list) else None
+        branch_weight = st.get("branch_weight")
+        branch_weight = branch_weight if isinstance(branch_weight, list) else None
+        if branch_pattern is None or len(branch_pattern) < len(branch_to):
+            logger.warning(
+                "project_state_machine: step %s branch_pattern missing/shorter than branch_to "
+                "(%d vs %d) — defaulting missing entries to None",
+                st.get("id"), len(branch_pattern or []), len(branch_to))
+        if branch_weight is None or len(branch_weight) < len(branch_to):
+            logger.warning(
+                "project_state_machine: step %s branch_weight missing/shorter than branch_to "
+                "(%d vs %d) — defaulting missing entries to 1.0",
+                st.get("id"), len(branch_weight or []), len(branch_to))
+        branches = []
+        for i, to in enumerate(branch_to):
+            pat = branch_pattern[i] if branch_pattern is not None and i < len(branch_pattern) else None
+            w = branch_weight[i] if branch_weight is not None and i < len(branch_weight) else 1.0
+            branches.append({"to": to, "required_pattern": pat, "weight": w})
+        return {"id": st.get("id"), "required_pattern": st.get("required_pattern"),
+                "text": st.get("text"), "branches": branches}
+    return {"id": st.get("id"), "required_pattern": st.get("required_pattern"),
+            "text": st.get("text"), "next": st.get("next")}
+
+
+def project_state_machine(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for the state_machine compile d-chain (STAGE A3).
+
+    PORTS dragonbones compiler.py._create_state_machine (the State_Machine EC →
+    create_sm_chain_live call, the 2-SM gating stack) into a SOMA effect d-chain
+    handler: when a state_machine concept is added (its add_concept POSTs to SOMA, the
+    state_machine d-chain fires), this builds the GATING Sm_Chain via the carton SM
+    factory (create_sm_chain_live) — the standard 2-SM stack (auto show-SM order-0 +
+    the declared gating-SM order-1) so it actually gates (the sm_chain_visit stack-size
+    > 1 rule).
+
+    The SM spec travels as GRAPH + PROPERTIES — NO JSON anywhere (Isaac 2026-06-22:
+    "setting up a state machine must NOT require properties you cannot set with dragonbones;
+    NEVER transport JSON thru n.d"). The property-notation keystone made this RACE-FREE: the
+    🏷 properties ride the add_concept queue and the daemon applies set_concept_properties
+    AFTER it MERGEs the node, in the SAME drain — so by the time this release handler runs,
+    the SM node, its Traversal_Step children, and all their properties already landed.
+      - PROPERTY `sm_gates` on the SM node = the concept whose retrieval this SM gates
+        (default: this state_machine concept itself, mirroring _create_state_machine's default).
+      - each gating STEP = a Traversal_Step concept PART_OF this SM, carrying its
+        required_pattern / text / next (the OLD scalar form) OR branch_to / branch_pattern /
+        branch_weight (the NEW branching form — see BRANCHING below) as its OWN properties.
+
+    BRANCHING (step 3 of the SM-branching build, 2026-07-04): `carton_utils.set_concept_properties`
+    (verified by reading `_validate_property_value` in carton_utils.py) REFUSES nested/dict
+    property values — only flat scalars and flat lists of scalars are legal — so a step's
+    `branches` (inherently a list of compound `{to, required_pattern, weight}` objects) cannot
+    ride as ONE property. The resolved, in-constraint encoding is THREE PARALLEL FLAT LISTS on
+    the same Traversal_Step node — `branch_to`/`branch_pattern`/`branch_weight`, zipped by index
+    — read here (the query below) and turned back into the `branches` list `create_sm_chain`
+    expects by `_step_spec_from_row`. A step with a single unconditional next-step still uses the
+    OLD scalar `next` property (backward compat — dragonbones cannot author `branch_to` yet, so
+    EVERY EXISTING dragonbones-authored SM lands here as scalar `next` and must produce the EXACT
+    SAME graph as before this change — the regression-critical path `_step_spec_from_row` preserves).
+
+    ALSO FIXED HERE — the step-list ORDERING: `create_sm_chain` (`knowledge/carton-mcp/sm_gate.py`,
+    read in full before this change) MERGEs each step by name and wires branches from whatever
+    `branches`/`next` each step declares, INDEPENDENT of the `steps` list's position — it never
+    reads list order, only the step `id`s each branch/`next` references. So the PRIOR `next`-
+    linked-list walk here (entry = the step nobody's `next` points at; walk `next` from there) was
+    ONLY EVER cosmetic (ordering the return value for readability), and was structurally
+    INCOMPATIBLE with branching (a step with 2+ branches has no single `next` to follow, so the
+    walk could never reach it). Since order is genuinely inconsequential to `create_sm_chain`'s
+    correctness, this handler now passes `raw_steps` straight through in whatever order the query
+    returns them — simpler AND correct for a DAG.
+
+    The handler reads them from neo4j and calls create_sm_chain_live EXACTLY as
+    _create_state_machine did from the EC claims (only the input source moves: EC claims →
+    concept properties + Traversal_Step graph; the call is unchanged). The Sm_Chain wrapper,
+    the auto show-SM, and the SM_CHAIN_RUNS edge-order (the parts add_concept cannot set) are
+    built by the factory.
+
+    Best-effort / never-raises (logs + returns on any error), mirroring the other
+    projectors. create_sm_chain is idempotent (MERGE-on-names), so firing on create AND
+    update is safe — the same idempotency contract as project_giint_registry.
+    """
+    import json
+    from carton_mcp.carton_utils import CartOnUtils
+
+    try:
+        utils = CartOnUtils(shared_connection=shared_connection)
+
+        # Read the SM spec from the GRAPH + PROPERTIES (no JSON). RACE-FREE: the 🏷 properties
+        # rode the add_concept queue and the daemon applied set_concept_properties AFTER the
+        # node MERGE, in the same drain, so by now the SM node, its Traversal_Step children, and
+        # all their properties have landed. `m.sm_gates` = the gated concept; each Traversal_Step
+        # PART_OF the SM carries required_pattern / text / next (old scalar form) AND/OR
+        # branch_to / branch_pattern / branch_weight (new parallel-flat-list branching form) as
+        # its own properties — `_step_spec_from_row` decides which form wins per step.
+        res = utils.query_wiki_graph(
+            "MATCH (m:Wiki {n: $name}) "
+            "OPTIONAL MATCH (s:Wiki)-[:PART_OF]->(m) WHERE (s)-[:IS_A]->(:Wiki {n: 'Traversal_Step'}) "
+            "OPTIONAL MATCH (m)-[:HAS_DOMAIN]->(dom:Wiki) "
+            "OPTIONAL MATCH (m)-[:HAS_SUBDOMAIN]->(sub:Wiki) "
+            "OPTIONAL MATCH (m)-[:HAS_PERSONAL_DOMAIN]->(pd:Wiki) "
+            "RETURN m.sm_gates AS gates, dom.n AS domain, sub.n AS subdomain, pd.n AS personal_domain, "
+            "collect({id: s.n, required_pattern: s.required_pattern, text: s.text, next: s.next, "
+            "branch_to: s.branch_to, branch_pattern: s.branch_pattern, branch_weight: s.branch_weight}"
+            ") AS steps",
+            {"name": concept_name},
+        )
+        gates, raw_steps, domain, subdomain, personal_domain = None, [], None, None, None
+        if res.get("success") and res.get("data"):
+            row = res["data"][0]
+            gates = row.get("gates")
+            domain = row.get("domain")
+            subdomain = row.get("subdomain")
+            personal_domain = row.get("personal_domain")
+            raw_steps = [st for st in (row.get("steps") or []) if st and st.get("id")]
+
+        if not (domain and subdomain and personal_domain):
+            return (
+                f"state-machine skipped: {concept_name} is missing has_domain/has_subdomain/"
+                f"has_personal_domain (domain={domain!r} subdomain={subdomain!r} "
+                f"personal_domain={personal_domain!r}) — create_sm_chain now REQUIRES these "
+                f"(Isaac 2026-07-04). Add them as customs on the State_Machine concept's own "
+                f"add_concept call, then re-save to re-fire this d-chain."
+            )
+
+        gated = gates or concept_name  # mirrors _create_state_machine's `gated` default
+
+        # Build each step's spec — branches (new form) if `branch_to` is present, else the OLD
+        # scalar `next` (regression-critical). No ordering pass: `create_sm_chain` does not need
+        # step-list order (see the docstring above) — pass raw_steps through as returned.
+        steps = [_step_spec_from_row(st) for st in raw_steps]
+
+        if not steps:
+            return (f"state-machine skipped: {concept_name} has no Traversal_Step children "
+                    f"(nothing to gate yet)")
+
+        # Build the standard 2-SM gating stack — IDENTICAL to compiler.py._create_state_machine:
+        # order-0 auto show-SM (serves the content) + order-1 the declared gating-SM (the
+        # concept_name), so the stack holds > 1 SM and sm_chain_visit GATES it.
+        show_sm = {"name": f"{gated}_Show",
+                   "steps": [{"id": f"{gated}_Show_Step", "required_pattern": None,
+                              "text": "(serves the concept content)", "next": None}]}
+        gating_sm = {"name": concept_name, "steps": steps}
+
+        from carton_mcp.sm_gate import create_sm_chain_live
+        result = create_sm_chain_live(gated, [show_sm, gating_sm],
+                                       domain=domain, subdomain=subdomain,
+                                       personal_domain=personal_domain)
+        logger.info("State_Machine compiled: %s gates %s → chain=%s gated=%s",
+                    concept_name, gated, result.get("sm_chain"), result.get("gated"))
+        return (f"state-machine {concept_name}: gate on {gated} "
+                f"chain={result.get('sm_chain')} sms={result.get('sms')} "
+                f"gated={result.get('gated')}")
+    except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
+        logger.warning("State_Machine compile failed for %s: %s", concept_name, e,
+                       exc_info=True)
+        return f"state-machine error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def flush_starlog_diary(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for the per-typed-EC starlog-diary d-chains (STAGE A4).
+
+    PORTS dragonbones compiler.py._flush_to_starlog_diary (the per-concept Captain's-Log
+    debug-diary write) into a SOMA effect d-chain handler, fired per typed EC. When a
+    typed concept is added, this writes a DebugDiaryEntry to the concept's starlog
+    project (detected from file paths in its description); maps is_a → entry_type the
+    same way compiler.py did.
+
+    Best-effort / never-raises. starlog_mcp is part of the intentionally-disconnected
+    GNOSYS stack, so while it is unavailable this no-ops gracefully (ImportError caught)
+    and becomes live on starlog reconnect — the same replace-now / effect-on-reconnect
+    contract as project_giint_registry / project_state_machine. Cross-cutting by design:
+    UNTYPED concepts have no vaulted type, hence no diary d-chain (goal-consistent —
+    "d-chains for vaulted system types").
     """
     from carton_mcp.carton_utils import CartOnUtils
 
-    utils = CartOnUtils()
+    try:
+        utils = CartOnUtils(shared_connection=shared_connection)
+        res = utils.query_wiki_graph(
+            "MATCH (c:Wiki {n: $name}) OPTIONAL MATCH (c)-[:IS_A]->(t:Wiki) "
+            "RETURN c.d AS descr, collect(t.n) AS isa",
+            {"name": concept_name},
+        )
+        if not (res.get("success") and res.get("data")):
+            return f"starlog-diary skipped: {concept_name} not found"
+        row = res["data"][0]
+        desc = (row.get("descr") or "")[:200]
+        isa = row.get("isa") or []
 
-    # Get full concept data
-    cypher_query = """
-    MATCH (c:Wiki) WHERE c.n = $concept_name AND c.d IS NOT NULL
-    OPTIONAL MATCH (c)-[r]->(related:Wiki)
-    RETURN c.n as name, c.d as description,
-           collect({type: type(r), target: related.n}) as relationships
+        # Map is_a → entry_type (IDENTICAL to compiler.py._flush_to_starlog_diary).
+        type_map = {
+            "Bug": "bug", "Potential_Solution": "potential_solution",
+            "Skill": "skill", "GIINT_Deliverable": "deliverable",
+            "GIINT_Task": "task", "Design": "design",
+            "Idea": "idea", "Inclusion_Map": "inclusion_map",
+        }
+        entry_type = "observation"
+        for isa_type, etype in type_map.items():
+            if isa_type in isa:
+                entry_type = etype
+                break
+
+        # starlog_mcp is part of the disconnected GNOSYS stack — a missing import is a
+        # graceful no-op (the diary becomes live on reconnect).
+        try:
+            from starlog_mcp.starlog import Starlog
+            from starlog_mcp.models import DebugDiaryEntry
+            from starlog_mcp.starlog_sessions import (
+                detect_starsystems_for_entry, get_joint_starlog_name,
+            )
+        except ImportError as e:
+            return f"starlog-diary skipped: starlog unavailable ({e})"
+
+        # Route to the starlog project detected from file paths in the description
+        # (compiler.py's multi-starsystem joint-starlog routing). No context → skip,
+        # exactly as compiler.py `continue`d when no starsystem was detected.
+        detected = detect_starsystems_for_entry(desc, None)
+        if len(detected) > 1:
+            project_name = get_joint_starlog_name(list(detected.keys()))
+        elif detected:
+            project_name = list(detected.keys())[0]
+        else:
+            return f"starlog-diary skipped: {concept_name} has no starsystem context"
+
+        sl = Starlog()
+        stardate = sl._generate_stardate()
+        entry_content = (f"Captain's Log, stardate {stardate}: [{entry_type}] "
+                         f"Dragonbones compiled {concept_name}. {desc}")
+        entry = DebugDiaryEntry(
+            content=entry_content, entry_type=entry_type, source="dragonbones",
+            concept_ref=concept_name, bug_report=(entry_type == "bug"),
+        )
+        sl._save_debug_diary_entry(project_name, entry)
+        logger.info("Starlog diary: %s [%s] → %s", concept_name, entry_type, project_name)
+        return f"starlog-diary {entry_type} for {concept_name} → {project_name}"
+    except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
+        logger.warning("Starlog diary failed for %s: %s", concept_name, e, exc_info=True)
+        return f"starlog-diary error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def _build_template_content(concept_data: dict, concept_name: str) -> dict:
     """
-    result = utils.query_wiki_graph(cypher_query, {"concept_name": concept_name})
+    Build the metastack template content dict from concept data.
 
-    if not result.get("success") or not result.get("data"):
-        raise ValueError(f"Concept '{concept_name}' not found")
+    Explicit concept-data keys (name, essence_paragraph, essence_sentence,
+    relationships, taxonomy, source) always win. NON-RESERVED node properties
+    (concept_data["props"], i.e. properties(c) from neo4j) fill only the keys
+    not already present; reserved managed fields (RESERVED_PROPERTY_KEYS in
+    carton_utils — n, d, t, c, linked, ...) are excluded entirely.
+    """
+    from carton_mcp.carton_utils import RESERVED_PROPERTY_KEYS
 
-    concept_data = result["data"][0]
-
-    # Build template content from concept data
-    # Parse description for taxonomy/source if present
-    description = concept_data.get("description", "")
+    # Parse description for taxonomy/source if present. A property-only node (created
+    # via MERGE with no c.d) returns description=None — coerce to "" so the essence/
+    # taxonomy parsing below never hits a NoneType.
+    description = concept_data.get("description") or ""
 
     # Extract taxonomy and source from description if formatted
     taxonomy = None
@@ -1113,6 +1593,50 @@ def render_through_template(concept_name: str, template_name: str) -> str:
     if source:
         template_content["source"] = source
 
+    # Merge non-reserved node properties: they fill keys not already present;
+    # the explicit concept-data keys above always win.
+    node_props = concept_data.get("props") or {}
+    for prop_key, prop_value in node_props.items():
+        if prop_key in RESERVED_PROPERTY_KEYS or prop_key in template_content:
+            continue
+        template_content[prop_key] = prop_value
+
+    return template_content
+
+
+def render_through_template(concept_name: str, template_name: str) -> str:
+    """
+    Render concept through a metastack template.
+
+    Args:
+        concept_name: Carton concept name
+        template_name: Registered metastack template name (e.g., 'reference_document')
+
+    Returns:
+        Rendered content from template
+    """
+    from carton_mcp.carton_utils import CartOnUtils
+
+    utils = CartOnUtils()
+
+    # Get full concept data (incl. node properties for the template merge)
+    cypher_query = """
+    MATCH (c:Wiki) WHERE c.n = $concept_name AND c.d IS NOT NULL
+    OPTIONAL MATCH (c)-[r]->(related:Wiki)
+    RETURN c.n as name, c.d as description,
+           properties(c) as props,
+           collect({type: type(r), target: related.n}) as relationships
+    """
+    result = utils.query_wiki_graph(cypher_query, {"concept_name": concept_name})
+
+    if not result.get("success") or not result.get("data"):
+        raise ValueError(f"Concept '{concept_name}' not found")
+
+    concept_data = result["data"][0]
+
+    # Build template content from concept data + non-reserved node properties
+    template_content = _build_template_content(concept_data, concept_name)
+
     # Call metastack to render
     try:
         # PARALLEL: uses heaven_base.registry — should migrate to CartON/YOUKNOW
@@ -1151,6 +1675,141 @@ def render_through_template(concept_name: str, template_name: str) -> str:
 
     except ImportError as e:
         raise RuntimeError(f"Failed to import template: {e}")
+
+
+def hydrate_template_content(
+    concept_name: str,
+    edge_type: str | None = None,
+    children_key: str = "children",
+    shared_connection=None,
+) -> dict:
+    """Build a metastack template content dict for a concept, optionally hydrating
+    its children one level deep.
+
+    The parent's own scalar properties come from `_build_template_content` (reused —
+    NOT re-implemented), so taxonomy/source/essence/relationships + non-reserved node
+    properties all merge the same way. If `edge_type` is given, every child reached by
+    that edge (e.g. HAS_UNIT) is hydrated the SAME way and collected, in graph order,
+    as a list of content dicts under `children_key` (e.g. 'units').
+
+    One level of children is sufficient for the publish-manifest render (registry ->
+    HAS_UNIT -> units); there is intentionally no deeper recursion (YAGNI).
+
+    Args:
+        concept_name: the parent concept whose content dict to build.
+        edge_type: relationship type to follow to children (None = no children).
+        children_key: key under which to place the hydrated children list.
+        shared_connection: optional KnowledgeGraphBuilder (the MCP passes its _neo4j_conn).
+
+    Returns:
+        the parent's template content dict, with `children_key` -> [child dicts] when
+        `edge_type` is set (the key is omitted when there are no children).
+    """
+    from carton_mcp.carton_utils import CartOnUtils
+
+    utils = CartOnUtils(shared_connection=shared_connection)
+
+    cypher = """
+    MATCH (c:Wiki) WHERE c.n = $name
+    OPTIONAL MATCH (c)-[r]->(related:Wiki)
+    RETURN c.n as name, c.d as description,
+           properties(c) as props,
+           collect({type: type(r), target: related.n}) as relationships
+    """
+    result = utils.query_wiki_graph(cypher, {"name": concept_name})
+    if not result.get("success") or not result.get("data"):
+        raise ValueError(f"Concept '{concept_name}' not found")
+
+    row = result["data"][0]
+    content = _build_template_content(row, concept_name)
+
+    # _build_template_content sets content["name"] = the CONCEPT name, which shadows a
+    # node `name` PROPERTY (a property-node carries its own data name, e.g. a unit's
+    # "doc-mirror" vs concept "Publishing_Unit_Doc_Mirror"). When a non-reserved `name`
+    # property exists, it IS the data identity — let it win so the template reads it.
+    node_props = row.get("props") or {}
+    if node_props.get("name") is not None:
+        content["name"] = node_props["name"]
+
+    if edge_type:
+        # Collect children by the requested edge. Order by a child `order` property
+        # when present (preserves an authored sequence, e.g. the manifest's units
+        # array), falling back to concept name so the output is always deterministic.
+        child_cypher = """
+        MATCH (parent:Wiki {n: $name})-[r]->(child:Wiki)
+        WHERE type(r) = $edge_type
+        RETURN child.n as name
+        ORDER BY coalesce(child.`order`, 2147483647), child.n
+        """
+        child_result = utils.query_wiki_graph(
+            child_cypher, {"name": concept_name, "edge_type": edge_type}
+        )
+        children = []
+        if child_result.get("success") and child_result.get("data"):
+            for row in child_result["data"]:
+                child_name = row.get("name")
+                if not child_name:
+                    continue
+                # Recurse exactly ONE level: hydrate each child WITHOUT following
+                # further edges (no grandchildren).
+                children.append(
+                    hydrate_template_content(
+                        child_name, edge_type=None, shared_connection=shared_connection
+                    )
+                )
+        if children:
+            content[children_key] = children
+
+    return content
+
+
+class PublishManifest(RenderablePiece):
+    """RenderablePiece that emits the scalable-publishing publish-manifest.json
+    structure from hydrated CartON content.
+
+    Input shape (produced by `hydrate_template_content(registry, edge_type='HAS_UNIT',
+    children_key='units')`): a dict carrying a `units` list, where each unit dict has the
+    flat publishing fields stored as node properties (name, subdir, public_repo, pypi,
+    readme_description, readme_links [json string], readme_badges [json string]). The
+    render() reconstructs the nested `readme` object and serialises stable-ordered JSON
+    matching publish-manifest.json.
+    """
+
+    units: List[dict] = Field(default_factory=list, description="Hydrated unit content dicts")
+    manifest_comment: str | None = Field(
+        default=None, description="Optional _comment string preserved at the top of the manifest"
+    )
+
+    @staticmethod
+    def _unit_to_manifest(unit: dict) -> dict:
+        """Reconstruct one manifest unit (with nested readme) from a flat hydrated dict."""
+        def _loads(value, default):
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except (ValueError, TypeError):
+                    return default
+            return value if value is not None else default
+
+        out = {
+            "name": unit.get("name"),
+            "subdir": unit.get("subdir"),
+            "public_repo": unit.get("public_repo"),
+            "pypi": unit.get("pypi"),
+            "readme": {
+                "description": unit.get("readme_description"),
+                "links": _loads(unit.get("readme_links"), {}),
+                "badges": _loads(unit.get("readme_badges"), {}),
+            },
+        }
+        return out
+
+    def render(self) -> str:
+        manifest = {}
+        if self.manifest_comment:
+            manifest["_comment"] = self.manifest_comment
+        manifest["units"] = [self._unit_to_manifest(u) for u in self.units]
+        return json.dumps(manifest, indent=2, sort_keys=False)
 
 
 def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hypercluster: str = None) -> str:
@@ -1291,9 +1950,9 @@ def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hyperc
             "# MEMORY - GNO.SYS",
             "",
             "## Instructions (compiled — do not edit)",
-            "- **ALL task/concept work MUST go through Dragonbones entity chains** — emit ECs, let the hook compile to CartON, then run `python3 ~/.claude/scripts/project_memory.py` to update this file",
+            "- **Write work state to CartON via the sanctioned SOUP lane** — `add_concept` / the doc-mirror `journal` CLI / `set_properties` (the Dragonbones EC pipeline is DISABLED; do not emit ECs)",
             "- **NEVER manually write MEMORY.md** — this file is compiler output. Source of truth is CartON.",
-            "- **Task list → Dragonbones EC → CartON → compiler → MEMORY.md** — this is the only valid pipeline",
+            "- **CartON graph → compiler → MEMORY.md** — the graph is the source; run `python3 ~/.claude/scripts/project_memory.py` to recompile",
             # CONNECTS_TO: /tmp/heaven_data/task_list_backup.json (reference) — ephemeral task list backup
             "- **Backup task list to `/tmp/heaven_data/task_list_backup.json`** before session end (Claude Code tasks are ephemeral)",
             "",
@@ -1363,11 +2022,58 @@ def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hyperc
         lines.extend([
             "# Mid-Term Memory (MTM)",
             "",
-            "Collection name pointers for active starsystem HCs.",
+            "Starsystem HC collection list with hierarchy.",
             "Use `activate_collection()` when you need one.",
             "",
-            "## Active Starsystem HC Collections",
+            "## Hyperclusters by Starsystem",
         ])
+
+        # Hierarchy-aware HC grouping (CHANGE_SPEC #6): when an HC has the welded
+        # PART_OF -> Task_Collections -> Starsystem_Collection chain, group it under
+        # that starsystem heading; HCs without the chain fall under "(unwelded)".
+        # Works BOTH before the world-graph weld (everything (unwelded), flat) and
+        # after (grouped). The query tolerates absent edges via OPTIONAL MATCH.
+        ss_by_hc = {}
+        try:
+            hier_query = """
+            MATCH (h:Wiki)-[:IS_A]->(:Wiki {n: "Hypercluster"})
+            OPTIONAL MATCH (h)-[:PART_OF*1..3]->(ss:Wiki)-[:IS_A]->(:Wiki {n: 'Starsystem_Collection'})
+            OPTIONAL MATCH (h)-[:HAS_STATUS]->(st:Wiki)
+            RETURN h.n as name, collect(DISTINCT ss.n)[0] as starsystem, st.n as status
+            ORDER BY h.n
+            """
+            hier_result = utils.query_wiki_graph(hier_query, {})
+            hier_data = hier_result.get("data", []) if hier_result.get("success") else []
+        except Exception:
+            logger.exception("[MemoryCompiler] Tier 1 hierarchy query failed; falling back to flat")
+            hier_data = []
+
+        from collections import defaultdict as _dd
+        grouped = _dd(list)
+        for entry in hier_data:
+            hc_name = entry.get("name", "")
+            if not hc_name:
+                continue
+            ss = entry.get("starsystem") or "(unwelded)"
+            status = entry.get("status")
+            ss_by_hc[hc_name] = ss
+            label = hc_name.replace("Hypercluster_", "").replace("_", " ")
+            line = f"- {label}" + (f" [{status}]" if status else "")
+            grouped[ss].append(line)
+
+        if grouped:
+            # Real starsystems first (alpha), "(unwelded)" last so the welded
+            # hierarchy reads cleanly when the weld lands.
+            for ss_name in sorted(grouped.keys(), key=lambda s: (s == "(unwelded)", s)):
+                heading = ss_name.replace("_Collection", "").replace("_", " ") if ss_name != "(unwelded)" else "(unwelded)"
+                lines.append(f"### {heading}")
+                lines.extend(sorted(grouped[ss_name]))
+                lines.append("")
+        else:
+            lines.append("*(No hyperclusters found)*")
+            lines.append("")
+
+        lines.append("## Active Starsystem HC Collections")
 
         # Find the active HC's starsystem, then list all collections in it
         active_hc_name = None
@@ -1440,10 +2146,66 @@ def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hyperc
 
         lines.append("")
 
+    elif tier_num == 3:
+        # L2 (faintest): the most-compressed index — names only, one line per HC
+        # (name + status if present), grouped under starsystem when the welded
+        # PART_OF -> Starsystem_Collection chain exists, flat "(unwelded)" otherwise.
+        # Kept deliberately small: no descriptions, no GIINT expansion. Mirrors the
+        # tier-1 grouping shape but strips it to bare names.
+        lines.extend([
+            "# Faintest Memories (L2)",
+            "",
+            "Most-compressed HC index — names only. Query CartON to expand any.",
+            "",
+        ])
+
+        l2_by_ss = {}
+        try:
+            l2_query = """
+            MATCH (h:Wiki)-[:IS_A]->(:Wiki {n: "Hypercluster"})
+            OPTIONAL MATCH (h)-[:PART_OF*1..3]->(ss:Wiki)-[:IS_A]->(:Wiki {n: 'Starsystem_Collection'})
+            OPTIONAL MATCH (h)-[:HAS_STATUS]->(st:Wiki)
+            RETURN h.n as name, collect(DISTINCT ss.n)[0] as starsystem, st.n as status
+            ORDER BY h.n
+            """
+            l2_result = utils.query_wiki_graph(l2_query, {})
+            l2_data = l2_result.get("data", []) if l2_result.get("success") else []
+        except Exception:
+            logger.exception("[MemoryCompiler] Tier 3 query failed; falling back to flat HC list")
+            l2_data = []
+
+        from collections import defaultdict as _dd3
+        l2_grouped = _dd3(list)
+        for entry in l2_data:
+            hc_name = entry.get("name", "")
+            if not hc_name:
+                continue
+            ss = entry.get("starsystem") or "(unwelded)"
+            status = entry.get("status")
+            label = hc_name.replace("Hypercluster_", "").replace("_", " ")
+            l2_grouped[ss].append(f"- {label}" + (f" [{status}]" if status else ""))
+
+        if l2_grouped:
+            for ss_name in sorted(l2_grouped.keys(), key=lambda s: (s == "(unwelded)", s)):
+                heading = ss_name.replace("_Collection", "").replace("_", " ") if ss_name != "(unwelded)" else "(unwelded)"
+                lines.append(f"### {heading}")
+                lines.extend(sorted(l2_grouped[ss_name]))
+                lines.append("")
+        else:
+            # Fall back to the already-fetched hypercluster list (names only) so the
+            # file is never empty/garbage even if the grouping query yields nothing.
+            for hc in (active + blocked + protected):
+                label = hc["name"].replace("Hypercluster_", "").replace("_", " ")
+                lines.append(f"- {label}")
+            if not (active or blocked or protected):
+                lines.append("*(No hyperclusters found)*")
+            lines.append("")
+
     # Write the compiled file
+    # NOTE: every tier_paths value is a literal expanduser() path (no dynamic/None
+    # tiers exist), so output_path can never be None here — the former None-guard
+    # was dead code and has been removed (CHANGE_SPEC #4).
     output_path = tier_paths[tier_num]
-    if output_path is None:
-        return f"Tier {tier_num} has dynamic path — not yet supported"
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text("\n".join(lines) + "\n")
@@ -1523,6 +2285,7 @@ def substrate_project(substrate: dict, target: str, description_only: bool = Tru
         "registry": RegistrySubstrate,
         "env": EnvSubstrate,
         "skill": SkillSubstrate,
+        "rule": RuleSubstrate,
     }
 
     substrate_model = substrate_classes[substrate_type](**substrate)

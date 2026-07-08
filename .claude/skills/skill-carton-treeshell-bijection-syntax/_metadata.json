@@ -1,0 +1,8 @@
+{
+  "domain": "Treeshell_Carton_Integration",
+  "subdomain": "Jit_Node_Creation",
+  "category": "understand",
+  "what": "'''Which CartON relationship types map to TreeShell navigable children'''",
+  "when": "'''When you want CartON concepts to appear as TreeShell menus with options'''",
+  "produces": "Navigable_Carton_Treeshell_Nodes"
+}

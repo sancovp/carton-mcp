@@ -1,0 +1,8 @@
+{
+  "domain": "Knowledge_Management",
+  "subdomain": "Architecture_Capture",
+  "category": "single_turn_process",
+  "what": "Create Design_ prefixed concepts in architecture collections with full descriptions and cross-references",
+  "when": "Architecture Discussion With Isaac",
+  "produces": "Persisted_Design_Concepts"
+}

@@ -1,0 +1,8 @@
+{
+  "domain": "Treeshell_Carton_Integration",
+  "subdomain": "Jit_Node_Options",
+  "category": "single_turn_process",
+  "what": "'''Only HAS_OPTION relationships become TreeShell children",
+  "when": "'''When JIT nodes display structural relationships as navigable options'''",
+  "produces": "Clean_Jit_Options"
+}

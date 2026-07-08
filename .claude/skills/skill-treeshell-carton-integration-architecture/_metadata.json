@@ -1,0 +1,8 @@
+{
+  "domain": "Treeshell_Architecture",
+  "subdomain": "Carton_Integration",
+  "category": "understand",
+  "what": "'''node_sync.py + learnings.py + renderer.py forming the TreeShell\u2194CartON bridge'''",
+  "when": "'''When building or extending the CartON-backed treeshell vision'''",
+  "produces": "Architecture_Understanding"
+}

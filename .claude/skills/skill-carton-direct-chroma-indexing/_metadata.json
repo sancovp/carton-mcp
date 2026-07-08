@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Architecture",
+  "subdomain": "Chromadb_Indexing",
+  "category": "understand",
+  "what": "Indexing concepts to ChromaDB without filesystem intermediary",
+  "when": "When daemon batch writes to Neo4j successfully",
+  "produces": "Searchable_Concept_Embeddings"
+}

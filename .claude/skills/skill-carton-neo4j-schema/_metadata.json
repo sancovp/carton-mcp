@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Graph_Schema",
+  "subdomain": "Node_And_Relationship_Types",
+  "category": "understand",
+  "what": "'''The actual properties and relationship types in CartON Neo4j'''",
+  "when": "'''When needing to understand how CartON stores and relates concepts in Neo4j'''",
+  "produces": "Schema_Understanding"
+}

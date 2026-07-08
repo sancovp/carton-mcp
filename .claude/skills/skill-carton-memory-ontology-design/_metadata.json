@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Ontology",
+  "subdomain": "Memory_Architecture_Types",
+  "category": "understand",
+  "what": "'''How to design HyperCluster",
+  "when": "'''When building CartON-native memory management that projects to files'''",
+  "produces": "Ontology_Bootstrap_Types"
+}

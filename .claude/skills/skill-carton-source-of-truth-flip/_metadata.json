@@ -1,0 +1,8 @@
+{
+  "domain": "Treeshell_Architecture",
+  "subdomain": "Carton_Integration",
+  "category": "understand",
+  "what": "'''Embed raw node dict as JSON in CartON description",
+  "when": "'''When implementing CartON as source of truth for TreeShell node definitions'''",
+  "produces": "Bidirectional_Node_Sync"
+}

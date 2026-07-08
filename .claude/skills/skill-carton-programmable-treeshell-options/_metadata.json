@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Programmable_Navigation",
+  "subdomain": "Has_Option_Syntax",
+  "category": "understand",
+  "what": "'''HAS_OPTION relationship in CartON renders as navigable TreeShell option via JIT loading'''",
+  "when": "'''When you want to create menu structure in TreeShell by programming CartON relationships'''",
+  "produces": "Programmable_Tree_Navigation"
+}

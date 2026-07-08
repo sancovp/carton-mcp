@@ -1,0 +1,8 @@
+{
+  "domain": "Infrastructure",
+  "subdomain": "Daemon_Management",
+  "category": "single_turn_process",
+  "what": "'''How to diagnose and restart the CartON observation worker daemon'''",
+  "when": "'''When ps aux shows no observation_worker process or carton_management says daemon is off'''",
+  "produces": "Running_Daemon"
+}

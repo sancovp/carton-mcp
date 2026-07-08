@@ -1,0 +1,8 @@
+{
+  "domain": "Treeshell_Architecture",
+  "subdomain": "Carton_Integration",
+  "category": "understand",
+  "what": "'''Just-in-time building of TreeShell nodes from CartON graph relationships'''",
+  "when": "'''When a jump target is not found in any loaded family JSON config'''",
+  "produces": "Synthetic_Treeshell_Node"
+}

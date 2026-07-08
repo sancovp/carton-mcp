@@ -3,11 +3,615 @@ CartOn Utils - Core business logic for concept management
 """
 import logging
 import os
+import re
 from typing import Dict, List, Optional
 from pathlib import Path
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+
+def strip_wiki_links(text):
+    """CANONICAL CartON wiki-link stripper (onion: lives in the LIBRARY so EVERY caller — MCP tools,
+    Python imports, skills, CLIs — gets clean output; the single source of truth). CartON's auto-linker
+    rewrites concept mentions in descriptions into `[word](../Word/Word_itself.md)` and stores them RAW
+    in n.d; these must NEVER render. Converts complete links to their text and removes orphan/TRUNCATED
+    `_itself.md` artifacts (truncation happens when a Cypher does substring(d,0,N), cutting a link with
+    no closing `)` — handled here so it can never leak)."""
+    if not isinstance(text, str):
+        return text
+    prev = None
+    while prev != text:                                            # complete link -> its text (nested-safe)
+        prev = text
+        text = re.sub(r'\[([^\[\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'\[([^\[\]]+)\]\(\.{0,2}/[^)]*$', r'\1', text)   # truncated/dangling link at end -> text
+    text = re.sub(r'\([^)]*_itself\.md\)', '', text)               # orphan complete _itself.md target
+    text = re.sub(r'\(\.{0,2}/[^)]*$', '', text)                   # truncated orphan target at end
+    text = re.sub(r'[^\s()\[\]]*_itself\.md\)?', '', text)         # any residual _itself.md fragment
+    text = re.sub(r'\(\s*\)', '', text)                            # leftover empty parens
+    text = re.sub(r'  +', ' ', text)
+    return text
+
+
+def deep_strip_wiki_links(obj):
+    """Apply strip_wiki_links recursively over any query-result structure (lists / dicts / strings),
+    so the library's read primitive returns CLEAN data to every caller."""
+    if isinstance(obj, str):
+        return strip_wiki_links(obj)
+    if isinstance(obj, list):
+        return [deep_strip_wiki_links(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: deep_strip_wiki_links(v) for k, v in obj.items()}
+    return obj
+
+
+def edit_carton_obj(concept_name, kvobj_name, key_path, op, value=None, shared_connection=None):
+    """Edit (or read) a <CartonObj name=kvobj_name> fence inside concept_name's n.d.
+
+    ONION: this is the neo4j-bound wrapper over the PURE carton_kv op-applier.
+      1. READ n.d RAW (direct cypher, bypassing the wiki-link strip facade) so the
+         splice is byte-identical against what is actually stored.
+      2. carton_kv.apply_carton_obj_op applies one op at a dotted/indexed key_path,
+         producing the new full description with ONLY the target leaf changed (prose +
+         sibling fences byte-identical).
+      3. op 'get' returns the value and performs NO write. set/append/remove WRITE n.d
+         back via the SANCTIONED raw_concept REPLACE queue entry — consumed by the
+         daemon's LIVE parse path, observation_worker_daemon.parse_queue_file_to_concepts
+         (the raw_concept branch, called from the worker loop) ->
+         batch_create_concepts_neo4j with desc_update_mode='replace'. NOT a new write
+         path; NOT the dead create_concept_in_neo4j (and NOT process_queue_file,
+         which is dead code with zero callers).
+
+    Args:
+        concept_name: the carton concept whose n.d holds the fence.
+        kvobj_name:   the <CartonObj name=...> to target.
+        key_path:     dotted/indexed path, e.g. "units.cave.tier" or "order.1" ("" = root).
+        op:           "get" | "set" | "append" | "remove".
+        value:        python value for set/append; a ref is {"$ref": "Name"} (renders bare).
+        shared_connection: optional KnowledgeGraphBuilder (the MCP passes its _neo4j_conn).
+
+    Returns: a result dict {success, op, concept, kvobj, key_path, value?, queued?, error?}.
+    """
+    import json as _json
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    from . import carton_kv
+    from .add_concept_tool import get_observation_queue_dir, _get_module_connection
+
+    graph = shared_connection or _get_module_connection()
+    if graph is None:
+        return {"success": False, "error": "no neo4j connection available"}
+
+    # 1) READ n.d RAW (no wiki-link strip → byte-identical splice basis)
+    rows = graph.execute_query(
+        "MATCH (c:Wiki) WHERE c.n = $name AND c.d IS NOT NULL RETURN c.d AS d LIMIT 1",
+        {"name": concept_name},
+    )
+    if not rows:
+        return {"success": False,
+                "error": f"concept {concept_name!r} not found or has no description"}
+    description = rows[0]["d"]
+
+    # 2) apply the op
+    removed_fences = []
+    if op == "remove_fence":
+        # explicit WHOLE-fence deletion: remove the fence span and mark removed_fences so the
+        # daemon's fence-preservation guard does NOT carry it back. This is the ONLY way a whole
+        # fence is deleted — an accidental prose write can never drop one.
+        try:
+            new_description = carton_kv.remove_carton_obj(description, kvobj_name)
+        except (KeyError, ValueError) as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+        removed_fences = [kvobj_name]
+        result_value = None
+    else:
+        try:
+            new_description, result_value = carton_kv.apply_carton_obj_op(
+                description, kvobj_name, key_path, op, value
+            )
+        except (KeyError, ValueError, IndexError, TypeError) as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+        # 3) get → no write
+        if op == "get":
+            return {"success": True, "op": "get", "concept": concept_name,
+                    "kvobj": kvobj_name, "key_path": key_path, "value": result_value}
+
+        # 3.5) FUZZY did-you-mean GUARD (the stub-disease cure): a write must NOT introduce an
+        #      unresolved bare ref. Check refs in the NEW value; refuse + suggest if any miss.
+        if op in ("set", "append") and value is not None:
+            from . import carton_kv as _ckv
+            new_refs = _ckv.extract_refs(value)
+            if new_refs:
+                chk = check_kv_refs(new_refs, graph)
+                if not chk["ok"]:
+                    return {"success": False, "op": op, "concept": concept_name,
+                            "kvobj": kvobj_name, "key_path": key_path,
+                            "error": "unresolved bare ref(s) — refusing write (no stub spawned)",
+                            "did_you_mean": chk["unresolved"]}
+
+    # 4) write n.d back via the SANCTIONED raw_concept REPLACE queue entry
+    #    (observation_worker_daemon raw_concept branch -> batch_create_concepts_neo4j;
+    #     desc_update_mode='replace' honored; removed_fences tells the fence-preservation guard
+    #     which fences are INTENTIONALLY gone so it doesn't carry them back)
+    queue_entry = {
+        "raw_concept": True,
+        "concept_name": concept_name,
+        "description": new_description,
+        "relationships": [],                 # empty = leave existing rels untouched (MERGE-only)
+        "desc_update_mode": "replace",
+        "removed_fences": removed_fences,
+        "timestamp": _dt.now().isoformat(),
+    }
+    queue_dir = get_observation_queue_dir()
+    fname = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{str(_uuid.uuid4())[:8]}_concept.json"
+    qpath = queue_dir / fname
+    with open(qpath, "w") as f:
+        _json.dump(queue_entry, f, indent=2)
+
+    return {"success": True, "op": op, "concept": concept_name, "kvobj": kvobj_name,
+            "key_path": key_path, "value": result_value, "queued": fname}
+
+
+def check_kv_refs(ref_names, graph, max_suggestions=3):
+    """FUZZY did-you-mean over CartON KV bare refs. For each ref name, check it resolves to
+    an existing :Wiki concept; for each that does NOT, compute nearest existing names (via a
+    cheap token-prefix candidate query + difflib). Returns
+    {"ok": bool, "unresolved": {ref_name: [suggestion, ...]}}. NEVER creates a node — this is
+    the cure for the auto-stub disease (an unresolved KV ref is refused, not stubbed)."""
+    import difflib
+    import re as _re
+    unresolved = {}
+    for name in sorted(set(r for r in ref_names if r)):
+        exists = graph.execute_query(
+            "MATCH (c:Wiki {n: $n}) RETURN c.n AS n LIMIT 1", {"n": name})
+        if exists:
+            continue
+        token = _re.split(r"_", name)[0].lower()
+        candidates = []
+        if token:
+            rows = graph.execute_query(
+                "MATCH (c:Wiki) WHERE toLower(c.n) CONTAINS $tok RETURN c.n AS n LIMIT 300",
+                {"tok": token})
+            candidates = [r["n"] for r in rows if r.get("n")]
+        suggestions = difflib.get_close_matches(name, candidates, n=max_suggestions, cutoff=0.4)
+        unresolved[name] = suggestions
+    return {"ok": len(unresolved) == 0, "unresolved": unresolved}
+
+
+def register_kv_schemas(concept_name, description, graph):
+    """SOUP-layer (plain KG, NOT SOMA/typed) auto-typing of CartON KV schemas. For each fence
+    in `description`: an is_schema=true fence types its concept IS_A Carton_Kv_Schema (the
+    browsable registry) and adds optional what_for/how edges (when the attr value is a concept);
+    a schema=<Concept> reference fence adds USES_KV_SCHEMA / USED_BY_KV edges (MATCH-both so an
+    undefined schema is NEVER stubbed). Returns {"typed_schemas": [...], "uses_schemas": [...]}."""
+    from . import carton_kv
+    typed, uses = [], []
+    try:
+        fences = carton_kv.find_carton_objs(description)
+    except Exception:
+        return {"typed_schemas": [], "uses_schemas": []}
+    for f in fences:
+        if f.is_schema:
+            graph.execute_query(
+                """
+                MATCH (c:Wiki {n: $cn})
+                MERGE (s:Wiki {n: 'Carton_Kv_Schema'})
+                  ON CREATE SET s.c = 'carton_kv_schema',
+                                s.d = 'Type of CartON KV schema concepts (concepts carrying an is_schema=true CartonObj fence).',
+                                s.t = datetime()
+                MERGE (c)-[:IS_A]->(s)
+                """,
+                {"cn": concept_name})
+            typed.append(f.name)
+            for attr, rel in (("what_for", "WHAT_FOR"), ("how", "HOW")):
+                val = f.attrs.get(attr)
+                if val and carton_kv.is_title_underscore(val):
+                    graph.execute_query(
+                        f"MATCH (c:Wiki {{n: $cn}}), (t:Wiki {{n: $t}}) MERGE (c)-[:{rel}]->(t)",
+                        {"cn": concept_name, "t": val})
+        if f.schema:
+            graph.execute_query(
+                """
+                MATCH (c:Wiki {n: $cn}), (sc:Wiki {n: $sn})
+                MERGE (c)-[:USES_KV_SCHEMA]->(sc)
+                MERGE (sc)-[:USED_BY_KV]->(c)
+                """,
+                {"cn": concept_name, "sn": f.schema})
+            uses.append(f.schema)
+    return {"typed_schemas": typed, "uses_schemas": uses}
+
+
+def validate_carton_obj(concept_name, kvobj_name, graph):
+    """Validate ONE CartonObj fence: (a) resolve its schema=<Concept> attr → load that schema
+    concept's is_schema fence (the json-schema body) → json-schema validate the (dereffed) body,
+    reporting WHICH key failed; (b) check every bare ref resolves (fuzzy did-you-mean). Returns
+    {"success", "concept", "kvobj", "schema", "valid", "errors": [{path,message}], "unresolved_refs"}."""
+    from . import carton_kv
+    rows = graph.execute_query(
+        "MATCH (c:Wiki) WHERE c.n = $n AND c.d IS NOT NULL RETURN c.d AS d LIMIT 1", {"n": concept_name})
+    if not rows:
+        return {"success": False, "error": f"concept {concept_name!r} not found or has no description"}
+    fence = carton_kv.get_carton_obj(rows[0]["d"], kvobj_name)
+    if fence is None:
+        return {"success": False, "error": f"no CartonObj named {kvobj_name!r} in {concept_name!r}"}
+
+    errors = []
+    # (b) ref resolution
+    ref_chk = check_kv_refs(carton_kv.extract_refs(fence.obj), graph)
+
+    # (a) schema validation
+    if fence.schema:
+        srows = graph.execute_query(
+            "MATCH (c:Wiki) WHERE c.n = $n AND c.d IS NOT NULL RETURN c.d AS d LIMIT 1", {"n": fence.schema})
+        if not srows:
+            errors.append({"path": "(schema)", "message": f"schema concept {fence.schema!r} not found"})
+        else:
+            sfence = next((x for x in carton_kv.find_carton_objs(srows[0]["d"]) if x.is_schema), None)
+            if sfence is None:
+                errors.append({"path": "(schema)", "message": f"{fence.schema!r} has no is_schema=true fence"})
+            else:
+                try:
+                    errors.extend(carton_kv.validate_against_schema(fence.obj, sfence.obj))
+                except Exception as e:
+                    errors.append({"path": "(schema)", "message": f"validation error: {e}"})
+
+    return {"success": True, "concept": concept_name, "kvobj": kvobj_name, "schema": fence.schema,
+            "valid": (len(errors) == 0 and ref_chk["ok"]),
+            "errors": errors, "unresolved_refs": ref_chk["unresolved"]}
+
+
+def expand_carton_refs(description, graph, depth=1):
+    """READ-TIME ref-expansion (graph-bound wrapper over carton_kv.expand_refs_in_description).
+    Returns a RENDER-ONLY copy of `description` where each bare ref inside a CartonObj is replaced
+    with the referenced concept's description + relationships, recursive to `depth`, cycle-guarded.
+    The STORED n.d is never mutated. depth<=0 returns the description unchanged."""
+    from . import carton_kv
+
+    def _fetch(name):
+        rows = graph.execute_query(
+            """
+            MATCH (c:Wiki) WHERE c.n = $n AND c.d IS NOT NULL
+            OPTIONAL MATCH (c)-[r]->(t:Wiki)
+            RETURN c.d AS d, collect({type: type(r), target: t.n}) AS rels LIMIT 1
+            """,
+            {"n": name})
+        if not rows or not rows[0].get("d"):
+            return None
+        rels = [(x["type"].lower(), x["target"])
+                for x in (rows[0].get("rels") or []) if x and x.get("type")]
+        return {"description": strip_wiki_links(rows[0]["d"]), "relationships": rels}
+
+    return carton_kv.expand_refs_in_description(description, _fetch, depth)
+
+
+# --------------------------------------------------------------------------- #
+# PROPERTY SURFACE (Phase 1 of the carton programming model — additive, SYNC,
+# carton-mcp-only). Properties are neo4j node properties OTHER than the reserved
+# managed fields. They never touch n.d, so NO linker / fence machinery is in play
+# — which is exactly why these are SYNCHRONOUS direct writes (read-after-write),
+# unlike the async observation queue. NEVER create nodes here (MATCH, not MERGE).
+# --------------------------------------------------------------------------- #
+
+# Managed fields that the daemon/linker/timeline own. Refuse to set or remove these
+# via the property surface (they are not user data).
+RESERVED_PROPERTY_KEYS = frozenset({
+    "n", "d", "t", "c", "linked", "score", "source",
+    "timeline_linked", "odyssey_linked", "system_generated", "last_modified",
+    # region = the SOMA-calculated vertical verdict (SOUP/CODE/SYSTEM_TYPE/ONT). It is a MANAGED
+    # field written ONLY by the daemon from the verdict (direct Cypher, observation_worker_daemon
+    # SET n.region=...). It must NEVER be arbitrarily settable via set_properties — you cannot set
+    # the region, it is calculated. (Isaac 2026-06-20.)
+    "region",
+})
+
+# Scalar property value types accepted directly.
+_SCALAR_PROP_TYPES = (str, int, float, bool)
+
+# --------------------------------------------------------------------------- #
+# PROPERTY → SOMA TRAIL (Option-4 hybrid stratification — Isaac ruled
+# "properties first"). The direct property write (above) ALWAYS happens first
+# and is NEVER blocked by anything here. ADDITIONALLY, a property change on an
+# ONTOLOGY-BEARING node emits a thin SOMA observation trail (a "this property
+# changed" record), reusing add_concept's EXACT SOMA wire format. SCRATCH
+# classes (and untyped nodes) get NO trail — they are pure scratch state.
+# The trail is best-effort: SOMA down → warn-and-proceed (the write already
+# succeeded), exactly like add_concept's soft-warn behavior.
+# --------------------------------------------------------------------------- #
+
+# Classes whose property changes are pure scratch state — NO SOMA trail.
+_DEFAULT_SCRATCH_PROPERTY_CLASSES = frozenset({
+    "Blog_Request", "Chain_Step", "Bundle_Step", "Plan_Graph",
+    "Carton_Collection", "Journal_Entry",
+})
+
+
+def _scratch_property_classes():
+    """The scratch class set. Env var CARTON_SCRATCH_PROPERTY_CLASSES (comma-separated)
+    REPLACES the default set when present and non-empty; otherwise the default is used.
+    Read at call time so the env override is honored without re-import."""
+    raw = os.getenv("CARTON_SCRATCH_PROPERTY_CLASSES")
+    if raw and raw.strip():
+        names = [n.strip() for n in raw.split(",") if n.strip()]
+        if names:
+            return frozenset(names)
+    return _DEFAULT_SCRATCH_PROPERTY_CLASSES
+
+
+# Module-level alias for the default set (so importers can see the doctrine's defaults).
+SCRATCH_PROPERTY_CLASSES = _DEFAULT_SCRATCH_PROPERTY_CLASSES
+
+
+def _soma_property_value_type(value):
+    """Pick the SOMA programming-type string for a property value's python type.
+    Order is bool → int → float → str BECAUSE isinstance(True, int) is True in Python,
+    so bool MUST be checked before int. Anything else falls through to string_value."""
+    if isinstance(value, bool):
+        return "bool_value"
+    if isinstance(value, int):
+        return "int_value"
+    if isinstance(value, float):
+        return "float_value"
+    return "string_value"
+
+
+def _emit_property_trail(concept_name, changed_props, connection):
+    """Best-effort SOMA observation trail for a property change on an ontology-bearing node.
+
+    Stratification (Isaac's Option-4 hybrid): the direct property write already happened
+    and is NEVER undone by this function. Here we ONLY decide whether to emit a thin SOMA
+    observation recording the changed properties, and try to POST it.
+
+    Returns a STATUS STRING (not a bare bool, so the caller can build a correct report line):
+      - "scratch-lane"     : node has NO is_a types, OR any is_a type is in the scratch set
+                             → no trail emitted (this is the scratch lane).
+      - "emitted"          : the SOMA POST got a real HTTP response (any 2xx).
+      - "soma-unreachable" : the POST failed (connection refused / timeout / non-2xx)
+                             → the property write already succeeded and STAYS succeeded.
+
+    Args:
+        concept_name: the concept whose property changed.
+        changed_props: dict of {key: value} that was just SET (merge mode).
+        connection: the neo4j KnowledgeGraphBuilder (same one set_concept_properties used).
+    """
+    import json as _json
+    import urllib.request as _urllib_request
+
+    # 1) Query the node's is_a types (same connection/driver the rest of the file uses).
+    try:
+        rows = connection.execute_query(
+            "MATCH (c:Wiki {n: $n})-[:IS_A]->(t:Wiki) RETURN collect(t.n) AS types",
+            {"n": concept_name},
+        )
+    except Exception as e:
+        logger.warning(f"property-trail: is_a query failed for {concept_name!r}: {e}")
+        return "soma-unreachable"
+    types = (rows[0].get("types") if rows and rows[0] else None) or []
+
+    # 2) No types at all, OR any type in the scratch set → scratch lane (no trail).
+    scratch = _scratch_property_classes()
+    if not types or any(t in scratch for t in types):
+        return "scratch-lane"
+
+    # 3) Build ONE observation per THE ENCODING (v0) and POST it to SOMA.
+    relationships = []
+    for k, v in changed_props.items():
+        relationships.append({
+            "relationship": "hasProperty_" + str(k),
+            "related": [{"value": str(v), "type": _soma_property_value_type(v)}],
+        })
+    obs = {
+        "source": "set_properties",
+        "name": concept_name,
+        "description": "",
+        "relationships": relationships,
+    }
+    body = _json.dumps(
+        {"source": "set_properties", "observations": [obs], "domain": None}
+    ).encode()
+
+    # Use the SAME SOMA_URL/route add_concept's soma_validate POSTs to (no invented route).
+    try:
+        from .add_concept_tool import SOMA_URL as _SOMA_URL
+    except Exception:
+        _SOMA_URL = "http://localhost:8091/event"
+
+    try:
+        req = _urllib_request.Request(
+            _SOMA_URL, data=body, headers={"Content-Type": "application/json"})
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            if 200 <= int(status) < 300:
+                return "emitted"
+            logger.warning(
+                f"property-trail: SOMA returned status {status} for {concept_name!r}")
+            return "soma-unreachable"
+    except Exception as e:
+        logger.warning(f"property-trail: SOMA POST failed for {concept_name!r}: {e}")
+        return "soma-unreachable"
+
+
+def _validate_property_value(key, value):
+    """Return None if `value` is an acceptable property value, else an error string.
+    Accepts str/int/float/bool and FLAT lists of those. Refuses dicts (nested objects)
+    and lists containing non-scalars — the caller must flatten or json.dumps it."""
+    if isinstance(value, bool) or isinstance(value, (str, int, float)):
+        return None
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            if not (isinstance(item, bool) or isinstance(item, (str, int, float))):
+                return (f"list value for {key!r} has non-scalar element at index {i} "
+                        f"({type(item).__name__}); flatten it or json.dumps it yourself")
+        return None
+    return (f"value for {key!r} is {type(value).__name__}; only str/int/float/bool "
+            f"or flat lists of those are allowed — flatten it or json.dumps it yourself")
+
+
+def set_concept_properties(concept_name, properties, mode="merge", shared_connection=None):
+    """Set or remove NON-reserved neo4j properties on an EXISTING concept — SYNCHRONOUSLY
+    (direct write, read-after-write), bypassing the observation queue. Safe because
+    properties never touch n.d, so no linker/fence machinery runs.
+
+    Args:
+        concept_name: the concept to update. MUST already exist (MATCH, not MERGE).
+        properties:   dict of {key: value}. For mode="merge" the values are SET;
+                      for mode="remove" the keys are REMOVEd (values ignored).
+        mode:         "merge" (default) sets the given keys; "remove" removes them.
+        shared_connection: optional KnowledgeGraphBuilder (the MCP passes its _neo4j_conn).
+
+    Reserved keys (n, d, t, c, linked, score, source, timeline_linked, odyssey_linked,
+    system_generated, last_modified) are REFUSED — they are managed fields, never user data.
+
+    Value types: str/int/float/bool and flat lists of those. A dict value (nested object)
+    is REFUSED — flatten it or json.dumps it yourself.
+
+    Returns {success, concept, updated_keys, refused_keys, removed_keys, error}.
+    """
+    from .add_concept_tool import _get_module_connection
+
+    graph = shared_connection or _get_module_connection()
+    if graph is None:
+        return {"success": False, "concept": concept_name,
+                "updated_keys": [], "refused_keys": [], "removed_keys": [],
+                "error": "no neo4j connection available"}
+
+    if mode not in ("merge", "remove"):
+        return {"success": False, "concept": concept_name,
+                "updated_keys": [], "refused_keys": [], "removed_keys": [],
+                "error": f"unknown mode {mode!r}; expected 'merge' or 'remove'"}
+
+    if not isinstance(properties, dict) or not properties:
+        return {"success": False, "concept": concept_name,
+                "updated_keys": [], "refused_keys": [], "removed_keys": [],
+                "error": "properties must be a non-empty dict"}
+
+    # Partition keys: reserved → refused; the rest → candidates.
+    refused = [k for k in properties if k in RESERVED_PROPERTY_KEYS]
+    candidates = {k: v for k, v in properties.items() if k not in RESERVED_PROPERTY_KEYS}
+
+    # Concept must EXIST (MATCH, never create).
+    exists = graph.execute_query(
+        "MATCH (c:Wiki {n: $n}) RETURN c.n AS n LIMIT 1", {"n": concept_name})
+    if not exists:
+        return {"success": False, "concept": concept_name,
+                "updated_keys": [], "refused_keys": refused, "removed_keys": [],
+                "error": f"concept {concept_name!r} not found"}
+
+    if mode == "remove":
+        removed = list(candidates.keys())
+        if not removed:
+            return {"success": True, "concept": concept_name, "updated_keys": [],
+                    "refused_keys": refused, "removed_keys": [],
+                    "error": None if not refused else "only reserved keys given; nothing removed"}
+        # REMOVE c.`key` clauses — keys are backtick-quoted (never user-interpolated as values).
+        remove_clauses = ", ".join(f"c.`{k}`" for k in removed)
+        graph.execute_query(
+            f"MATCH (c:Wiki {{n: $n}}) REMOVE {remove_clauses}", {"n": concept_name})
+        return {"success": True, "concept": concept_name, "updated_keys": [],
+                "refused_keys": refused, "removed_keys": removed, "error": None}
+
+    # mode == "merge": validate value types BEFORE writing (refuse the whole call on a bad value).
+    for k, v in candidates.items():
+        err = _validate_property_value(k, v)
+        if err is not None:
+            return {"success": False, "concept": concept_name, "updated_keys": [],
+                    "refused_keys": refused, "removed_keys": [], "error": err}
+
+    if not candidates:
+        return {"success": True, "concept": concept_name, "updated_keys": [],
+                "refused_keys": refused, "removed_keys": [],
+                "error": None if not refused else "only reserved keys given; nothing set"}
+
+    # SET c += $props — parameterized map, no value interpolation.
+    graph.execute_query(
+        "MATCH (c:Wiki {n: $n}) SET c += $props", {"n": concept_name, "props": candidates})
+
+    # ADDITIVE: emit a thin SOMA observation trail for ontology-bearing nodes (Option-4
+    # hybrid). The direct write above ALREADY succeeded; the trail is best-effort and is
+    # wrapped so it can NEVER raise out of this function (a trail failure must not fail the
+    # property write). Trail status is reported but does not change updated_keys/success.
+    trail_status = "scratch-lane"
+    try:
+        trail_status = _emit_property_trail(concept_name, candidates, graph)
+    except Exception as e:  # belt-and-suspenders: the trail can never kill the main path
+        logger.warning(f"property-trail: unexpected error for {concept_name!r}: {e}")
+        trail_status = "soma-unreachable"
+
+    return {"success": True, "concept": concept_name,
+            "updated_keys": list(candidates.keys()),
+            "refused_keys": refused, "removed_keys": [], "error": None,
+            "trail": trail_status}
+
+
+def query_concepts_by_properties(where, limit=25, shared_connection=None):
+    """Find concepts whose properties EXACTLY match every key/value in `where` (AND).
+    Parameterized Cypher only — property VALUES are never string-interpolated.
+
+    Args:
+        where: non-empty dict of {property_key: exact_value} to match (AND).
+        limit: max rows (default 25).
+        shared_connection: optional KnowledgeGraphBuilder.
+
+    Returns {success, results: [{n, <matched+requested props>}], error}.
+    Each result carries the concept name plus the value of every key in `where`.
+    """
+    from .add_concept_tool import _get_module_connection
+
+    graph = shared_connection or _get_module_connection()
+    if graph is None:
+        return {"success": False, "results": [], "error": "no neo4j connection available"}
+
+    if not isinstance(where, dict) or not where:
+        return {"success": False, "results": [], "error": "where must be a non-empty dict"}
+
+    try:
+        lim = int(limit)
+    except (ValueError, TypeError):
+        lim = 25
+    if lim <= 0:
+        lim = 25
+
+    # Property keys are backtick-quoted identifiers; values are $params (never interpolated).
+    where_clauses = " AND ".join(f"c.`{k}` = $w_{i}" for i, k in enumerate(where))
+    params = {f"w_{i}": v for i, (k, v) in enumerate(where.items())}
+    params["lim"] = lim
+    return_props = ", ".join(f"c.`{k}` AS `{k}`" for k in where)
+    cypher = (f"MATCH (c:Wiki) WHERE {where_clauses} "
+              f"RETURN c.n AS n, {return_props} LIMIT $lim")
+    rows = graph.execute_query(cypher, params)
+    results = [dict(r) for r in (rows or [])]
+    return {"success": True, "results": results, "error": None}
+
+
+def remove_concept_relationship(source, rel_type, target, shared_connection=None):
+    """SYNCHRONOUSLY delete exactly the relationship (source)-[:REL_TYPE]->(target).
+    This does not exist anywhere else; relationship CREATION is via add_concept.
+
+    rel_type is validated against ^[A-Za-z_]+$ before being interpolated as a Cypher
+    relationship type (rel types CANNOT be parameters, so the name is strictly sanitized).
+    source/target are passed as $params.
+
+    Returns {success, source, rel_type, target, deleted_count, error}.
+    """
+    from .add_concept_tool import _get_module_connection
+
+    graph = shared_connection or _get_module_connection()
+    if graph is None:
+        return {"success": False, "source": source, "rel_type": rel_type, "target": target,
+                "deleted_count": 0, "error": "no neo4j connection available"}
+
+    if not isinstance(rel_type, str) or not re.match(r"^[A-Za-z_]+$", rel_type):
+        return {"success": False, "source": source, "rel_type": rel_type, "target": target,
+                "deleted_count": 0,
+                "error": f"invalid rel_type {rel_type!r}; must match ^[A-Za-z_]+$"}
+
+    cypher = (f"MATCH (s:Wiki {{n: $s}})-[r:{rel_type}]->(t:Wiki {{n: $t}}) "
+              f"DELETE r RETURN count(r) AS deleted")
+    rows = graph.execute_query(cypher, {"s": source, "t": target})
+    deleted = (rows[0]["deleted"] if rows and "deleted" in rows[0] else 0)
+    return {"success": True, "source": source, "rel_type": rel_type, "target": target,
+            "deleted_count": deleted, "error": None}
+
 
 class CartOnUtils:
     """
@@ -121,280 +725,282 @@ class CartOnUtils:
             # Don't write flag if bootstrap failed
             raise
 
-    def bootstrap_ontology_types(self) -> bool:
-        """Bootstrap ontology template types if not already done.
+# DISABLED 2026-06-16 (SOMA-unification sprint, STEP 1). This bootstrap only WROTE A GRAPH (not real code), duplicating skill-pipeline ontology that already lives in SOMA's OWL: Skill / SkillSpec / Skill_Category(+3) are already classes in base/soma-prolog/soma_prolog/starsystem.owl; the ~24 Has_* nodes are just has_* predicate NAMES (they dissolve); Carton_Template dissolves (a "template" == a system-type-with-required-restrictions). Redundant -> commented out (NOT deleted yet; niceness pass later). SkillSpec also has a real paia-builder model (models.py:180) that may later be vaulted to supersede the OWL relic — a separate enhancement. Caller in server_fastmcp.py is likewise commented out.
+    # def bootstrap_ontology_types(self) -> bool:
+        # """Bootstrap ontology template types if not already done.
 
-        Creates foundation ontology concepts that HAS_VALIDATOR depends on:
-        - Carton_Template (root template type)
-        - Skillspec_Template (template for typed skills, with REQUIRES_RELATIONSHIP)
-        - Relationship type concepts: Has_Domain, Has_Category, Has_What, Has_When
+        # Creates foundation ontology concepts that HAS_VALIDATOR depends on:
+        # - Carton_Template (root template type)
+        # - Skillspec_Template (template for typed skills, with REQUIRES_RELATIONSHIP)
+        # - Relationship type concepts: Has_Domain, Has_Category, Has_What, Has_When
 
-        Uses filesystem flag to avoid repeated bootstrapping.
+        # Uses filesystem flag to avoid repeated bootstrapping.
 
-        Returns:
-            True if bootstrap was performed, False if already bootstrapped
-        """
-        base_path = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-        carton_dir = Path(base_path) / 'carton'
-        carton_dir.mkdir(parents=True, exist_ok=True)
+        # Returns:
+            # True if bootstrap was performed, False if already bootstrapped
+        # """
+        # base_path = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
+        # carton_dir = Path(base_path) / 'carton'
+        # carton_dir.mkdir(parents=True, exist_ok=True)
 
-        flag_file = carton_dir / 'ontology_types_bootstrapped.flag'
+        # flag_file = carton_dir / 'ontology_types_bootstrapped.flag'
 
-        if flag_file.exists():
-            logger.info("Ontology types already bootstrapped (flag file exists)")
-            return False
+        # if flag_file.exists():
+            # logger.info("Ontology types already bootstrapped (flag file exists)")
+            # return False
 
-        logger.info("Bootstrapping ontology type system...")
+        # logger.info("Bootstrapping ontology type system...")
 
-        from .add_concept_tool import add_concept_tool_func
+        # from .add_concept_tool import add_concept_tool_func
 
-        try:
-            # Create Carton_Template root type
-            add_concept_tool_func(
-                concept_name="Carton_Template",
-                description="Root type for CartON templates. Templates define required relationships that child concepts must provide (via REQUIRES_RELATIONSHIP edges). HAS_VALIDATOR checks these at add_concept time.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Concept"]},
-                    {"relationship": "part_of", "related": ["CartON_System"]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+        # try:
+            # # Create Carton_Template root type
+            # add_concept_tool_func(
+                # concept_name="Carton_Template",
+                # description="Root type for CartON templates. Templates define required relationships that child concepts must provide (via REQUIRES_RELATIONSHIP edges). HAS_VALIDATOR checks these at add_concept time.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Concept"]},
+                    # {"relationship": "part_of", "related": ["CartON_System"]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            # Create relationship type concepts
-            for rel_name, rel_desc in [
-                ("Has_Domain", "Relationship type indicating domain membership (e.g., Paiab, Sanctum, Cave)"),
-                ("Has_Category", "Relationship type indicating skill category (understand, preflight, single_turn_process)"),
-                ("Has_What", "Relationship type describing what a skill does"),
-                ("Has_When", "Relationship type describing when to use a skill"),
-                ("Has_Produces", "Relationship type declaring what a skill produces/instantiates (the output artifact, NOT the pattern type)"),
-                # Skill structure and content
-                ("Has_Subdomain", "Relationship type indicating subdomain within a domain"),
-                ("Has_Content", "Relationship type linking to skill body content (truncated hash reference)"),
-                ("Has_Reference", "Relationship type linking to reference.md table of contents"),
-                ("Has_Resources", "Relationship type linking to resource files listing"),
-                ("Has_Scripts", "Relationship type linking to executable scripts listing"),
-                ("Has_Templates", "Relationship type linking to template files listing"),
-                # Claude Code integration fields
-                ("Has_Allowed_Tools", "Relationship type for Claude allowed-tools field (comma-separated tool names)"),
-                ("Has_Model", "Relationship type for Claude model field (which model to use)"),
-                ("Has_Context_Mode", "Relationship type for Claude context field (fork/inline execution mode)"),
-                ("Has_Agent_Type", "Relationship type for Claude agent field (subagent type when context=fork)"),
-                ("Has_Hook", "Relationship type for Claude hooks field (PreToolUse/PostToolUse)"),
-                ("Has_User_Invocable", "Relationship type for Claude user-invocable field (show in / menu)"),
-                ("Has_Disable_Model_Invocation", "Relationship type for Claude disable-model-invocation field"),
-                ("Has_Argument_Hint", "Relationship type for Claude argument-hint field (autocomplete hint)"),
-                # System links
-                ("Has_Requires", "Relationship type linking to understand skill dependencies"),
-                ("Has_Describes_Component", "Relationship type linking to GIINT component path"),
-                ("Has_Starsystem", "Relationship type linking to project/starsystem"),
-            ]:
-                add_concept_tool_func(
-                    concept_name=rel_name,
-                    description=rel_desc,
-                    relationships=[
-                        {"relationship": "is_a", "related": ["Relationship_Type"]},
-                        {"relationship": "part_of", "related": ["CartON_System"]}
-                    ],
-                    hide_youknow=True,
-                    shared_connection=self._shared_conn
-                )
+            # # Create relationship type concepts
+            # for rel_name, rel_desc in [
+                # ("Has_Domain", "Relationship type indicating domain membership (e.g., Paiab, Sanctum, Cave)"),
+                # ("Has_Category", "Relationship type indicating skill category (understand, preflight, single_turn_process)"),
+                # ("Has_What", "Relationship type describing what a skill does"),
+                # ("Has_When", "Relationship type describing when to use a skill"),
+                # ("Has_Produces", "Relationship type declaring what a skill produces/instantiates (the output artifact, NOT the pattern type)"),
+                # # Skill structure and content
+                # ("Has_Subdomain", "Relationship type indicating subdomain within a domain"),
+                # ("Has_Content", "Relationship type linking to skill body content (truncated hash reference)"),
+                # ("Has_Reference", "Relationship type linking to reference.md table of contents"),
+                # ("Has_Resources", "Relationship type linking to resource files listing"),
+                # ("Has_Scripts", "Relationship type linking to executable scripts listing"),
+                # ("Has_Templates", "Relationship type linking to template files listing"),
+                # # Claude Code integration fields
+                # ("Has_Allowed_Tools", "Relationship type for Claude allowed-tools field (comma-separated tool names)"),
+                # ("Has_Model", "Relationship type for Claude model field (which model to use)"),
+                # ("Has_Context_Mode", "Relationship type for Claude context field (fork/inline execution mode)"),
+                # ("Has_Agent_Type", "Relationship type for Claude agent field (subagent type when context=fork)"),
+                # ("Has_Hook", "Relationship type for Claude hooks field (PreToolUse/PostToolUse)"),
+                # ("Has_User_Invocable", "Relationship type for Claude user-invocable field (show in / menu)"),
+                # ("Has_Disable_Model_Invocation", "Relationship type for Claude disable-model-invocation field"),
+                # ("Has_Argument_Hint", "Relationship type for Claude argument-hint field (autocomplete hint)"),
+                # # System links
+                # ("Has_Requires", "Relationship type linking to understand skill dependencies"),
+                # ("Has_Describes_Component", "Relationship type linking to GIINT component path"),
+                # ("Has_Starsystem", "Relationship type linking to project/starsystem"),
+            # ]:
+                # add_concept_tool_func(
+                    # concept_name=rel_name,
+                    # description=rel_desc,
+                    # relationships=[
+                        # {"relationship": "is_a", "related": ["Relationship_Type"]},
+                        # {"relationship": "part_of", "related": ["CartON_System"]}
+                    # ],
+                    # hide_youknow=True,
+                    # shared_connection=self._shared_conn
+                # )
 
-            # Create canonical skill category types
-            for cat_name, cat_desc in [
-                ("Skill_Category", "Root type for skill categories. Claude Code has one native type (skill). Categories are our typed layer on top."),
-                ("Skill_Category_Understand", "Skills for discussion/recall of domain knowledge. Equip to talk about or remember a domain."),
-                ("Skill_Category_Preflight", "Skills that prime for work and point to flight configs. Equip before starting a workflow."),
-                ("Skill_Category_Single_Turn_Process", "Skills with context + immediate action. Equip and do in one turn."),
-            ]:
-                add_concept_tool_func(
-                    concept_name=cat_name,
-                    description=cat_desc,
-                    relationships=[
-                        {"relationship": "is_a", "related": ["Skill_Category"] if cat_name != "Skill_Category" else ["Concept"]},
-                        {"relationship": "part_of", "related": ["CartON_System"]}
-                    ],
-                    hide_youknow=True,
-                    shared_connection=self._shared_conn
-                )
+            # # Create canonical skill category types
+            # for cat_name, cat_desc in [
+                # ("Skill_Category", "Root type for skill categories. Claude Code has one native type (skill). Categories are our typed layer on top."),
+                # ("Skill_Category_Understand", "Skills for discussion/recall of domain knowledge. Equip to talk about or remember a domain."),
+                # ("Skill_Category_Preflight", "Skills that prime for work and point to flight configs. Equip before starting a workflow."),
+                # ("Skill_Category_Single_Turn_Process", "Skills with context + immediate action. Equip and do in one turn."),
+            # ]:
+                # add_concept_tool_func(
+                    # concept_name=cat_name,
+                    # description=cat_desc,
+                    # relationships=[
+                        # {"relationship": "is_a", "related": ["Skill_Category"] if cat_name != "Skill_Category" else ["Concept"]},
+                        # {"relationship": "part_of", "related": ["CartON_System"]}
+                    # ],
+                    # hide_youknow=True,
+                    # shared_connection=self._shared_conn
+                # )
 
-            # Create Skillspec_Template with REQUIRES_RELATIONSHIP edges
-            add_concept_tool_func(
-                concept_name="Skillspec_Template",
-                description="Template for skill metadata envelope (SkillSpec). Enforces required relationships for skill discovery: domain, category, what, when, produces. Extended fields: subdomain, requires, describes_component, starsystem.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Carton_Template"]},
-                    {"relationship": "part_of", "related": ["Skill_Projection_Pipeline_Feb8"]},
-                    {"relationship": "instantiates", "related": ["Template_Pattern"]},
-                    {"relationship": "REQUIRES_RELATIONSHIP", "related": [
-                        "Has_Domain", "Has_Category", "Has_What", "Has_When", "Has_Produces",
-                        "Has_Subdomain", "Has_Requires", "Has_Describes_Component", "Has_Starsystem"
-                    ]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+            # # Create Skillspec_Template with REQUIRES_RELATIONSHIP edges
+            # add_concept_tool_func(
+                # concept_name="Skillspec_Template",
+                # description="Template for skill metadata envelope (SkillSpec). Enforces required relationships for skill discovery: domain, category, what, when, produces. Extended fields: subdomain, requires, describes_component, starsystem.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Carton_Template"]},
+                    # {"relationship": "part_of", "related": ["Skill_Projection_Pipeline_Feb8"]},
+                    # {"relationship": "instantiates", "related": ["Template_Pattern"]},
+                    # {"relationship": "REQUIRES_RELATIONSHIP", "related": [
+                        # "Has_Domain", "Has_Category", "Has_What", "Has_When", "Has_Produces",
+                        # "Has_Subdomain", "Has_Requires", "Has_Describes_Component", "Has_Starsystem"
+                    # ]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            # Create Skill_Template extending Skillspec_Template with content + Claude fields
-            add_concept_tool_func(
-                concept_name="Skill_Template",
-                description="Template for COMPLETE skill concepts. Extends Skillspec_Template with content, file structure, and Claude Code integration fields. A Skill is a SkillSpec PLUS the actual content body, reference docs, resources, scripts, templates, and Claude frontmatter fields.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Carton_Template"]},
-                    {"relationship": "extends", "related": ["Skillspec_Template"]},
-                    {"relationship": "part_of", "related": ["Skill_Projection_Pipeline_Feb8"]},
-                    {"relationship": "instantiates", "related": ["Template_Pattern"]},
-                    {"relationship": "REQUIRES_RELATIONSHIP", "related": [
-                        # SkillSpec fields (inherited)
-                        "Has_Domain", "Has_Category", "Has_What", "Has_When", "Has_Produces",
-                        # Content + structure
-                        "Has_Content", "Has_Reference", "Has_Resources", "Has_Scripts", "Has_Templates",
-                        # Claude Code integration
-                        "Has_Allowed_Tools", "Has_Model", "Has_Context_Mode", "Has_Agent_Type",
-                        "Has_Hook", "Has_User_Invocable", "Has_Disable_Model_Invocation", "Has_Argument_Hint",
-                        # System links
-                        "Has_Subdomain", "Has_Requires", "Has_Describes_Component", "Has_Starsystem",
-                    ]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+            # # Create Skill_Template extending Skillspec_Template with content + Claude fields
+            # add_concept_tool_func(
+                # concept_name="Skill_Template",
+                # description="Template for COMPLETE skill concepts. Extends Skillspec_Template with content, file structure, and Claude Code integration fields. A Skill is a SkillSpec PLUS the actual content body, reference docs, resources, scripts, templates, and Claude frontmatter fields.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Carton_Template"]},
+                    # {"relationship": "extends", "related": ["Skillspec_Template"]},
+                    # {"relationship": "part_of", "related": ["Skill_Projection_Pipeline_Feb8"]},
+                    # {"relationship": "instantiates", "related": ["Template_Pattern"]},
+                    # {"relationship": "REQUIRES_RELATIONSHIP", "related": [
+                        # # SkillSpec fields (inherited)
+                        # "Has_Domain", "Has_Category", "Has_What", "Has_When", "Has_Produces",
+                        # # Content + structure
+                        # "Has_Content", "Has_Reference", "Has_Resources", "Has_Scripts", "Has_Templates",
+                        # # Claude Code integration
+                        # "Has_Allowed_Tools", "Has_Model", "Has_Context_Mode", "Has_Agent_Type",
+                        # "Has_Hook", "Has_User_Invocable", "Has_Disable_Model_Invocation", "Has_Argument_Hint",
+                        # # System links
+                        # "Has_Subdomain", "Has_Requires", "Has_Describes_Component", "Has_Starsystem",
+                    # ]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            flag_file.write_text("Ontology type system bootstrapped successfully.\n")
-            logger.info("✅ Ontology type system bootstrapped successfully")
-            return True
+            # flag_file.write_text("Ontology type system bootstrapped successfully.\n")
+            # logger.info("✅ Ontology type system bootstrapped successfully")
+            # return True
 
-        except Exception as e:
-            logger.error(f"Failed to bootstrap ontology types: {e}")
-            raise
+        # except Exception as e:
+            # logger.error(f"Failed to bootstrap ontology types: {e}")
+            # raise
 
-    def bootstrap_memory_ontology_types(self) -> bool:
-        """Bootstrap memory architecture ontology types.
+# DISABLED 2026-06-16 (SOMA-unification sprint, STEP 1). This bootstrap only WROTE A GRAPH (not real code), duplicating ontology that now lives in SOMA's OWL: Memory_Tier / Memory_Tier_0..3 / UltraMap + the Hypercluster memory restrictions were added to base/soma-prolog/soma_prolog/starsystem.owl (Hypercluster itself was already there). Redundant -> commented out (NOT deleted yet; niceness pass later). Live graphs already have the nodes; fresh installs get them via the deferred auto-seed-from-SOMA (last step of the refactor). Caller in server_fastmcp.py is likewise commented out.
+    # def bootstrap_memory_ontology_types(self) -> bool:
+        # """Bootstrap memory architecture ontology types.
 
-        Creates types for the fractal memory tier system:
-        - HyperCluster: Groups of concepts tracking a GIINT_Project in memory
-        - Memory_Tier: Tier 0-3 placement (active → archived → faint → faintest)
-        - UltraMap: Sequencing/dependency relationships between clusters
-        - Relationship types: Has_Tier, Has_Why, Has_Status, Has_Level, Has_File_Path, etc.
-        - Concrete tier instances: Memory_Tier_0 through Memory_Tier_3
+        # Creates types for the fractal memory tier system:
+        # - HyperCluster: Groups of concepts tracking a GIINT_Project in memory
+        # - Memory_Tier: Tier 0-3 placement (active → archived → faint → faintest)
+        # - UltraMap: Sequencing/dependency relationships between clusters
+        # - Relationship types: Has_Tier, Has_Why, Has_Status, Has_Level, Has_File_Path, etc.
+        # - Concrete tier instances: Memory_Tier_0 through Memory_Tier_3
 
-        Uses filesystem flag to avoid repeated bootstrapping.
-        """
-        base_path = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-        carton_dir = Path(base_path) / 'carton'
-        carton_dir.mkdir(parents=True, exist_ok=True)
+        # Uses filesystem flag to avoid repeated bootstrapping.
+        # """
+        # base_path = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
+        # carton_dir = Path(base_path) / 'carton'
+        # carton_dir.mkdir(parents=True, exist_ok=True)
 
-        flag_file = carton_dir / 'memory_ontology_bootstrapped.flag'
+        # flag_file = carton_dir / 'memory_ontology_bootstrapped.flag'
 
-        if flag_file.exists():
-            logger.info("Memory ontology types already bootstrapped (flag file exists)")
-            return False
+        # if flag_file.exists():
+            # logger.info("Memory ontology types already bootstrapped (flag file exists)")
+            # return False
 
-        logger.info("Bootstrapping memory ontology type system...")
+        # logger.info("Bootstrapping memory ontology type system...")
 
-        from .add_concept_tool import add_concept_tool_func
+        # from .add_concept_tool import add_concept_tool_func
 
-        try:
-            # --- Relationship types for memory architecture ---
-            for rel_name, rel_desc in [
-                ("Has_Tier", "Relationship linking a HyperCluster to its Memory_Tier placement"),
-                ("Has_Why", "Relationship storing the one-line reason a HyperCluster matters"),
-                ("Has_Status", "Relationship indicating HyperCluster status: active, done, or archived"),
-                ("Has_Level", "Relationship storing numeric tier level (0, 1, 2, 3)"),
-                ("Has_File_Path", "Relationship linking a Memory_Tier to its filesystem projection path"),
-                ("Has_Sequence", "Relationship storing ordered sequence of HyperClusters in an UltraMap"),
-                ("Has_Giint_Project", "Relationship linking a HyperCluster to the GIINT_Project it tracks"),
-            ]:
-                add_concept_tool_func(
-                    concept_name=rel_name,
-                    description=rel_desc,
-                    relationships=[
-                        {"relationship": "is_a", "related": ["Relationship_Type"]},
-                        {"relationship": "part_of", "related": ["CartON_System"]}
-                    ],
-                    hide_youknow=True,
-                    shared_connection=self._shared_conn
-                )
+        # try:
+            # # --- Relationship types for memory architecture ---
+            # for rel_name, rel_desc in [
+                # ("Has_Tier", "Relationship linking a HyperCluster to its Memory_Tier placement"),
+                # ("Has_Why", "Relationship storing the one-line reason a HyperCluster matters"),
+                # ("Has_Status", "Relationship indicating HyperCluster status: active, done, or archived"),
+                # ("Has_Level", "Relationship storing numeric tier level (0, 1, 2, 3)"),
+                # ("Has_File_Path", "Relationship linking a Memory_Tier to its filesystem projection path"),
+                # ("Has_Sequence", "Relationship storing ordered sequence of HyperClusters in an UltraMap"),
+                # ("Has_Giint_Project", "Relationship linking a HyperCluster to the GIINT_Project it tracks"),
+            # ]:
+                # add_concept_tool_func(
+                    # concept_name=rel_name,
+                    # description=rel_desc,
+                    # relationships=[
+                        # {"relationship": "is_a", "related": ["Relationship_Type"]},
+                        # {"relationship": "part_of", "related": ["CartON_System"]}
+                    # ],
+                    # hide_youknow=True,
+                    # shared_connection=self._shared_conn
+                # )
 
-            # --- Core ontology types ---
-            add_concept_tool_func(
-                concept_name="HyperCluster",
-                description="A group of CartON concepts organized around a GIINT_Project within the fractal memory tier system. Each HyperCluster lives at a Memory_Tier (0=active in MEMORY.md, 1=archived in rules, 2=faint, 3=faintest). Contains concepts via HAS_PART, tracks status (active/done/archived), and has a one-line Why statement for MEMORY.md projection.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Carton_Ontology_Entity"]},
-                    {"relationship": "part_of", "related": ["CartON_System"]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+            # # --- Core ontology types ---
+            # add_concept_tool_func(
+                # concept_name="HyperCluster",
+                # description="A group of CartON concepts organized around a GIINT_Project within the fractal memory tier system. Each HyperCluster lives at a Memory_Tier (0=active in MEMORY.md, 1=archived in rules, 2=faint, 3=faintest). Contains concepts via HAS_PART, tracks status (active/done/archived), and has a one-line Why statement for MEMORY.md projection.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Carton_Ontology_Entity"]},
+                    # {"relationship": "part_of", "related": ["CartON_System"]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            add_concept_tool_func(
-                concept_name="Memory_Tier",
-                description="A tier in the fractal memory system. Tier 0 = MEMORY.md (active work, auto-injected). Tier 1 = rules files (completed GIINT_Projects). Tier 2 = faint memories (compressed collection names). Tier 3 = faintest memories (meta-compressed). Each tier has a file path for substrate projection.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Carton_Ontology_Entity"]},
-                    {"relationship": "part_of", "related": ["CartON_System"]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+            # add_concept_tool_func(
+                # concept_name="Memory_Tier",
+                # description="A tier in the fractal memory system. Tier 0 = MEMORY.md (active work, auto-injected). Tier 1 = rules files (completed GIINT_Projects). Tier 2 = faint memories (compressed collection names). Tier 3 = faintest memories (meta-compressed). Each tier has a file path for substrate projection.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Carton_Ontology_Entity"]},
+                    # {"relationship": "part_of", "related": ["CartON_System"]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            add_concept_tool_func(
-                concept_name="UltraMap",
-                description="A sequencing map showing how HyperClusters relate and which must complete before others. Encodes blocked-by dependencies and build order. Used to create task list dependencies when loaded.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Carton_Ontology_Entity"]},
-                    {"relationship": "part_of", "related": ["CartON_System"]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+            # add_concept_tool_func(
+                # concept_name="UltraMap",
+                # description="A sequencing map showing how HyperClusters relate and which must complete before others. Encodes blocked-by dependencies and build order. Used to create task list dependencies when loaded.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Carton_Ontology_Entity"]},
+                    # {"relationship": "part_of", "related": ["CartON_System"]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            # --- Concrete tier instances ---
-            tier_data = [
-                ("Memory_Tier_0", "Active work tier. Projected to MEMORY.md. Auto-injected every conversation. Max ~100 lines of concept names + Why statements.", "/home/GOD/.claude/projects/-home-GOD/memory/MEMORY.md"),
-                ("Memory_Tier_1", "Completed GIINT_Projects tier. Projected to .claude/rules/giint-projects-{date}.md. Auto-loaded every conversation.", "/home/GOD/.claude/rules/"),
-                ("Memory_Tier_2", "Faint memories tier. Compressed collection names. Projected to .claude/rules/faint-memories-L1.md.", "/home/GOD/.claude/rules/faint-memories-L1.md"),
-                ("Memory_Tier_3", "Faintest memories tier. Meta-compressed. Projected to .claude/rules/faintest-memories-L2.md.", "/home/GOD/.claude/rules/faintest-memories-L2.md"),
-            ]
-            for tier_name, tier_desc, tier_path in tier_data:
-                level = tier_name[-1]  # "0", "1", "2", "3"
-                add_concept_tool_func(
-                    concept_name=tier_name,
-                    description=tier_desc,
-                    relationships=[
-                        {"relationship": "is_a", "related": ["Memory_Tier"]},
-                        {"relationship": "part_of", "related": ["CartON_System"]},
-                        {"relationship": "has_level", "related": [f"Level_{level}"]},
-                        {"relationship": "has_file_path", "related": [tier_path]},
-                    ],
-                    hide_youknow=True,
-                    shared_connection=self._shared_conn
-                )
+            # # --- Concrete tier instances ---
+            # tier_data = [
+                # ("Memory_Tier_0", "Active work tier. Projected to MEMORY.md. Auto-injected every conversation. Max ~100 lines of concept names + Why statements.", "/home/GOD/.claude/projects/-home-GOD/memory/MEMORY.md"),
+                # ("Memory_Tier_1", "Completed GIINT_Projects tier. Projected to .claude/rules/giint-projects-{date}.md. Auto-loaded every conversation.", "/home/GOD/.claude/rules/"),
+                # ("Memory_Tier_2", "Faint memories tier. Compressed collection names. Projected to .claude/rules/faint-memories-L1.md.", "/home/GOD/.claude/rules/faint-memories-L1.md"),
+                # ("Memory_Tier_3", "Faintest memories tier. Meta-compressed. Projected to .claude/rules/faintest-memories-L2.md.", "/home/GOD/.claude/rules/faintest-memories-L2.md"),
+            # ]
+            # for tier_name, tier_desc, tier_path in tier_data:
+                # level = tier_name[-1]  # "0", "1", "2", "3"
+                # add_concept_tool_func(
+                    # concept_name=tier_name,
+                    # description=tier_desc,
+                    # relationships=[
+                        # {"relationship": "is_a", "related": ["Memory_Tier"]},
+                        # {"relationship": "part_of", "related": ["CartON_System"]},
+                        # {"relationship": "has_level", "related": [f"Level_{level}"]},
+                        # {"relationship": "has_file_path", "related": [tier_path]},
+                    # ],
+                    # hide_youknow=True,
+                    # shared_connection=self._shared_conn
+                # )
 
-            # --- HyperCluster template ---
-            add_concept_tool_func(
-                concept_name="HyperCluster_Template",
-                description="Template for HyperCluster concepts. Enforces required relationships: must link to a GIINT_Project, a Memory_Tier, have a status, and a Why statement.",
-                relationships=[
-                    {"relationship": "is_a", "related": ["Carton_Template"]},
-                    {"relationship": "part_of", "related": ["CartON_System"]},
-                    {"relationship": "instantiates", "related": ["Template_Pattern"]},
-                    {"relationship": "REQUIRES_RELATIONSHIP", "related": [
-                        "Has_Giint_Project", "Has_Tier", "Has_Status", "Has_Why"
-                    ]}
-                ],
-                hide_youknow=True,
-                shared_connection=self._shared_conn
-            )
+            # # --- HyperCluster template ---
+            # add_concept_tool_func(
+                # concept_name="HyperCluster_Template",
+                # description="Template for HyperCluster concepts. Enforces required relationships: must link to a GIINT_Project, a Memory_Tier, have a status, and a Why statement.",
+                # relationships=[
+                    # {"relationship": "is_a", "related": ["Carton_Template"]},
+                    # {"relationship": "part_of", "related": ["CartON_System"]},
+                    # {"relationship": "instantiates", "related": ["Template_Pattern"]},
+                    # {"relationship": "REQUIRES_RELATIONSHIP", "related": [
+                        # "Has_Giint_Project", "Has_Tier", "Has_Status", "Has_Why"
+                    # ]}
+                # ],
+                # hide_youknow=True,
+                # shared_connection=self._shared_conn
+            # )
 
-            flag_file.write_text("Memory ontology type system bootstrapped successfully.\n")
-            logger.info("✅ Memory ontology type system bootstrapped successfully")
-            return True
+            # flag_file.write_text("Memory ontology type system bootstrapped successfully.\n")
+            # logger.info("✅ Memory ontology type system bootstrapped successfully")
+            # return True
 
-        except Exception as e:
-            logger.error(f"Failed to bootstrap memory ontology types: {e}")
-            raise
+        # except Exception as e:
+            # logger.error(f"Failed to bootstrap memory ontology types: {e}")
+            # raise
 
     def enforce_ontology_invariants(self) -> dict:
         """Enforce ALL ontology invariants on every startup. No flag file — runs every time.
@@ -424,89 +1030,15 @@ class CartOnUtils:
         graph, should_close = self._get_connection()
 
         try:
-            # --- SEED SHIP ENFORCEMENT (root graph node, one per user) ---
-            try:
-                from carton_mcp.add_concept_tool import add_concept_tool_func
-                from carton_mcp.ontology_graphs import ensure_ontology_completeness
-
-                seed_ship_check = graph.execute_query(
-                    "MATCH (n:Wiki {n: 'Seed_Ship'}) RETURN n.n as name LIMIT 1"
-                )
-                if not seed_ship_check:
-                    add_concept_tool_func(
-                        concept_name="Seed_Ship",
-                        description="Root graph node for user's fleet. One per user. HAS starsystems, kardashev map, and SANCTUM.",
-                        relationships=[
-                            {"relationship": "is_a", "related": ["Seed_Ship"]},
-                            {"relationship": "instantiates", "related": ["Seed_Ship_Template"]},
-                        ],
-                        hide_youknow=True,
-                        shared_connection=graph,
-                    )
-                    logger.info("[INVARIANT] Created Seed_Ship root node")
-
-                # Always ensure children exist (catches pre-existing Seed_Ship missing children)
-                ensure_ontology_completeness(
-                    "Seed_Ship", ["Seed_Ship"], {"is_a": ["Seed_Ship"]},
-                    shared_connection=graph,
-                )
-
-                # --- STARSYSTEM ONTOLOGY ENFORCEMENT ---
-                # Find all starsystems, fix PART_OF to Seed_Ship_Starsystems, ensure completeness
-                starsystems = graph.execute_query(
-                    "MATCH (ss:Wiki)-[:IS_A]->(:Wiki {n: 'Starsystem_Collection'}) RETURN ss.n as name"
-                )
-                if starsystems:
-                    for ss_rec in starsystems:
-                        ss_name = ss_rec["name"] if isinstance(ss_rec, dict) else ss_rec["name"]
-
-                        # Check if already PART_OF Seed_Ship_Starsystems
-                        has_ref = graph.execute_query(
-                            "MATCH (ss:Wiki {n: $name})-[:PART_OF]->(:Wiki {n: 'Seed_Ship_Starsystems'}) RETURN ss.n LIMIT 1",
-                            {"name": ss_name}
-                        )
-                        if not has_ref:
-                            # Remove old All_Starsystems or STARSYSTEM_Collection refs
-                            graph.execute_query(
-                                "MATCH (ss:Wiki {n: $name})-[r:PART_OF]->(old:Wiki) "
-                                "WHERE old.n IN ['All_Starsystems', 'STARSYSTEM_Collection'] DELETE r",
-                                {"name": ss_name}
-                            )
-                            # Add proper Seed Ship membership (bidirectional)
-                            graph.execute_query(
-                                "MATCH (ss:Wiki {n: $name}), (target:Wiki {n: 'Seed_Ship_Starsystems'}) "
-                                "MERGE (ss)-[:PART_OF]->(target) "
-                                "MERGE (target)-[:HAS_PART]->(ss)",
-                                {"name": ss_name}
-                            )
-                            logger.info(f"[INVARIANT] Migrated {ss_name} to Seed_Ship_Starsystems")
-
-                        # Ensure starsystem ontology completeness (auto-creates Task_Collections etc.)
-                        ensure_ontology_completeness(
-                            ss_name, ["Starsystem_Collection"],
-                            {"is_a": ["Starsystem_Collection"]},
-                            shared_connection=graph,
-                        )
-
-            except Exception as e:
-                logger.warning(f"[INVARIANT] Seed_Ship/starsystem enforcement failed: {e}")
-
-            # --- ONTOLOGY TYPE MATERIALIZATION (bounded to ONTOLOGY_SCHEMAS keys) ---
-            try:
-                from carton_mcp.ontology_graphs import materialize_ontology_types, ensure_instances_have_is_a
-
-                materialized = materialize_ontology_types(graph)
-                if materialized:
-                    logger.info(f"[INVARIANT] Materialized {len(materialized)} ontology types: {materialized}")
-                    stats["ontology_types_materialized"] = len(materialized)
-
-                linked = ensure_instances_have_is_a(graph)
-                if linked:
-                    logger.info(f"[INVARIANT] Linked {len(linked)} instances to ontology types")
-                    stats["instances_linked"] = len(linked)
-
-            except Exception as e:
-                logger.warning(f"[INVARIANT] Ontology materialization failed: {e}")
+            # [P5 DELETED 2026-06-22] Seed_Ship / starsystem ontology enforcement +
+            # ontology-type materialization blocks REMOVED. They called the deleted
+            # ensure_ontology_completeness / materialize_ontology_types / ensure_instances_have_is_a
+            # fabricators (ontology_graphs.py). That structural-type/ontology work now lives
+            # in SOMA (gnosys-vault GIINT presence d-chains) — the missing-child gap is COMPUTED
+            # as unmet_requirement, never fabricated. This whole method is itself dead (its only
+            # invocation, server_fastmcp.py _deferred_enforcement thread, is DISABLED/commented-out);
+            # only the SKILL ENFORCEMENT block below remains, and it is independently broken (see its
+            # own BUG note). Left in place as-is — out of scope for the P5 ontology-corpse delete pass.
 
             # --- SKILL ENFORCEMENT ---
             # BUG (Apr 18 2026): This entire section is broken.
@@ -534,16 +1066,12 @@ class CartOnUtils:
             # 3. Get all existing ChromaDB skillgraph entries
             existing_chroma = set()
             try:
-                import chromadb
-                client = chromadb.HttpClient(host="localhost", port=8101)
-                collection = client.get_or_create_collection(
-                    name="skillgraphs",
-                    metadata={"hnsw:space": "cosine"}
-                )
-                all_ids = collection.get(include=[])['ids']
-                for cid in all_ids:
+                # Read skillgraph IDs via the chroma daemon (ZERO chroma import here).
+                from carton_mcp.chroma_client import chroma_coll_get_ids
+                for cid in chroma_coll_get_ids("skillgraphs"):
                     # IDs are like "skillgraph:Skillgraph_Make_Skill" or "skillgraph:mcp-skill-carton"
                     existing_chroma.add(cid)
+                collection = "skillgraphs"  # truthy marker: chroma reachable -> upsert/delete via daemon
             except Exception as e:
                 logger.warning(f"Could not read ChromaDB skillgraphs: {e}")
                 collection = None
@@ -648,11 +1176,9 @@ class CartOnUtils:
                             "type": "skillgraph",
                         }
 
-                        collection.upsert(
-                            ids=[chroma_id],
-                            documents=[doc_text],
-                            metadatas=[meta_dict]
-                        )
+                        from carton_mcp.chroma_client import chroma_coll_upsert
+                        chroma_coll_upsert("skillgraphs", ids=[chroma_id],
+                                           documents=[doc_text], metadatas=[meta_dict])
                         stats["chroma_fixed"] += 1
                     except Exception as e:
                         stats["errors"].append(f"Chroma {skill_name}: {e}")
@@ -696,7 +1222,8 @@ class CartOnUtils:
                 stale_chroma_ids = [cid for cid in existing_chroma if cid not in valid_chroma_ids]
                 if stale_chroma_ids:
                     try:
-                        collection.delete(ids=stale_chroma_ids)
+                        from carton_mcp.chroma_client import chroma_coll_delete
+                        chroma_coll_delete("skillgraphs", ids=stale_chroma_ids)
                         stats["chroma_removed"] = len(stale_chroma_ids)
                     except Exception as e:
                         stats["errors"].append(f"Chroma remove batch: {e}")
@@ -854,7 +1381,10 @@ class CartOnUtils:
             if should_close:
                 graph.close()
 
-        return serialized_results
+        # CANONICAL strip at the library's shared read primitive (onion arch): every read facade
+        # (query_wiki_graph, get_concept_network, collections, history, …) returns CLEAN data — CartON
+        # wiki-links (`[w](../W/W_itself.md)`) can NEVER render from any caller (MCP tool, import, CLI).
+        return deep_strip_wiki_links(serialized_results)
 
     def _handle_query_errors(self, e: Exception) -> dict:
         """Handle query execution errors"""

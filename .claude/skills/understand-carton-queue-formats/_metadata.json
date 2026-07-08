@@ -1,0 +1,8 @@
+{
+  "domain": "Carton_Queue_Processing",
+  "subdomain": "Queue_File_Formats",
+  "category": "understand",
+  "what": "'''How to choose between raw_concept",
+  "when": "'''When writing files to carton_queue/ from hooks",
+  "produces": "Correctly_Formatted_Queue_File"
+}

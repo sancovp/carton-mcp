@@ -1,0 +1,8 @@
+{
+  "domain": "Carton",
+  "subdomain": "Neo4J_Transaction_Timing",
+  "category": "understand",
+  "what": "Relationships not immediately queryable after add_concept",
+  "when": "Any time you query Neo4j right after writing a concept",
+  "produces": "Correct_Query_Strategy"
+}
