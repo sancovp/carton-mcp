@@ -2300,6 +2300,15 @@ def add_concept_tool_func(
     if not relationships or len(relationships) == 0:
         raise Exception("ERROR: There is no reason you cannot put a WIP is_a, part_of, or has_type. Relationships cannot be empty or none.")
 
+    # NODE-QUOTA gate (hosted carton boxes — carton-saas-DESIGN §4; the whole
+    # capability lives in carton_quota.py). A NO-OP unless CARTON_MAX_NODES is
+    # set (local/self-hosted default: unlimited, zero queries). At/over quota:
+    # edits to EXISTING concepts still pass; NEW nodes raise QuotaExceeded.
+    # Sits HERE — on the live path, before the queue write below — so a
+    # rejection provably never reaches the graph.
+    from carton_mcp.carton_quota import check_quota
+    check_quota(concept_name, shared_connection=shared_connection)
+
     # OPTIONAL domain/subdomain/personal_domain/produces passthrough (Isaac 2026-07-04).
     # Mirrors the add_concept MCP tool's has_domain/has_subdomain/has_personal_domain/
     # produces convenience-building (server_fastmcp.py's add_concept), but every field
