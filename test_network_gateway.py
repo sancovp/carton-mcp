@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Network gateway laws: stdio default · sse refused · fail-closed key ·
-token verification · live ASGI 401-without / pass-with bearer.
+"""Network gateway v2 laws: stdio default · sse refused · fail-closed key ·
+the pure-ASGI bearer gate (401 without/wrong, pass-through with).
 
-Plain-python runner (the test_relationship_constraints.py house idiom) —
-runs standalone on host or container: `python3 test_network_gateway.py`.
-The module is stdlib-at-import, imported via path shim (the repo root IS
-the carton_mcp package, so bare-module import avoids the heavy __init__).
+Plain-python runner (the house idiom): `python3 test_network_gateway.py`.
+The module is stdlib-at-import; the ASGI gate is tested directly (no server
+needed) — the live end-to-end runs in the box smoke
+(application/carton-saas/box/).
 """
 
 import asyncio
@@ -22,7 +22,7 @@ def check(name, fn):
     try:
         fn()
         print(f"  PASS  {name}")
-    except Exception as e:  # noqa: BLE001 — a test runner reports, never hides
+    except Exception as e:  # noqa: BLE001
         FAILURES.append((name, e))
         print(f"  FAIL  {name}: {e}")
 
@@ -50,7 +50,7 @@ def t_sse_refused_citing_the_rule():
         "FORBIDDEN",
         "carton-mcp-transport",
     )
-    expect_raises(  # case-insensitive
+    expect_raises(
         lambda: ng.resolve_transport({"CARTON_TRANSPORT": "SSE"}), "FORBIDDEN"
     )
 
@@ -67,34 +67,14 @@ def t_unknown_transport_errors_loudly():
     )
 
 
-# -- fail-closed auth --------------------------------------------------------
+# -- fail-closed key ---------------------------------------------------------
 
-def t_stdio_gets_no_verifier():
-    assert ng.build_auth_verifier({}) is None
-
-
-def t_network_without_key_fails_closed():
+def t_missing_key_fails_closed():
+    expect_raises(lambda: ng.require_api_key({}), "CARTON_API_KEY")
     expect_raises(
-        lambda: ng.build_auth_verifier({"CARTON_TRANSPORT": "http"}),
-        "CARTON_API_KEY",
+        lambda: ng.require_api_key({"CARTON_API_KEY": "  "}), "fail-closed"
     )
-    expect_raises(  # whitespace key is no key
-        lambda: ng.build_auth_verifier(
-            {"CARTON_TRANSPORT": "http", "CARTON_API_KEY": "  "}
-        ),
-        "fail-closed",
-    )
-
-
-def t_network_with_key_verifies_only_that_token():
-    v = ng.build_auth_verifier(
-        {"CARTON_TRANSPORT": "http", "CARTON_API_KEY": "sekrit-key"}
-    )
-    assert v is not None
-    good = asyncio.run(v.verify_token("sekrit-key"))
-    bad = asyncio.run(v.verify_token("wrong-key"))
-    assert good is not None and good.client_id == "carton-box"
-    assert bad is None
+    assert ng.require_api_key({"CARTON_API_KEY": "k1"}) == "k1"
 
 
 # -- run kwargs (bind-local default) ----------------------------------------
@@ -106,48 +86,57 @@ def t_run_kwargs_defaults_and_overrides():
     ) == {"host": "0.0.0.0", "port": 9300}
 
 
-# -- live ASGI: the wire actually rejects/accepts ---------------------------
+# -- the ASGI bearer gate ----------------------------------------------------
 
-def t_http_app_rejects_without_bearer_and_passes_with():
-    import httpx
-    from fastmcp import FastMCP
+def _drive(app, headers):
+    """Minimal ASGI driver: returns (status|None, reached_inner)."""
+    sent = []
+    reached = {"inner": False}
 
-    v = ng.build_auth_verifier(
-        {"CARTON_TRANSPORT": "http", "CARTON_API_KEY": "sekrit-key"}
+    async def inner(scope, receive, send):
+        reached["inner"] = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    gate = ng.BearerGateMiddleware(inner, "sekrit-key")
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(msg):
+        sent.append(msg)
+
+    scope = {"type": "http", "method": "POST", "path": "/mcp", "headers": headers}
+    asyncio.run(gate(scope, receive, send))
+    status = next(
+        (m["status"] for m in sent if m["type"] == "http.response.start"), None
     )
-    app = FastMCP("gw-test", auth=v).http_app()
+    return status, reached["inner"]
 
-    async def _roundtrip():
-        async with app.router.lifespan_context(app):
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://test"
-            ) as client:
-                body = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": {"name": "t", "version": "0"},
-                    },
-                }
-                headers = {
-                    "content-type": "application/json",
-                    "accept": "application/json, text/event-stream",
-                }
-                no_auth = await client.post("/mcp", json=body, headers=headers)
-                with_auth = await client.post(
-                    "/mcp",
-                    json=body,
-                    headers={**headers, "authorization": "Bearer sekrit-key"},
-                )
-                return no_auth.status_code, with_auth.status_code
 
-    no_auth_status, with_auth_status = asyncio.run(_roundtrip())
-    assert no_auth_status == 401, f"expected 401 without bearer, got {no_auth_status}"
-    assert with_auth_status == 200, f"expected 200 with bearer, got {with_auth_status}"
+def t_gate_401_without_bearer():
+    status, reached = _drive(None, [])
+    assert status == 401 and not reached
+
+
+def t_gate_401_wrong_bearer():
+    status, reached = _drive(None, [(b"authorization", b"Bearer wrong")])
+    assert status == 401 and not reached
+
+
+def t_gate_passes_right_bearer():
+    status, reached = _drive(None, [(b"authorization", b"Bearer sekrit-key")])
+    assert status == 200 and reached
+
+
+def t_gate_ignores_non_http_scopes():
+    async def inner(scope, receive, send):
+        inner.called = True
+
+    inner.called = False
+    gate = ng.BearerGateMiddleware(inner, "k")
+    asyncio.run(gate({"type": "lifespan"}, None, None))
+    assert inner.called  # lifespan passes through untouched
 
 
 if __name__ == "__main__":
@@ -156,11 +145,12 @@ if __name__ == "__main__":
         t_sse_refused_citing_the_rule,
         t_http_and_alias,
         t_unknown_transport_errors_loudly,
-        t_stdio_gets_no_verifier,
-        t_network_without_key_fails_closed,
-        t_network_with_key_verifies_only_that_token,
+        t_missing_key_fails_closed,
         t_run_kwargs_defaults_and_overrides,
-        t_http_app_rejects_without_bearer_and_passes_with,
+        t_gate_401_without_bearer,
+        t_gate_401_wrong_bearer,
+        t_gate_passes_right_bearer,
+        t_gate_ignores_non_http_scopes,
     ]
     print(f"network_gateway tests ({len(tests)}):")
     for t in tests:

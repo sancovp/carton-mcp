@@ -4,14 +4,14 @@
 (monorepo `designs/carton-saas-DESIGN.md` §2), useful standalone: remote
 agents reaching carton over the network, authenticated.
 
-## States
+## States (v2 — the box smoke corrected v1, 2026-07-10)
 
 | component | status | note |
 |---|---|---|
-| `network_gateway.py` | BUILT + 9/9 tests | stdlib-at-import; fastmcp lazy (network path only, needs fastmcp>=2.11 for `StaticTokenVerifier`; pinned 2.9 still runs stdio untouched) |
-| `server_fastmcp.py` touchpoints | EDITED | `mcp = FastMCP("carton", auth=_gw_build_auth_verifier())` (auth=None on stdio — byte-identical locally) + `main()` dispatch (`resolve_transport()` + host/port kwargs) |
-| `test_network_gateway.py` | 9/9 green (plain-python runner — the house idiom; pytest chokes on the repo-root `__init__.py` outside the container) | incl. a LIVE ASGI check: 401 without bearer, 200 with, on a real `FastMCP(...).http_app()` |
-| live network smoke (real port, real Client) | PENDING | run in the box image / container: `CARTON_TRANSPORT=http CARTON_API_KEY=k carton-mcp` then a fastmcp Client with the token |
+| `network_gateway.py` | **v2 BUILT + LIVE-VERIFIED** | v1's `auth=StaticTokenVerifier` constructor param was WRONG-CLASS (carton uses the SDK's `mcp.server.fastmcp.FastMCP`, `server_fastmcp.py:17`, NOT the fastmcp-2.x lib — v1 died at real boot). v2 = pure-ASGI `BearerGateMiddleware` around `streamable_http_app()` under uvicorn — zero extra deps, every pinned version |
+| `server_fastmcp.py` touchpoints | EDITED (v2) | constructor PRISTINE (`mcp = FastMCP("carton")` — stdio even more untouched than v1) + `main()` dispatch → `run_network(mcp)` |
+| `test_network_gateway.py` | 10/10 green | transport laws + fail-closed key + the ASGI gate driven directly (401/401/200/lifespan-passthrough) |
+| live network smoke (real port, real Client, real server) | **VERIFIED 2026-07-10, 6/6** | `application/carton-saas/box/smoke/` — no-token 401 · wrong-token 401 · token → 31 real tools · plus the quota lifecycle |
 
 ## The laws (now CODE, not prose)
 

@@ -70,12 +70,28 @@ def invalidate_cache():
         _cache["at"] = 0.0
 
 
+def _rows(result, what: str):
+    """query_wiki_graph returns an ENVELOPE — {'success': bool, 'data':
+    [rows...]} (carton_utils.py:1398-1416; the box smoke caught the v1
+    rows[0] KeyError). A failed query fails LOUD: a quota gate that cannot
+    count must never fail-open into 'unlimited'."""
+    if isinstance(result, dict):
+        if not result.get("success", False):
+            raise RuntimeError(
+                f"quota {what} query failed (refusing to guess a count): "
+                f"{result.get('error', result)}"
+            )
+        return result.get("data") or []
+    return result or []
+
+
 def _count_nodes(shared_connection=None) -> int:
     from carton_mcp.carton_utils import CartOnUtils
 
     utils = CartOnUtils(shared_connection=shared_connection)
-    rows = utils.query_wiki_graph(
-        "MATCH (c:Wiki) RETURN count(c) AS n", {}
+    rows = _rows(
+        utils.query_wiki_graph("MATCH (c:Wiki) RETURN count(c) AS n", {}),
+        "count",
     )
     if not rows:
         return 0
@@ -87,8 +103,12 @@ def _concept_exists(concept_name: str, shared_connection=None) -> bool:
     from carton_mcp.carton_utils import CartOnUtils
 
     utils = CartOnUtils(shared_connection=shared_connection)
-    rows = utils.query_wiki_graph(
-        "MATCH (c:Wiki {n: $name}) RETURN count(c) AS n", {"name": concept_name}
+    rows = _rows(
+        utils.query_wiki_graph(
+            "MATCH (c:Wiki {n: $name}) RETURN count(c) AS n",
+            {"name": concept_name},
+        ),
+        "existence",
     )
     if not rows:
         return False

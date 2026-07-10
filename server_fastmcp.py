@@ -107,19 +107,18 @@ def _fmt_inner(data) -> str:
         return ", ".join(_fmt_inner(x) for x in data)
     return str(data)
 
-# Create FastMCP server. auth is None on stdio (the default — local carton
-# byte-identical); a static-token verifier on the opt-in network path. The
-# gateway module also enforces the no-SSE law and fails closed without
-# CARTON_API_KEY — see network_gateway.py. Env-read only; nothing blocking
-# at import (the transport rule's startup-timeout lesson).
+# Create FastMCP server (the SDK class — UNTOUCHED; this is the stdio local
+# server exactly as before). Network auth wraps the ASGI app in main()'s
+# network branch instead — see network_gateway.py: the no-SSE law +
+# fail-closed CARTON_API_KEY + a pure-ASGI bearer gate. Nothing blocking at
+# import (the transport rule's startup-timeout lesson).
 from .network_gateway import (
     STDIO as _GW_STDIO,
-    build_auth_verifier as _gw_build_auth_verifier,
-    network_run_kwargs as _gw_network_run_kwargs,
     resolve_transport as _gw_resolve_transport,
+    run_network as _gw_run_network,
 )
 
-mcp = FastMCP("carton", auth=_gw_build_auth_verifier())
+mcp = FastMCP("carton")
 
 # Initialize shared Neo4j connection (lives for MCP lifetime)
 def _create_shared_neo4j():
@@ -3639,7 +3638,7 @@ def main():
     if transport == _GW_STDIO:
         mcp.run(transport=transport)
     else:
-        mcp.run(transport=transport, **_gw_network_run_kwargs())
+        _gw_run_network(mcp)  # bearer-gated streamable HTTP under uvicorn
 
 if __name__ == "__main__":
     main()

@@ -8,9 +8,9 @@ call at the top of `add_concept_tool_func` (before the queue write).
 
 | component | status | note |
 |---|---|---|
-| `carton_quota.py` | BUILT + 7/7 tests | pure logic, injectable count/exists fns; TTL-cached count (default 60s, `CARTON_QUOTA_TTL_S`) |
+| `carton_quota.py` | **BUILT + 8/8 tests + LIVE-VERIFIED 2026-07-10** | pure logic, injectable count/exists fns; TTL-cached count (default 60s, `CARTON_QUOTA_TTL_S`). **The envelope law (the box smoke's catch):** `query_wiki_graph` returns `{'success':…,'data':[rows]}` — `_rows()` unwraps and **fails LOUD on a failed query** (a meter that can't count must never fail-open into 'unlimited'). Live 6/6: refused-at-quota with the exact message through the real MCP surface · refinement passed · freed+TTL-refresh passed (`application/carton-saas/box/smoke/`) |
 | `add_concept_tool.py` wiring | EDITED (one call, after the empty-relationships check, BEFORE the optional-fields merge and the queue write) | does NOT touch the guarded optional-fields capability (domain/subdomain/personal_domain/produces untouched) |
-| live E2E (real box, real neo4j, real MCP surface) | PENDING | box-image context only — NEVER set `CARTON_MAX_NODES` on Isaac's live carton (his graph exceeds any test limit; it would start rejecting real writes) |
+| live E2E (real server, real neo4j, real MCP surface) | **VERIFIED 2026-07-10 (6/6)** | `application/carton-saas/box/smoke/` — against a throwaway Community neo4j on 7688. The standing warning holds forever: NEVER set `CARTON_MAX_NODES` on Isaac's live carton (his graph exceeds any test limit; it would start rejecting real writes) |
 | daemon-side stub drift | NAMED, accepted | auto-created relationship-target stubs bypass the chokepoint; front door blocks all deliberate growth; the BLACKBOX nightly gauge shows true counts. Daemon-side enforcement = a separate capability with its own dev-flow if ever needed |
 
 ## The laws (in code)

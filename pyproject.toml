@@ -1,13 +1,18 @@
 [project]
 name = "carton-mcp"
-version = "0.1.82"
+version = "0.1.83"
 description = "CartOn - Cartographic knowledge graph mapping for concept networks"
 authors = [{name = "HEAVEN System"}]
 readme = "README.md"
 requires-python = ">=3.11"
 
 dependencies = [
-    "fastmcp==2.9.0",
+    # range, not exact: heaven-framework's installed metadata pins 2.9.0 while
+    # its setup.py pins 2.12.2 (the known standalone drift) — an exact pin here
+    # conflicts with one of them. stdio works on 2.9; NETWORK mode
+    # (CARTON_TRANSPORT=http) needs >=2.11 for the static-token verifier —
+    # network_gateway raises an actionable error below that. Box images pin exact.
+    "fastmcp>=2.9.0,<3",
     "pydantic==2.10.6",
     "heaven-framework>=0.1.14",
     "neo4j==6.1.0",

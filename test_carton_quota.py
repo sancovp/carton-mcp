@@ -116,6 +116,20 @@ def t_ttl_zero_always_recounts():
     assert spy.calls == 2
 
 
+# -- the envelope law (the box smoke's catch: query_wiki_graph returns a dict)
+
+def t_envelope_unwrap_and_loud_failure():
+    assert q._rows({"success": True, "data": [{"n": 7}]}, "count") == [{"n": 7}]
+    assert q._rows({"success": True, "data": None}, "count") == []
+    assert q._rows([{"n": 3}], "count") == [{"n": 3}]  # bare list still fine
+    try:
+        q._rows({"success": False, "error": "boom"}, "count")
+    except RuntimeError as e:
+        assert "refusing to guess" in str(e) and "boom" in str(e)
+    else:
+        raise AssertionError("failed envelope must raise, never fail-open")
+
+
 if __name__ == "__main__":
     tests = [
         t_noop_when_unset,
@@ -125,6 +139,7 @@ if __name__ == "__main__":
         t_existing_concept_passes_at_limit,
         t_ttl_cache_bounds_queries,
         t_ttl_zero_always_recounts,
+        t_envelope_unwrap_and_loud_failure,
     ]
     print(f"carton_quota tests ({len(tests)}):")
     for t in tests:
