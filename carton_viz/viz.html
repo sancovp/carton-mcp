@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CARTON // NETWORK COMMAND</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+/* ═══════════════════════════════════════════════════════════════════════════
+   FEEDBACK_ORACLE ART DIRECTION — Mode 5: NETWORK COMMAND (style tokens, v1)
+   ───────────────────────────────────────────────────────────────────────────
+   PALETTE (every color has a ROLE; saturation is a STATE EVENT):
+     field        #090c11  near-black graphite-navy — insulation / inactive capacity
+     structure    #2a3547  cold gray-blue — frames, dividers, dormant lines
+     supervisory  #dce8f5  pale white-blue — the CORE + authority text
+     operational  #35c8dc  electric cyan — active signal, 1-hop tier
+     diagnostic   #4a6070  desaturated — 2-hop periphery, metadata
+     caution      #d9a13c  sodium amber — truncation, degraded (RARE)
+     critical     #e04f30  compressed red-orange — query fault ONLY
+   SHAPE = label-class (never color): Wiki ○ sensor capsule · File ▭ module ·
+     other-labeled ⬡ framed core. AUTHORITY = hop tier (core → op → diag).
+   LINE = rel-class: control (IS_A/PART_OF/INSTANTIATES/…) solid+bright ·
+     possession (HAS_x / CONTAINS) thin · reference (MENTIONS/…) dashed dim.
+   MOTION: core breathes 5s · transmission pulses on core channels · nothing
+     else moves at idle. Selection = reticle brackets. One red, ever.
+   ═══════════════════════════════════════════════════════════════════════ */
+:root {
+    --field: #090c11; --panel: rgba(13, 18, 26, 0.94); --structure: #2a3547;
+    --sup: #dce8f5; --op: #35c8dc; --diag: #4a6070; --caution: #d9a13c; --crit: #e04f30;
+    --text: #c8d4e4; --mut: #5c6b80;
+    --mono: 'SF Mono', ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; margin: 0; }
+html, body { height: 100%; }
+body { background: var(--field); color: var(--text); font-family: var(--mono); overflow: hidden; }
+#bar {
+    display: flex; align-items: center; gap: 14px; padding: 8px 14px;
+    border-bottom: 1px solid var(--structure); background: rgba(9, 12, 17, .92);
+}
+#bar h1 { font-size: 12px; font-weight: 700; letter-spacing: .34em; color: var(--sup); }
+#bar .sub { font-size: 9.5px; color: var(--mut); letter-spacing: .2em; }
+#q {
+    flex: 1; max-width: 360px; background: #0b0f16; border: 1px solid var(--structure);
+    border-radius: 2px; color: var(--op); padding: 6px 10px; font-family: var(--mono);
+    font-size: 12px; outline: none; letter-spacing: .04em;
+}
+#q::placeholder { color: var(--mut); }
+#q:focus { border-color: var(--op); box-shadow: 0 0 0 1px rgba(53, 200, 220, .25); }
+select {
+    background: #0b0f16; border: 1px solid var(--structure); border-radius: 2px;
+    color: var(--text); padding: 5px 8px; font-family: var(--mono); font-size: 10.5px;
+}
+#status { margin-left: auto; font-size: 10px; letter-spacing: .12em; color: var(--mut); }
+#status b { color: var(--sup); font-weight: 400; }
+#status .cau { color: var(--caution); }
+#results {
+    position: absolute; top: 46px; left: 14px; z-index: 30; width: 360px; max-height: 300px;
+    overflow: auto; background: var(--panel); border: 1px solid var(--structure);
+    display: none; box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+}
+#results .r { padding: 7px 11px; cursor: pointer; border-bottom: 1px solid rgba(42, 53, 71, .5); }
+#results .r:hover { background: rgba(53, 200, 220, .08); }
+#results .r b { font-size: 12px; color: var(--sup); font-weight: 400; }
+#results .r p { font-size: 10px; color: var(--mut); margin-top: 2px; }
+#stage { position: relative; height: calc(100% - 40px); }
+canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+canvas.drag { cursor: grabbing; }
+/* OBSERVATION_LAYER — the instrument side panel */
+#drawer {
+    position: absolute; top: 10px; right: 10px; width: 330px; max-height: calc(100% - 20px);
+    overflow: auto; background: var(--panel); border: 1px solid var(--structure);
+    padding: 0; display: none; box-shadow: 0 14px 40px rgba(0, 0, 0, .55);
+}
+#drawer .dh {
+    display: flex; align-items: center; gap: 8px; padding: 7px 11px;
+    border-bottom: 1px solid var(--structure); background: rgba(220, 232, 245, 0.04);
+}
+#drawer .dh .tag { font-size: 9px; letter-spacing: .24em; color: var(--mut); }
+#drawer .x { margin-left: auto; background: none; border: 1px solid var(--structure); color: var(--mut); cursor: pointer; font-size: 10px; padding: 1px 7px; font-family: var(--mono); }
+#drawer .x:hover { color: var(--sup); border-color: var(--sup); }
+#dbody { padding: 11px; }
+#dbody h2 { font-size: 13.5px; color: var(--sup); font-weight: 700; letter-spacing: .03em; word-break: break-word; }
+#dbody .labels { font-size: 9px; color: var(--op); letter-spacing: .18em; margin: 3px 0 9px; }
+#dbody .desc {
+    font-size: 11px; line-height: 1.6; color: var(--text); white-space: pre-wrap;
+    user-select: text; border-left: 2px solid var(--structure); padding-left: 9px;
+}
+#dbody h3 { font-size: 9px; letter-spacing: .24em; color: var(--mut); margin: 13px 0 6px; }
+#dbody .nb { display: flex; gap: 8px; align-items: baseline; padding: 2.5px 0; font-size: 11px; }
+#dbody .nb .rel { font-size: 8.5px; color: var(--op); letter-spacing: .06em; min-width: 88px; opacity: .8; }
+#dbody .nb a { color: var(--text); text-decoration: none; cursor: pointer; }
+#dbody .nb a:hover { color: var(--op); }
+#empty { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; color: var(--mut); pointer-events: none; font-size: 11px; letter-spacing: .2em; }
+#empty .ring { width: 44px; height: 44px; border: 1px solid var(--structure); border-radius: 50%; position: relative; }
+#empty .ring::after { content: ""; position: absolute; inset: 9px; border: 1px solid var(--structure); border-radius: 50%; opacity: .6; }
+/* annunciators — the state band */
+#annun { position: absolute; bottom: 10px; left: 14px; display: flex; gap: 8px; font-size: 10px; letter-spacing: .12em; }
+#annun .a { padding: 3px 9px; border: 1px solid; display: none; }
+#annun .cau { color: var(--caution); border-color: var(--caution); background: rgba(217, 161, 60, .07); }
+#annun .crit { color: var(--crit); border-color: var(--crit); background: rgba(224, 79, 48, .08); }
+</style>
+</head>
+<body>
+<div id="bar">
+    <h1>CARTON</h1><span class="sub">// NETWORK COMMAND</span>
+    <input id="q" placeholder="QUERY://" autocomplete="off">
+    <select id="depth" title="channel depth"><option value="1">D1</option><option value="2" selected>D2</option><option value="3">D3</option></select>
+    <span id="status">SIG:<b>IDLE</b></span>
+</div>
+<div id="results"></div>
+<div id="stage">
+    <canvas id="c"></canvas>
+    <div id="empty"><div class="ring"></div><span>AWAITING QUERY</span></div>
+    <div id="drawer">
+        <div class="dh"><span class="tag">OBSERVATION_LAYER</span><button class="x" onclick="drawer.style.display='none'">CLOSE</button></div>
+        <div id="dbody"></div>
+    </div>
+    <div id="annun"><span class="a cau" id="a-trunc">CAUTION//TRUNCATED</span><span class="a crit" id="a-fault"></span></div>
+</div>
+<script>
+"use strict";
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+const drawer = document.getElementById('drawer'), dbody = document.getElementById('dbody');
+const statusEl = document.getElementById('status'), emptyEl = document.getElementById('empty');
+const aTrunc = document.getElementById('a-trunc'), aFault = document.getElementById('a-fault');
+let W = 0, H = 0, DPR = window.devicePixelRatio || 1;
+function resize() { W = canvas.clientWidth; H = canvas.clientHeight; canvas.width = W * DPR; canvas.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
+window.addEventListener('resize', resize); resize();
+
+/* ── the grammars (conceptual source → visual token) ─────────────────────── */
+const C = { field:'#090c11', structure:'#2a3547', sup:'#dce8f5', op:'#35c8dc', diag:'#4a6070', caution:'#d9a13c', crit:'#e04f30' };
+// LINE GRAMMAR — rel-class → stroke semantics
+const REL_CLASS = rel => {
+    const r = (rel || '').toUpperCase();
+    if (/^(IS_A|PART_OF|INSTANTIATES|SUBTYPES|PRODUCES|HAS_INSTANCES|INSTANTIATES_BY)/.test(r)) return 'control';
+    if (/^(HAS_|CONTAINS|USES|HOLDS)/.test(r)) return 'operational';
+    return 'reference';  // MENTIONS_CONCEPT, CREATED_DURING, …
+};
+const LINE = {
+    control:      { alpha: 0.55, width: 1.2, dash: [] },
+    operational:  { alpha: 0.30, width: 1.0, dash: [] },
+    reference:    { alpha: 0.22, width: 0.8, dash: [3, 4] },
+};
+// SHAPE GRAMMAR — label-class → housing
+const shapeOf = labels => {
+    const ls = labels || [];
+    if (ls.includes('File')) return 'module';
+    if (ls.length && !ls.includes('Wiki')) return 'framed';   // Repository etc.
+    return 'capsule';                                          // Wiki = sensor capsule
+};
+// AUTHORITY (color) — hop tier from the supervisory core
+const tierColor = t => t === 0 ? C.sup : t === 1 ? C.op : C.diag;
+
+let nodes = [], links = [], center = null, view = { x: 0, y: 0, k: 1 };
+let t0 = performance.now();
+
+function setStatus(sig, extra) {
+    statusEl.innerHTML = `SIG:<b>${sig}</b>${extra ? ' · ' + extra : ''}`;
+}
+const pad = (n, w = 3) => String(n).padStart(w, '0');
+
+function hopTiers() {
+    // BFS from the core over the rendered links → authority tiers
+    const adj = {};
+    links.forEach(l => { (adj[l.source] ||= []).push(l.target); (adj[l.target] ||= []).push(l.source); });
+    const tier = { [center]: 0 };
+    let frontier = [center];
+    for (let d = 1; d <= 3 && frontier.length; d++) {
+        const next = [];
+        for (const n of frontier) for (const m of (adj[n] || [])) if (!(m in tier)) { tier[m] = d; next.push(m); }
+        frontier = next;
+    }
+    nodes.forEach(n => { n.tier = tier[n.name] ?? 2; });
+}
+
+async function loadNetwork(name) {
+    aFault.style.display = 'none';
+    setStatus('QUERY', esc(name).slice(0, 30));
+    const depth = document.getElementById('depth').value;
+    try {
+        const j = await fetch(`/api/network?concept=${encodeURIComponent(name)}&depth=${depth}&limit=250`).then(r => r.json());
+        if (j.error) { fault(j.error); return; }
+        center = j.concept;
+        const deg = {};
+        j.links.forEach(l => { deg[l.source] = (deg[l.source] || 0) + 1; deg[l.target] = (deg[l.target] || 0) + 1; });
+        const old = Object.fromEntries(nodes.map(n => [n.name, n]));
+        nodes = j.nodes.map(n => ({
+            ...n, degree: deg[n.name] || 0,
+            x: old[n.name]?.x ?? (W / 2 + (Math.random() - .5) * 300),
+            y: old[n.name]?.y ?? (H / 2 + (Math.random() - .5) * 300),
+            vx: 0, vy: 0,
+        }));
+        links = j.links.filter(l => nodes.some(n => n.name === l.source) && nodes.some(n => n.name === l.target));
+        hopTiers();
+        setStatus('STABLE', `N:${pad(nodes.length)} · R:${pad(links.length)} · D${j.depth}`);
+        aTrunc.style.display = j.truncated ? 'inline-block' : 'none';
+        emptyEl.style.display = nodes.length ? 'none' : 'flex';
+        heat = 1;
+        openDrawer(name);
+    } catch (e) { fault(String(e)); }
+}
+function fault(msg) {
+    aFault.textContent = 'FAULT//' + msg.slice(0, 60);
+    aFault.style.display = 'inline-block';
+    setStatus('FAULT');
+}
+
+async function openDrawer(name) {
+    try {
+        const j = await fetch(`/api/concept?name=${encodeURIComponent(name)}`).then(r => r.json());
+        if (j.error) { fault(j.error); return; }
+        dbody.innerHTML = `<h2>${esc(j.name)}</h2>
+            <div class="labels">${(j.labels || []).map(l => esc(l).toUpperCase()).join(' · ')}</div>
+            <div class="desc">${esc((j.description || '(no description)').slice(0, 2400))}</div>
+            <h3>CHN // RELATIONS</h3>
+            ${(j.neighbors || []).slice(0, 40).map(n =>
+                `<div class="nb"><span class="rel">${esc(n.rel || '')}</span><a data-n="${esc(n.neighbor)}">${esc(n.neighbor)}</a></div>`).join('')}`;
+        drawer.style.display = 'block';
+        dbody.querySelectorAll('a[data-n]').forEach(a => a.onclick = () => loadNetwork(a.dataset.n));
+    } catch (e) { fault(String(e)); }
+}
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* ── search ── */
+const q = document.getElementById('q'), results = document.getElementById('results');
+let tmr = null, top1 = null;
+q.addEventListener('input', () => {
+    clearTimeout(tmr);
+    tmr = setTimeout(async () => {
+        const v = q.value.trim();
+        if (v.length < 2) { results.style.display = 'none'; return; }
+        const j = await fetch(`/api/search?q=${encodeURIComponent(v)}`).then(r => r.json()).catch(() => ({ results: [] }));
+        top1 = j.results?.[0]?.name || null;
+        results.innerHTML = (j.results || []).map(r => `<div class="r" data-n="${esc(r.name)}"><b>${esc(r.name)}</b><p>${esc(r.blurb)}</p></div>`).join('') || '<div class="r"><p>NO MATCH</p></div>';
+        results.style.display = 'block';
+        results.querySelectorAll('.r[data-n]').forEach(el => el.onclick = () => { results.style.display = 'none'; loadNetwork(el.dataset.n); });
+    }, 220);
+});
+q.addEventListener('keydown', e => { if (e.key === 'Enter' && top1) { results.style.display = 'none'; loadNetwork(top1); } });
+document.addEventListener('click', e => { if (!results.contains(e.target) && e.target !== q) results.style.display = 'none'; });
+document.getElementById('depth').addEventListener('change', () => { if (center) loadNetwork(center); });
+
+/* ── physics (calibration, then rest) ── */
+let heat = 0, hovered = null;
+function step() {
+    if (!nodes.length) return;
+    const k = Math.max(0.02, heat); heat *= 0.995;
+    for (let i = 0; i < nodes.length; i++) {
+        const a = nodes[i];
+        for (let j = i + 1; j < nodes.length; j++) {
+            const b = nodes[j];
+            let dx = a.x - b.x, dy = a.y - b.y;
+            let d2 = dx * dx + dy * dy || 1; const d = Math.sqrt(d2);
+            const rep = 2600 / d2;
+            dx /= d; dy /= d;
+            a.vx += dx * rep * k; a.vy += dy * rep * k;
+            b.vx -= dx * rep * k; b.vy -= dy * rep * k;
+        }
+        a.vx += (W / 2 - a.x) * 0.0012 * k; a.vy += (H / 2 - a.y) * 0.0012 * k;
+    }
+    const byName = Object.fromEntries(nodes.map(n => [n.name, n]));
+    for (const l of links) {
+        const a = byName[l.source], b = byName[l.target];
+        if (!a || !b) continue;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.sqrt(dx * dx + dy * dy) || 1;
+        const f = (d - 115) * 0.004 * k;
+        a.vx += dx / d * f * 2; a.vy += dy / d * f * 2;
+        b.vx -= dx / d * f * 2; b.vy -= dy / d * f * 2;
+    }
+    for (const n of nodes) {
+        if (n === dragging) continue;
+        n.vx *= 0.86; n.vy *= 0.86; n.x += n.vx; n.y += n.vy;
+    }
+}
+
+function nodeR(n) { return (n.tier === 0 ? 11 : n.tier === 1 ? 6.5 : 4.5) + Math.min(8, Math.sqrt(n.degree || 1) * 1.4); }
+
+function drawHousing(n, r, col, phase) {
+    const shape = shapeOf(n.labels);
+    ctx.strokeStyle = col; ctx.fillStyle = col;
+    if (n.tier === 0) {
+        // SUPERVISORY CORE — concentric aperture, breathing (5s), the only idle motion
+        const breathe = 0.75 + 0.25 * Math.sin(phase * Math.PI * 2 / 5000);
+        ctx.globalAlpha = breathe;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 7, 0, 7); ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.stroke();
+        ctx.beginPath(); ctx.arc(n.x, n.y, 2.4, 0, 7); ctx.fill();
+        return;
+    }
+    if (shape === 'module') {          // File — rectangular module
+        ctx.strokeRect(n.x - r, n.y - r * 0.72, r * 2, r * 1.44);
+        ctx.fillRect(n.x - r + 2, n.y - 1, 3.5, 2);
+    } else if (shape === 'framed') {   // other-labeled — framed core (octagonal impression)
+        ctx.strokeRect(n.x - r, n.y - r, r * 2, r * 2);
+        ctx.beginPath(); ctx.arc(n.x, n.y, r * 0.45, 0, 7); ctx.fill();
+    } else {                           // Wiki — sensor capsule
+        ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7);
+        ctx.globalAlpha = 0.16; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+        ctx.beginPath(); ctx.arc(n.x, n.y, 1.6, 0, 7); ctx.fill();
+    }
+}
+
+function draw() {
+    const now = performance.now(), phase = now - t0;
+    ctx.clearRect(0, 0, W, H);
+    // calibration ticks — edge instrumentation (restrained)
+    ctx.strokeStyle = 'rgba(42,53,71,0.5)';
+    for (let x = 40; x < W; x += 80) { ctx.beginPath(); ctx.moveTo(x, H - 6); ctx.lineTo(x, H); ctx.stroke(); }
+    for (let y = 40; y < H; y += 80) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(6, y); ctx.stroke(); }
+
+    ctx.save();
+    ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
+    const byName = Object.fromEntries(nodes.map(n => [n.name, n]));
+
+    // EDGES — the line grammar
+    ctx.font = '8px ' + '"SF Mono", ui-monospace, monospace';
+    for (const l of links) {
+        const a = byName[l.source], b = byName[l.target];
+        if (!a || !b) continue;
+        const cls = REL_CLASS(l.rel), st = LINE[cls];
+        const coreEdge = (l.source === center || l.target === center);
+        ctx.setLineDash(st.dash);
+        ctx.lineWidth = st.width;
+        ctx.strokeStyle = cls === 'control' ? C.op : C.structure;
+        ctx.globalAlpha = st.alpha * (coreEdge ? 1.5 : 1);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
+        // TRANSMISSION — a pulse travels the core's channels only
+        if (coreEdge) {
+            const t = ((phase / 2400) + (Math.abs(hue32(l.source + l.target)) % 100) / 100) % 1;
+            const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
+            ctx.fillStyle = C.op; ctx.globalAlpha = 0.8;
+            ctx.beginPath(); ctx.arc(px, py, 1.5, 0, 7); ctx.fill();
+            ctx.globalAlpha = 1;
+        }
+        if (view.k > 0.85 && cls === 'control') {
+            ctx.fillStyle = 'rgba(53,200,220,0.4)';
+            ctx.fillText(l.rel, (a.x + b.x) / 2 + 3, (a.y + b.y) / 2 - 3);
+        }
+    }
+    // NODES — housing by label-class, authority by tier
+    for (const n of nodes) {
+        const r = nodeR(n);
+        const col = n === hovered ? C.sup : tierColor(n.tier);
+        ctx.lineWidth = n.tier === 0 ? 1.3 : 1;
+        drawHousing(n, r, col, phase);
+        // reticle brackets on the hovered unit (SIG:ACTIVE)
+        if (n === hovered && n.tier !== 0) {
+            const g = r + 5;
+            ctx.strokeStyle = C.sup; ctx.lineWidth = 1;
+            [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([sx, sy]) => {
+                ctx.beginPath();
+                ctx.moveTo(n.x + sx * g, n.y + sy * (g - 4)); ctx.lineTo(n.x + sx * g, n.y + sy * g); ctx.lineTo(n.x + sx * (g - 4), n.y + sy * g);
+                ctx.stroke();
+            });
+        }
+        // LABELS — machine discipline; tier decides presence
+        if (n.tier === 0 || n.tier === 1 || n === hovered || view.k > 1.3) {
+            ctx.fillStyle = n.tier === 0 ? C.sup : (n === hovered ? C.sup : 'rgba(200,212,228,0.62)');
+            ctx.font = (n.tier === 0 ? '700 11px ' : '9.5px ') + '"SF Mono", ui-monospace, monospace';
+            const label = n.name.length > 30 ? n.name.slice(0, 29) + '…' : n.name;
+            ctx.fillText(label, n.x + r + 6, n.y + 3);
+        }
+    }
+    ctx.restore();
+}
+function hue32(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h; }
+(function loop() { step(); draw(); requestAnimationFrame(loop); })();
+
+/* ── interaction ── */
+let dragging = null, panning = false, px = 0, py = 0, moved = false;
+const toWorld = (x, y) => ({ x: (x - view.x) / view.k, y: (y - view.y) / view.k });
+const pick = (x, y) => {
+    const w = toWorld(x, y);
+    return nodes.find(n => { const r = nodeR(n) + 4; return (n.x - w.x) ** 2 + (n.y - w.y) ** 2 < r * r; });
+};
+canvas.addEventListener('mousedown', e => {
+    moved = false;
+    const n = pick(e.offsetX, e.offsetY);
+    if (n) { dragging = n; heat = Math.max(heat, 0.25); } else panning = true;
+    px = e.offsetX; py = e.offsetY; canvas.classList.add('drag');
+});
+canvas.addEventListener('mousemove', e => {
+    if (Math.abs(e.offsetX - px) + Math.abs(e.offsetY - py) > 3) moved = true;
+    if (dragging) { const w = toWorld(e.offsetX, e.offsetY); dragging.x = w.x; dragging.y = w.y; dragging.vx = dragging.vy = 0; }
+    else if (panning) { view.x += e.offsetX - px; view.y += e.offsetY - py; px = e.offsetX; py = e.offsetY; }
+    else {
+        const h = pick(e.offsetX, e.offsetY);
+        if (h !== hovered) { hovered = h; if (h) setStatus('ACTIVE', esc(h.name).slice(0, 34)); else if (center) setStatus('STABLE', `N:${pad(nodes.length)} · R:${pad(links.length)}`); }
+    }
+});
+window.addEventListener('mouseup', () => {
+    if (dragging && !moved) openDrawer(dragging.name);
+    dragging = null; panning = false; canvas.classList.remove('drag');
+});
+canvas.addEventListener('dblclick', e => { const n = pick(e.offsetX, e.offsetY); if (n) loadNetwork(n.name); });
+canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const f = e.deltaY < 0 ? 1.1 : 0.9;
+    const w = toWorld(e.offsetX, e.offsetY);
+    view.k = Math.max(0.25, Math.min(3, view.k * f));
+    view.x = e.offsetX - w.x * view.k; view.y = e.offsetY - w.y * view.k;
+}, { passive: false });
+
+const boot = new URLSearchParams(location.search).get('concept');
+if (boot) loadNetwork(boot);
+</script>
+</body>
+</html>
