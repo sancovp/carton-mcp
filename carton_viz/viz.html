@@ -5,161 +5,205 @@
 <title>CARTON // NETWORK COMMAND</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-/* ═══════════════════════════════════════════════════════════════════════════
-   FEEDBACK_ORACLE ART DIRECTION — Mode 5: NETWORK COMMAND (style tokens, v1)
-   ───────────────────────────────────────────────────────────────────────────
-   PALETTE (every color has a ROLE; saturation is a STATE EVENT):
-     field        #090c11  near-black graphite-navy — insulation / inactive capacity
-     structure    #2a3547  cold gray-blue — frames, dividers, dormant lines
-     supervisory  #dce8f5  pale white-blue — the CORE + authority text
-     operational  #35c8dc  electric cyan — active signal, 1-hop tier
-     diagnostic   #4a6070  desaturated — 2-hop periphery, metadata
-     caution      #d9a13c  sodium amber — truncation, degraded (RARE)
-     critical     #e04f30  compressed red-orange — query fault ONLY
-   SHAPE = label-class (never color): Wiki ○ sensor capsule · File ▭ module ·
-     other-labeled ⬡ framed core. AUTHORITY = hop tier (core → op → diag).
-   LINE = rel-class: control (IS_A/PART_OF/INSTANTIATES/…) solid+bright ·
-     possession (HAS_x / CONTAINS) thin · reference (MENTIONS/…) dashed dim.
-   MOTION: core breathes 5s · transmission pulses on core channels · nothing
-     else moves at idle. Selection = reticle brackets. One red, ever.
+/* ═════════════════════════════════════════════════════════════════════════
+   FEEDBACK_ORACLE — Mode 5: NETWORK COMMAND, v3 (FULL INSTRUMENT DENSITY)
+   The mindpalace's command center. Doctrine: high informational atmosphere,
+   instrument clusters, peripheral diagnostics, supervisory core, recursive
+   frames — density is DISCIPLINED, never empty. Palette = role: graphite
+   field / structure gray-blue / supervisory white-blue / operational cyan /
+   diagnostic dim / amber caution / one red. Shape = label-class. Line =
+   rel-class. Authority = hop tier. Motion = state.
    ═══════════════════════════════════════════════════════════════════════ */
 :root {
-    --field: #090c11; --panel: rgba(13, 18, 26, 0.94); --structure: #2a3547;
-    --sup: #dce8f5; --op: #35c8dc; --diag: #4a6070; --caution: #d9a13c; --crit: #e04f30;
-    --text: #c8d4e4; --mut: #5c6b80;
+    --field: #070a0e; --panel: #0c1118; --panel2: #0a0e14; --structure: #253243;
+    --structure2: #1a2431; --sup: #dfeaf6; --op: #3fd4e8; --opdim: #1f7f8f;
+    --diag: #55697c; --caution: #dca23a; --crit: #e04f30;
+    --text: #b9c8da; --mut: #5c6e82; --mut2: #3d4c5e;
     --mono: 'SF Mono', ui-monospace, Menlo, monospace;
 }
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
 body { background: var(--field); color: var(--text); font-family: var(--mono); overflow: hidden; }
-#bar {
-    display: flex; align-items: center; gap: 14px; padding: 8px 14px;
-    border-bottom: 1px solid var(--structure); background: rgba(9, 12, 17, .92);
+/* ── supervisory bar ── */
+#bar { display: flex; align-items: stretch; border-bottom: 1px solid var(--structure); background: var(--panel2); height: 42px; }
+#bar > div { display: flex; align-items: center; padding: 0 13px; border-right: 1px solid var(--structure2); gap: 9px; }
+#bar h1 { font-size: 13px; font-weight: 700; letter-spacing: .38em; color: var(--sup); }
+#bar .sub { font-size: 8.5px; color: var(--op); letter-spacing: .26em; }
+#qwrap { flex: 1; }
+#q { width: 100%; background: transparent; border: none; color: var(--op); font-family: var(--mono); font-size: 12.5px; outline: none; letter-spacing: .05em; caret-color: var(--op); }
+#q::placeholder { color: var(--mut2); }
+select { background: var(--panel); border: 1px solid var(--structure); color: var(--text); padding: 4px 7px; font-family: var(--mono); font-size: 10px; border-radius: 0; }
+#sig { min-width: 210px; justify-content: flex-end; font-size: 10px; letter-spacing: .1em; color: var(--mut); }
+#sig b { color: var(--sup); font-weight: 400; }
+#sig .lamp { width: 7px; height: 7px; border-radius: 50%; background: var(--op); box-shadow: 0 0 8px var(--op); animation: lamp 2.4s ease-in-out infinite; }
+@keyframes lamp { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+#clock { font-size: 10px; color: var(--mut); letter-spacing: .1em; border-right: none !important; }
+/* ── layout: sideband rail + stage ── */
+#main { display: flex; height: calc(100% - 42px - 26px); }
+#rail {
+    width: 218px; min-width: 218px; border-right: 1px solid var(--structure);
+    background: var(--panel2); overflow-y: auto; padding: 10px 11px; display: flex; flex-direction: column; gap: 14px;
 }
-#bar h1 { font-size: 12px; font-weight: 700; letter-spacing: .34em; color: var(--sup); }
-#bar .sub { font-size: 9.5px; color: var(--mut); letter-spacing: .2em; }
-#q {
-    flex: 1; max-width: 360px; background: #0b0f16; border: 1px solid var(--structure);
-    border-radius: 2px; color: var(--op); padding: 6px 10px; font-family: var(--mono);
-    font-size: 12px; outline: none; letter-spacing: .04em;
-}
-#q::placeholder { color: var(--mut); }
-#q:focus { border-color: var(--op); box-shadow: 0 0 0 1px rgba(53, 200, 220, .25); }
-select {
-    background: #0b0f16; border: 1px solid var(--structure); border-radius: 2px;
-    color: var(--text); padding: 5px 8px; font-family: var(--mono); font-size: 10.5px;
-}
-#status { margin-left: auto; font-size: 10px; letter-spacing: .12em; color: var(--mut); }
-#status b { color: var(--sup); font-weight: 400; }
-#status .cau { color: var(--caution); }
-#results {
-    position: absolute; top: 46px; left: 14px; z-index: 30; width: 360px; max-height: 300px;
-    overflow: auto; background: var(--panel); border: 1px solid var(--structure);
-    display: none; box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
-}
-#results .r { padding: 7px 11px; cursor: pointer; border-bottom: 1px solid rgba(42, 53, 71, .5); }
-#results .r:hover { background: rgba(53, 200, 220, .08); }
-#results .r b { font-size: 12px; color: var(--sup); font-weight: 400; }
-#results .r p { font-size: 10px; color: var(--mut); margin-top: 2px; }
-#stage { position: relative; height: calc(100% - 40px); }
+.rl h4 { font-size: 8.5px; letter-spacing: .3em; color: var(--mut); border-bottom: 1px solid var(--structure2); padding-bottom: 4px; margin-bottom: 7px; }
+.chn { display: grid; grid-template-columns: 1fr 26px 58px; gap: 6px; align-items: center; padding: 2.5px 0; }
+.chn .nm { font-size: 8.5px; color: var(--text); letter-spacing: .04em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chn .ct { font-size: 9px; color: var(--sup); text-align: right; }
+.chn .mt { height: 5px; background: var(--structure2); position: relative; }
+.chn .mt span { position: absolute; inset: 0 auto 0 0; background: var(--opdim); }
+.chn.ctl .mt span { background: var(--op); box-shadow: 0 0 6px rgba(63, 212, 232, .5); }
+.kv { display: flex; justify-content: space-between; font-size: 9px; padding: 2px 0; color: var(--mut); }
+.kv b { color: var(--text); font-weight: 400; }
+.kv .on { color: var(--op); }
+#nodelist .row { display: flex; gap: 7px; align-items: baseline; padding: 2.5px 0; cursor: pointer; }
+#nodelist .row:hover .nm { color: var(--op); }
+#nodelist .tier { font-size: 8px; color: var(--mut2); min-width: 20px; }
+#nodelist .nm { font-size: 9.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#nodelist .row.t0 .nm { color: var(--sup); }
+#nodelist .row.t0 .tier { color: var(--op); }
+/* ── stage ── */
+#stage { position: relative; flex: 1; overflow: hidden; }
 canvas { display: block; width: 100%; height: 100%; cursor: grab; }
 canvas.drag { cursor: grabbing; }
-/* OBSERVATION_LAYER — the instrument side panel */
+/* corner registration marks — the monitored zone */
+.reg { position: absolute; width: 17px; height: 17px; pointer-events: none; z-index: 5; }
+.reg::before, .reg::after { content: ""; position: absolute; background: var(--structure); }
+.reg::before { width: 100%; height: 1px; } .reg::after { width: 1px; height: 100%; }
+.reg.tl { top: 8px; left: 8px; } .reg.tr { top: 8px; right: 8px; transform: scaleX(-1); }
+.reg.bl { bottom: 8px; left: 8px; transform: scaleY(-1); } .reg.br { bottom: 8px; right: 8px; transform: scale(-1); }
+#zone { position: absolute; top: 10px; left: 32px; font-size: 8.5px; letter-spacing: .26em; color: var(--mut2); pointer-events: none; }
+/* ── OBSERVATION_LAYER — the instrument panel ── */
 #drawer {
-    position: absolute; top: 10px; right: 10px; width: 330px; max-height: calc(100% - 20px);
-    overflow: auto; background: var(--panel); border: 1px solid var(--structure);
-    padding: 0; display: none; box-shadow: 0 14px 40px rgba(0, 0, 0, .55);
+    position: absolute; top: 12px; right: 12px; width: 348px; max-height: calc(100% - 24px);
+    display: none; flex-direction: column; background: var(--panel); border: 1px solid var(--structure);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .65), inset 0 0 0 1px rgba(63, 212, 232, .04); z-index: 20;
 }
-#drawer .dh {
-    display: flex; align-items: center; gap: 8px; padding: 7px 11px;
-    border-bottom: 1px solid var(--structure); background: rgba(220, 232, 245, 0.04);
-}
-#drawer .dh .tag { font-size: 9px; letter-spacing: .24em; color: var(--mut); }
-#drawer .x { margin-left: auto; background: none; border: 1px solid var(--structure); color: var(--mut); cursor: pointer; font-size: 10px; padding: 1px 7px; font-family: var(--mono); }
+#drawer .dh { display: flex; align-items: center; gap: 8px; padding: 7px 11px; border-bottom: 1px solid var(--structure); background: rgba(63, 212, 232, .035); }
+#drawer .dh .tag { font-size: 8.5px; letter-spacing: .3em; color: var(--op); }
+#drawer .dh .idc { font-size: 8.5px; color: var(--mut2); margin-left: auto; letter-spacing: .08em; }
+#drawer .x { background: none; border: 1px solid var(--structure); color: var(--mut); cursor: pointer; font-size: 9px; padding: 2px 8px; font-family: var(--mono); letter-spacing: .1em; }
 #drawer .x:hover { color: var(--sup); border-color: var(--sup); }
-#dbody { padding: 11px; }
-#dbody h2 { font-size: 13.5px; color: var(--sup); font-weight: 700; letter-spacing: .03em; word-break: break-word; }
-#dbody .labels { font-size: 9px; color: var(--op); letter-spacing: .18em; margin: 3px 0 9px; }
+#dbody { overflow-y: auto; padding: 12px; }
+#dbody h2 { font-size: 14.5px; color: var(--sup); font-weight: 700; word-break: break-word; letter-spacing: .02em; }
+#dbody .chips { display: flex; gap: 5px; flex-wrap: wrap; margin: 7px 0 10px; }
+#dbody .chip { font-size: 8px; letter-spacing: .18em; color: var(--op); border: 1px solid rgba(63, 212, 232, .35); padding: 2px 7px; background: rgba(63, 212, 232, .05); }
+#dbody .chip.dim { color: var(--mut); border-color: var(--structure); background: none; }
+#dbody .meters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin-bottom: 11px; }
+#dbody .m { border: 1px solid var(--structure2); padding: 6px 8px; background: var(--panel2); }
+#dbody .m .v { font-size: 15px; color: var(--sup); }
+#dbody .m .k { font-size: 7.5px; letter-spacing: .2em; color: var(--mut); margin-top: 2px; }
 #dbody .desc {
-    font-size: 11px; line-height: 1.6; color: var(--text); white-space: pre-wrap;
-    user-select: text; border-left: 2px solid var(--structure); padding-left: 9px;
+    font-size: 11px; line-height: 1.62; color: var(--text); white-space: pre-wrap; user-select: text;
+    border: 1px solid var(--structure2); background: var(--panel2); padding: 9px 10px; max-height: 220px; overflow-y: auto;
 }
-#dbody h3 { font-size: 9px; letter-spacing: .24em; color: var(--mut); margin: 13px 0 6px; }
-#dbody .nb { display: flex; gap: 8px; align-items: baseline; padding: 2.5px 0; font-size: 11px; }
-#dbody .nb .rel { font-size: 8.5px; color: var(--op); letter-spacing: .06em; min-width: 88px; opacity: .8; }
+#dbody h3 { font-size: 8.5px; letter-spacing: .3em; color: var(--mut); margin: 13px 0 6px; display: flex; align-items: center; gap: 8px; }
+#dbody h3::after { content: ""; flex: 1; height: 1px; background: var(--structure2); }
+#dbody .nb { display: grid; grid-template-columns: 104px 1fr; gap: 8px; align-items: baseline; padding: 3px 0; font-size: 11px; border-bottom: 1px dotted var(--structure2); }
+#dbody .nb .rel { font-size: 8px; color: var(--op); letter-spacing: .05em; opacity: .85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#dbody .nb.ref .rel { color: var(--diag); }
 #dbody .nb a { color: var(--text); text-decoration: none; cursor: pointer; }
 #dbody .nb a:hover { color: var(--op); }
-#empty { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px; align-items: center; justify-content: center; color: var(--mut); pointer-events: none; font-size: 11px; letter-spacing: .2em; }
-#empty .ring { width: 44px; height: 44px; border: 1px solid var(--structure); border-radius: 50%; position: relative; }
-#empty .ring::after { content: ""; position: absolute; inset: 9px; border: 1px solid var(--structure); border-radius: 50%; opacity: .6; }
-/* annunciators — the state band */
-#annun { position: absolute; bottom: 10px; left: 14px; display: flex; gap: 8px; font-size: 10px; letter-spacing: .12em; }
-#annun .a { padding: 3px 9px; border: 1px solid; display: none; }
-#annun .cau { color: var(--caution); border-color: var(--caution); background: rgba(217, 161, 60, .07); }
-#annun .crit { color: var(--crit); border-color: var(--crit); background: rgba(224, 79, 48, .08); }
+/* ── results dropdown ── */
+#results { position: absolute; top: 43px; left: 258px; z-index: 40; width: 380px; max-height: 320px; overflow: auto; background: var(--panel); border: 1px solid var(--structure); display: none; box-shadow: 0 16px 50px rgba(0,0,0,.7); }
+#results .r { padding: 7px 12px; cursor: pointer; border-bottom: 1px solid var(--structure2); display: flex; flex-direction: column; gap: 2px; }
+#results .r:hover { background: rgba(63, 212, 232, .07); }
+#results .r b { font-size: 12px; color: var(--sup); font-weight: 400; }
+#results .r p { font-size: 9.5px; color: var(--mut); }
+/* ── empty state ── */
+#empty { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px; align-items: center; justify-content: center; color: var(--mut); pointer-events: none; font-size: 10px; letter-spacing: .3em; z-index: 2; }
+#empty .aperture { width: 84px; height: 84px; border: 1px solid var(--structure); border-radius: 50%; position: relative; animation: lamp 4s ease-in-out infinite; }
+#empty .aperture::before { content: ""; position: absolute; inset: 14px; border: 1px solid var(--structure); border-radius: 50%; }
+#empty .aperture::after { content: ""; position: absolute; inset: 34px; background: var(--structure); border-radius: 50%; }
+/* ── telemetry strip ── */
+#tele { height: 26px; border-top: 1px solid var(--structure); background: var(--panel2); display: flex; align-items: center; font-size: 9px; letter-spacing: .12em; color: var(--mut); overflow: hidden; }
+#tele > span { padding: 0 13px; border-right: 1px solid var(--structure2); white-space: nowrap; height: 100%; display: flex; align-items: center; gap: 6px; }
+#tele b { color: var(--text); font-weight: 400; }
+#tele .cau { color: var(--caution); display: none; }
+#tele .crit { color: var(--crit); display: none; }
+#tele .fill { flex: 1; border-right: none; justify-content: flex-end; color: var(--mut2); }
 </style>
 </head>
 <body>
 <div id="bar">
-    <h1>CARTON</h1><span class="sub">// NETWORK COMMAND</span>
-    <input id="q" placeholder="QUERY://" autocomplete="off">
-    <select id="depth" title="channel depth"><option value="1">D1</option><option value="2" selected>D2</option><option value="3">D3</option></select>
-    <span id="status">SIG:<b>IDLE</b></span>
+    <div><h1>CARTON</h1><span class="sub">NETWORK COMMAND</span></div>
+    <div id="qwrap"><span style="color:var(--mut2);font-size:11px">QUERY://</span><input id="q" autocomplete="off" spellcheck="false"></div>
+    <div><select id="depth"><option value="1">DEPTH 1</option><option value="2" selected>DEPTH 2</option><option value="3">DEPTH 3</option></select></div>
+    <div id="sig"><span class="lamp"></span><span>SIG:<b id="sigv">IDLE</b></span></div>
+    <div id="clock">--:--:--</div>
 </div>
 <div id="results"></div>
-<div id="stage">
-    <canvas id="c"></canvas>
-    <div id="empty"><div class="ring"></div><span>AWAITING QUERY</span></div>
-    <div id="drawer">
-        <div class="dh"><span class="tag">OBSERVATION_LAYER</span><button class="x" onclick="drawer.style.display='none'">CLOSE</button></div>
-        <div id="dbody"></div>
+<div id="main">
+    <div id="rail">
+        <div class="rl"><h4>SYSTEM</h4>
+            <div class="kv"><span>STORE</span><b class="on">NEO4J//LIVE</b></div>
+            <div class="kv"><span>NODES</span><b id="r-nodes">000</b></div>
+            <div class="kv"><span>CHANNELS</span><b id="r-rels">000</b></div>
+            <div class="kv"><span>QUERY</span><b id="r-ms">— ms</b></div>
+            <div class="kv"><span>UPTIME</span><b id="r-up">00:00</b></div>
+        </div>
+        <div class="rl"><h4>CHN // REL CLASSES</h4><div id="channels"><div class="kv"><span style="color:var(--mut2)">awaiting query</span></div></div></div>
+        <div class="rl"><h4>UNITS // BY AUTHORITY</h4><div id="nodelist"></div></div>
     </div>
-    <div id="annun"><span class="a cau" id="a-trunc">CAUTION//TRUNCATED</span><span class="a crit" id="a-fault"></span></div>
+    <div id="stage">
+        <canvas id="c"></canvas>
+        <span class="reg tl"></span><span class="reg tr"></span><span class="reg bl"></span><span class="reg br"></span>
+        <span id="zone">MONITORED ZONE // GRAPH FIELD</span>
+        <div id="empty"><div class="aperture"></div><span>AWAITING QUERY</span></div>
+        <div id="drawer">
+            <div class="dh"><span class="tag">OBSERVATION_LAYER</span><span class="idc" id="d-id"></span><button class="x" onclick="drawer.style.display='none'">CLOSE</button></div>
+            <div id="dbody"></div>
+        </div>
+    </div>
+</div>
+<div id="tele">
+    <span>MODE <b>NETWORK COMMAND</b></span>
+    <span>CORE <b id="t-core">—</b></span>
+    <span>D<b id="t-depth">2</b></span>
+    <span id="t-trunc" class="cau">▲ CAUTION//TRUNCATED</span>
+    <span id="t-fault" class="crit"></span>
+    <span class="fill">FEEDBACK_ORACLE//AESTHETIC.SYS.V3</span>
 </div>
 <script>
 "use strict";
-const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
-const drawer = document.getElementById('drawer'), dbody = document.getElementById('dbody');
-const statusEl = document.getElementById('status'), emptyEl = document.getElementById('empty');
-const aTrunc = document.getElementById('a-trunc'), aFault = document.getElementById('a-fault');
+const $ = id => document.getElementById(id);
+const canvas = $('c'), ctx = canvas.getContext('2d');
+const drawer = $('drawer'), dbody = $('dbody');
 let W = 0, H = 0, DPR = window.devicePixelRatio || 1;
 function resize() { W = canvas.clientWidth; H = canvas.clientHeight; canvas.width = W * DPR; canvas.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
 window.addEventListener('resize', resize); resize();
 
-/* ── the grammars (conceptual source → visual token) ─────────────────────── */
-const C = { field:'#090c11', structure:'#2a3547', sup:'#dce8f5', op:'#35c8dc', diag:'#4a6070', caution:'#d9a13c', crit:'#e04f30' };
-// LINE GRAMMAR — rel-class → stroke semantics
+const C = { field:'#070a0e', structure:'#253243', structure2:'#1a2431', sup:'#dfeaf6', op:'#3fd4e8', opdim:'#1f7f8f', diag:'#55697c', caution:'#dca23a', crit:'#e04f30' };
+const MONO = '"SF Mono", ui-monospace, Menlo, monospace';
 const REL_CLASS = rel => {
     const r = (rel || '').toUpperCase();
     if (/^(IS_A|PART_OF|INSTANTIATES|SUBTYPES|PRODUCES|HAS_INSTANCES|INSTANTIATES_BY)/.test(r)) return 'control';
     if (/^(HAS_|CONTAINS|USES|HOLDS)/.test(r)) return 'operational';
-    return 'reference';  // MENTIONS_CONCEPT, CREATED_DURING, …
+    return 'reference';
 };
-const LINE = {
-    control:      { alpha: 0.55, width: 1.2, dash: [] },
-    operational:  { alpha: 0.30, width: 1.0, dash: [] },
-    reference:    { alpha: 0.22, width: 0.8, dash: [3, 4] },
-};
-// SHAPE GRAMMAR — label-class → housing
 const shapeOf = labels => {
     const ls = labels || [];
     if (ls.includes('File')) return 'module';
-    if (ls.length && !ls.includes('Wiki')) return 'framed';   // Repository etc.
-    return 'capsule';                                          // Wiki = sensor capsule
+    if (ls.length && !ls.includes('Wiki')) return 'framed';
+    return 'capsule';
 };
-// AUTHORITY (color) — hop tier from the supervisory core
 const tierColor = t => t === 0 ? C.sup : t === 1 ? C.op : C.diag;
+const idCode = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return 'NODE_' + String((h >>> 0) % 10000).padStart(4, '0'); };
+const pad = (n, w = 3) => String(n).padStart(w, '0');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 
 let nodes = [], links = [], center = null, view = { x: 0, y: 0, k: 1 };
-let t0 = performance.now();
+let t0 = performance.now(), bootT = Date.now();
 
-function setStatus(sig, extra) {
-    statusEl.innerHTML = `SIG:<b>${sig}</b>${extra ? ' · ' + extra : ''}`;
-}
-const pad = (n, w = 3) => String(n).padStart(w, '0');
+/* clocks */
+setInterval(() => {
+    const d = new Date();
+    $('clock').textContent = d.toISOString().slice(11, 19) + 'Z';
+    const up = Math.floor((Date.now() - bootT) / 1000);
+    $('r-up').textContent = `${pad(Math.floor(up / 60), 2)}:${pad(up % 60, 2)}`;
+}, 1000);
+
+function setSig(v) { $('sigv').textContent = v; }
 
 function hopTiers() {
-    // BFS from the core over the rendered links → authority tiers
     const adj = {};
     links.forEach(l => { (adj[l.source] ||= []).push(l.target); (adj[l.target] ||= []).push(l.source); });
     const tier = { [center]: 0 };
@@ -172,56 +216,84 @@ function hopTiers() {
     nodes.forEach(n => { n.tier = tier[n.name] ?? 2; });
 }
 
+function updateRail() {
+    $('r-nodes').textContent = pad(nodes.length);
+    $('r-rels').textContent = pad(links.length);
+    // CHN meters — real counts by rel type
+    const byRel = {};
+    links.forEach(l => { byRel[l.rel] = (byRel[l.rel] || 0) + 1; });
+    const entries = Object.entries(byRel).sort((a, b) => b[1] - a[1]).slice(0, 12);
+    const max = Math.max(1, ...entries.map(e => e[1]));
+    $('channels').innerHTML = entries.map(([rel, ct]) =>
+        `<div class="chn ${REL_CLASS(rel) === 'control' ? 'ctl' : ''}">
+           <span class="nm">${esc(rel)}</span><span class="ct">${pad(ct, 2)}</span>
+           <span class="mt"><span style="width:${Math.round(100 * ct / max)}%"></span></span>
+         </div>`).join('') || '<div class="kv"><span style="color:var(--mut2)">no channels</span></div>';
+    // UNITS by authority
+    const sorted = [...nodes].sort((a, b) => a.tier - b.tier || (b.degree || 0) - (a.degree || 0)).slice(0, 22);
+    $('nodelist').innerHTML = sorted.map(n =>
+        `<div class="row t${n.tier}" data-n="${esc(n.name)}"><span class="tier">T${n.tier}</span><span class="nm">${esc(n.name)}</span></div>`).join('');
+    $('nodelist').querySelectorAll('.row').forEach(r => r.onclick = () => loadNetwork(r.dataset.n));
+}
+
 async function loadNetwork(name) {
-    aFault.style.display = 'none';
-    setStatus('QUERY', esc(name).slice(0, 30));
-    const depth = document.getElementById('depth').value;
+    $('t-fault').style.display = 'none';
+    setSig('QUERY');
+    const depth = $('depth').value;
+    const q0 = performance.now();
     try {
         const j = await fetch(`/api/network?concept=${encodeURIComponent(name)}&depth=${depth}&limit=250`).then(r => r.json());
         if (j.error) { fault(j.error); return; }
+        $('r-ms').textContent = Math.round(performance.now() - q0) + ' ms';
         center = j.concept;
         const deg = {};
         j.links.forEach(l => { deg[l.source] = (deg[l.source] || 0) + 1; deg[l.target] = (deg[l.target] || 0) + 1; });
         const old = Object.fromEntries(nodes.map(n => [n.name, n]));
         nodes = j.nodes.map(n => ({
             ...n, degree: deg[n.name] || 0,
-            x: old[n.name]?.x ?? (W / 2 + (Math.random() - .5) * 300),
-            y: old[n.name]?.y ?? (H / 2 + (Math.random() - .5) * 300),
+            x: old[n.name]?.x ?? (W / 2 + (Math.random() - .5) * 320),
+            y: old[n.name]?.y ?? (H / 2 + (Math.random() - .5) * 320),
             vx: 0, vy: 0,
         }));
         links = j.links.filter(l => nodes.some(n => n.name === l.source) && nodes.some(n => n.name === l.target));
-        hopTiers();
-        setStatus('STABLE', `N:${pad(nodes.length)} · R:${pad(links.length)} · D${j.depth}`);
-        aTrunc.style.display = j.truncated ? 'inline-block' : 'none';
-        emptyEl.style.display = nodes.length ? 'none' : 'flex';
+        hopTiers(); updateRail();
+        setSig('STABLE');
+        $('t-core').textContent = name.slice(0, 26);
+        $('t-depth').textContent = j.depth;
+        $('t-trunc').style.display = j.truncated ? 'flex' : 'none';
+        $('empty').style.display = nodes.length ? 'none' : 'flex';
         heat = 1;
         openDrawer(name);
     } catch (e) { fault(String(e)); }
 }
-function fault(msg) {
-    aFault.textContent = 'FAULT//' + msg.slice(0, 60);
-    aFault.style.display = 'inline-block';
-    setStatus('FAULT');
-}
+function fault(msg) { const f = $('t-fault'); f.textContent = '■ FAULT//' + msg.slice(0, 70); f.style.display = 'flex'; setSig('FAULT'); }
 
 async function openDrawer(name) {
     try {
         const j = await fetch(`/api/concept?name=${encodeURIComponent(name)}`).then(r => r.json());
         if (j.error) { fault(j.error); return; }
+        const nbs = j.neighbors || [];
+        const node = nodes.find(n => n.name === name);
+        $('d-id').textContent = idCode(name);
         dbody.innerHTML = `<h2>${esc(j.name)}</h2>
-            <div class="labels">${(j.labels || []).map(l => esc(l).toUpperCase()).join(' · ')}</div>
-            <div class="desc">${esc((j.description || '(no description)').slice(0, 2400))}</div>
+            <div class="chips">${(j.labels || []).map(l => `<span class="chip">${esc(l).toUpperCase()}</span>`).join('')}
+                <span class="chip dim">T${node?.tier ?? '—'}</span><span class="chip dim">${idCode(name)}</span></div>
+            <div class="meters">
+                <div class="m"><div class="v">${pad(nbs.length, 2)}</div><div class="k">RELATIONS</div></div>
+                <div class="m"><div class="v">${pad(node?.degree ?? 0, 2)}</div><div class="k">IN-FIELD DEG</div></div>
+                <div class="m"><div class="v">${(j.description || '').length > 999 ? ((j.description.length / 1000).toFixed(1) + 'k') : (j.description || '').length}</div><div class="k">DESC CHARS</div></div>
+            </div>
+            <div class="desc">${esc((j.description || '(no description)').slice(0, 4000))}</div>
             <h3>CHN // RELATIONS</h3>
-            ${(j.neighbors || []).slice(0, 40).map(n =>
-                `<div class="nb"><span class="rel">${esc(n.rel || '')}</span><a data-n="${esc(n.neighbor)}">${esc(n.neighbor)}</a></div>`).join('')}`;
-        drawer.style.display = 'block';
+            ${nbs.slice(0, 48).map(n =>
+                `<div class="nb ${REL_CLASS(n.rel) === 'reference' ? 'ref' : ''}"><span class="rel">${esc(n.rel || '')}</span><a data-n="${esc(n.neighbor)}">${esc(n.neighbor)}</a></div>`).join('')}`;
+        drawer.style.display = 'flex';
         dbody.querySelectorAll('a[data-n]').forEach(a => a.onclick = () => loadNetwork(a.dataset.n));
     } catch (e) { fault(String(e)); }
 }
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-/* ── search ── */
-const q = document.getElementById('q'), results = document.getElementById('results');
+/* search */
+const q = $('q'), results = $('results');
 let tmr = null, top1 = null;
 q.addEventListener('input', () => {
     clearTimeout(tmr);
@@ -237,9 +309,9 @@ q.addEventListener('input', () => {
 });
 q.addEventListener('keydown', e => { if (e.key === 'Enter' && top1) { results.style.display = 'none'; loadNetwork(top1); } });
 document.addEventListener('click', e => { if (!results.contains(e.target) && e.target !== q) results.style.display = 'none'; });
-document.getElementById('depth').addEventListener('change', () => { if (center) loadNetwork(center); });
+$('depth').addEventListener('change', () => { if (center) loadNetwork(center); });
 
-/* ── physics (calibration, then rest) ── */
+/* physics */
 let heat = 0, hovered = null;
 function step() {
     if (!nodes.length) return;
@@ -250,7 +322,7 @@ function step() {
             const b = nodes[j];
             let dx = a.x - b.x, dy = a.y - b.y;
             let d2 = dx * dx + dy * dy || 1; const d = Math.sqrt(d2);
-            const rep = 2600 / d2;
+            const rep = 3000 / d2;
             dx /= d; dy /= d;
             a.vx += dx * rep * k; a.vy += dy * rep * k;
             b.vx -= dx * rep * k; b.vy -= dy * rep * k;
@@ -263,7 +335,7 @@ function step() {
         if (!a || !b) continue;
         const dx = b.x - a.x, dy = b.y - a.y;
         const d = Math.sqrt(dx * dx + dy * dy) || 1;
-        const f = (d - 115) * 0.004 * k;
+        const f = (d - 125) * 0.004 * k;
         a.vx += dx / d * f * 2; a.vy += dy / d * f * 2;
         b.vx -= dx / d * f * 2; b.vy -= dy / d * f * 2;
     }
@@ -273,107 +345,203 @@ function step() {
     }
 }
 
-function nodeR(n) { return (n.tier === 0 ? 11 : n.tier === 1 ? 6.5 : 4.5) + Math.min(8, Math.sqrt(n.degree || 1) * 1.4); }
+function nodeR(n) { return (n.tier === 0 ? 15 : n.tier === 1 ? 8.5 : 6) + Math.min(9, Math.sqrt(n.degree || 1) * 1.7); }
+
+/* ── THE FIELD: polar grid + radar sweep centered on the core ── */
+function drawField(phase, core) {
+    const cx = core ? core.x * view.k + view.x : W / 2;
+    const cy = core ? core.y * view.k + view.y : H / 2;
+    // radial rings
+    ctx.strokeStyle = 'rgba(37,50,67,0.5)';
+    ctx.lineWidth = 1;
+    for (let r = 90; r < Math.max(W, H) * 1.2; r += 90) {
+        ctx.globalAlpha = Math.max(0.08, 0.5 - r / 2400);
+        ctx.beginPath(); ctx.arc(cx, cy, r * view.k, 0, 7); ctx.stroke();
+    }
+    // spokes every 30°
+    ctx.globalAlpha = 0.16;
+    for (let a = 0; a < 12; a++) {
+        const th = a * Math.PI / 6;
+        ctx.beginPath(); ctx.moveTo(cx + 40 * Math.cos(th), cy + 40 * Math.sin(th));
+        ctx.lineTo(cx + 2000 * Math.cos(th), cy + 2000 * Math.sin(th)); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    // the radar sweep — a fading wedge, 14s revolution (watchful, slow)
+    const sw = (phase / 14000) * Math.PI * 2;
+    const g = ctx.createConicGradient ? ctx.createConicGradient(sw, cx, cy) : null;
+    if (g) {
+        g.addColorStop(0, 'rgba(63,212,232,0.10)');
+        g.addColorStop(0.08, 'rgba(63,212,232,0.025)');
+        g.addColorStop(0.18, 'rgba(63,212,232,0)');
+        g.addColorStop(1, 'rgba(63,212,232,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, Math.max(W, H), sw, sw + Math.PI * 2); ctx.fill();
+    }
+    // sweep leading edge
+    ctx.strokeStyle = 'rgba(63,212,232,0.28)';
+    ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.max(W, H) * Math.cos(sw), cy + Math.max(W, H) * Math.sin(sw)); ctx.stroke();
+}
 
 function drawHousing(n, r, col, phase) {
     const shape = shapeOf(n.labels);
     ctx.strokeStyle = col; ctx.fillStyle = col;
     if (n.tier === 0) {
-        // SUPERVISORY CORE — concentric aperture, breathing (5s), the only idle motion
-        const breathe = 0.75 + 0.25 * Math.sin(phase * Math.PI * 2 / 5000);
-        ctx.globalAlpha = breathe;
-        ctx.beginPath(); ctx.arc(n.x, n.y, r + 7, 0, 7); ctx.stroke();
-        ctx.globalAlpha = 1;
+        const breathe = 0.7 + 0.3 * Math.sin(phase * Math.PI * 2 / 5000);
+        // triple aperture
+        ctx.lineWidth = 1.6;
         ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7); ctx.stroke();
-        ctx.beginPath(); ctx.arc(n.x, n.y, 2.4, 0, 7); ctx.fill();
+        ctx.lineWidth = 1; ctx.globalAlpha = breathe;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 9, 0, 7); ctx.stroke();
+        ctx.globalAlpha = 0.5 * breathe;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + 18, 0, 7); ctx.stroke();
+        ctx.globalAlpha = 1;
+        // sector ticks on the outer ring
+        for (let a = 0; a < 8; a++) {
+            const th = a * Math.PI / 4 + phase / 9000;
+            ctx.beginPath();
+            ctx.moveTo(n.x + (r + 15) * Math.cos(th), n.y + (r + 15) * Math.sin(th));
+            ctx.lineTo(n.x + (r + 21) * Math.cos(th), n.y + (r + 21) * Math.sin(th));
+            ctx.stroke();
+        }
+        ctx.beginPath(); ctx.arc(n.x, n.y, 3.2, 0, 7); ctx.fill();
+        ctx.shadowColor = col; ctx.shadowBlur = 14;
+        ctx.beginPath(); ctx.arc(n.x, n.y, 3.2, 0, 7); ctx.fill();
+        ctx.shadowBlur = 0;
         return;
     }
-    if (shape === 'module') {          // File — rectangular module
+    ctx.lineWidth = n.tier === 1 ? 1.3 : 1;
+    if (shape === 'module') {
         ctx.strokeRect(n.x - r, n.y - r * 0.72, r * 2, r * 1.44);
-        ctx.fillRect(n.x - r + 2, n.y - 1, 3.5, 2);
-    } else if (shape === 'framed') {   // other-labeled — framed core (octagonal impression)
+        ctx.globalAlpha = 0.12; ctx.fillRect(n.x - r, n.y - r * 0.72, r * 2, r * 1.44); ctx.globalAlpha = 1;
+        ctx.fillRect(n.x - r + 2.5, n.y - 1.2, 4.5, 2.4);
+    } else if (shape === 'framed') {
         ctx.strokeRect(n.x - r, n.y - r, r * 2, r * 2);
-        ctx.beginPath(); ctx.arc(n.x, n.y, r * 0.45, 0, 7); ctx.fill();
-    } else {                           // Wiki — sensor capsule
+        ctx.beginPath(); ctx.arc(n.x, n.y, r * 0.42, 0, 7); ctx.fill();
+    } else {
         ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 7);
-        ctx.globalAlpha = 0.16; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
-        ctx.beginPath(); ctx.arc(n.x, n.y, 1.6, 0, 7); ctx.fill();
+        ctx.globalAlpha = 0.14; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+        ctx.beginPath(); ctx.arc(n.x, n.y, 2, 0, 7); ctx.fill();
+        // degree pips around 1-hop capsules
+        if (n.tier === 1) {
+            const pips = Math.min(8, n.degree || 0);
+            for (let p = 0; p < pips; p++) {
+                const th = -Math.PI / 2 + p * Math.PI / 4.5;
+                ctx.beginPath(); ctx.arc(n.x + (r + 4) * Math.cos(th), n.y + (r + 4) * Math.sin(th), 1, 0, 7); ctx.fill();
+            }
+        }
     }
 }
 
 function draw() {
-    const now = performance.now(), phase = now - t0;
+    const phase = performance.now() - t0;
     ctx.clearRect(0, 0, W, H);
-    // calibration ticks — edge instrumentation (restrained)
-    ctx.strokeStyle = 'rgba(42,53,71,0.5)';
-    for (let x = 40; x < W; x += 80) { ctx.beginPath(); ctx.moveTo(x, H - 6); ctx.lineTo(x, H); ctx.stroke(); }
-    for (let y = 40; y < H; y += 80) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(6, y); ctx.stroke(); }
+    const byName = Object.fromEntries(nodes.map(n => [n.name, n]));
+    const core = byName[center];
+    if (nodes.length) drawField(phase, core);
 
     ctx.save();
     ctx.translate(view.x, view.y); ctx.scale(view.k, view.k);
-    const byName = Object.fromEntries(nodes.map(n => [n.name, n]));
 
-    // EDGES — the line grammar
-    ctx.font = '8px ' + '"SF Mono", ui-monospace, monospace';
+    // EDGES
+    ctx.font = '8px ' + MONO;
     for (const l of links) {
         const a = byName[l.source], b = byName[l.target];
         if (!a || !b) continue;
-        const cls = REL_CLASS(l.rel), st = LINE[cls];
+        const cls = REL_CLASS(l.rel);
         const coreEdge = (l.source === center || l.target === center);
-        ctx.setLineDash(st.dash);
-        ctx.lineWidth = st.width;
-        ctx.strokeStyle = cls === 'control' ? C.op : C.structure;
-        ctx.globalAlpha = st.alpha * (coreEdge ? 1.5 : 1);
+        const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+        const ux = dx / d, uy = dy / d;
+        if (cls === 'control') {
+            ctx.strokeStyle = C.op; ctx.lineWidth = 1.3; ctx.globalAlpha = coreEdge ? 0.8 : 0.5; ctx.setLineDash([]);
+        } else if (cls === 'operational') {
+            ctx.strokeStyle = '#39506a'; ctx.lineWidth = 1.1; ctx.globalAlpha = coreEdge ? 0.85 : 0.6; ctx.setLineDash([]);
+        } else {
+            ctx.strokeStyle = C.diag; ctx.lineWidth = 0.9; ctx.globalAlpha = 0.4; ctx.setLineDash([3, 5]);
+        }
         ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-        ctx.setLineDash([]); ctx.globalAlpha = 1;
-        // TRANSMISSION — a pulse travels the core's channels only
+        ctx.setLineDash([]);
+        // direction chevron on control lines (a→b)
+        if (cls === 'control') {
+            const mx = a.x + dx * 0.56, my = a.y + dy * 0.56;
+            ctx.beginPath();
+            ctx.moveTo(mx - ux * 5 - uy * 3.4, my - uy * 5 + ux * 3.4);
+            ctx.lineTo(mx, my);
+            ctx.lineTo(mx - ux * 5 + uy * 3.4, my - uy * 5 - ux * 3.4);
+            ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+        // pulse train on core channels
         if (coreEdge) {
-            const t = ((phase / 2400) + (Math.abs(hue32(l.source + l.target)) % 100) / 100) % 1;
-            const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
-            ctx.fillStyle = C.op; ctx.globalAlpha = 0.8;
-            ctx.beginPath(); ctx.arc(px, py, 1.5, 0, 7); ctx.fill();
+            for (let pi = 0; pi < 2; pi++) {
+                const t = ((phase / 2200) + pi * 0.5 + (Math.abs(hash32(l.source + l.target)) % 100) / 100) % 1;
+                ctx.fillStyle = cls === 'control' ? C.op : '#6fa0c8';
+                ctx.globalAlpha = 0.9 * Math.sin(t * Math.PI);
+                ctx.beginPath(); ctx.arc(a.x + dx * t, a.y + dy * t, 1.7, 0, 7); ctx.fill();
+            }
             ctx.globalAlpha = 1;
         }
-        if (view.k > 0.85 && cls === 'control') {
-            ctx.fillStyle = 'rgba(53,200,220,0.4)';
-            ctx.fillText(l.rel, (a.x + b.x) / 2 + 3, (a.y + b.y) / 2 - 3);
+        // rel labels
+        if (view.k > 0.7 && (cls !== 'reference' || view.k > 1.2)) {
+            ctx.fillStyle = cls === 'control' ? 'rgba(63,212,232,0.55)' : 'rgba(85,105,124,0.5)';
+            ctx.fillText(l.rel, (a.x + b.x) / 2 + 4, (a.y + b.y) / 2 - 4);
         }
     }
-    // NODES — housing by label-class, authority by tier
+
+    // NODES
     for (const n of nodes) {
         const r = nodeR(n);
         const col = n === hovered ? C.sup : tierColor(n.tier);
-        ctx.lineWidth = n.tier === 0 ? 1.3 : 1;
         drawHousing(n, r, col, phase);
-        // reticle brackets on the hovered unit (SIG:ACTIVE)
         if (n === hovered && n.tier !== 0) {
-            const g = r + 5;
+            const g = r + 6;
             ctx.strokeStyle = C.sup; ctx.lineWidth = 1;
             [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([sx, sy]) => {
                 ctx.beginPath();
-                ctx.moveTo(n.x + sx * g, n.y + sy * (g - 4)); ctx.lineTo(n.x + sx * g, n.y + sy * g); ctx.lineTo(n.x + sx * (g - 4), n.y + sy * g);
+                ctx.moveTo(n.x + sx * g, n.y + sy * (g - 5)); ctx.lineTo(n.x + sx * g, n.y + sy * g); ctx.lineTo(n.x + sx * (g - 5), n.y + sy * g);
                 ctx.stroke();
             });
         }
-        // LABELS — machine discipline; tier decides presence
-        if (n.tier === 0 || n.tier === 1 || n === hovered || view.k > 1.3) {
-            ctx.fillStyle = n.tier === 0 ? C.sup : (n === hovered ? C.sup : 'rgba(200,212,228,0.62)');
-            ctx.font = (n.tier === 0 ? '700 11px ' : '9.5px ') + '"SF Mono", ui-monospace, monospace';
-            const label = n.name.length > 30 ? n.name.slice(0, 29) + '…' : n.name;
-            ctx.fillText(label, n.x + r + 6, n.y + 3);
+        // labels + ID codes
+        const showLabel = n.tier <= 1 || n === hovered || view.k > 1.25;
+        if (showLabel) {
+            const label = n.name.length > 32 ? n.name.slice(0, 31) + '…' : n.name;
+            if (n.tier === 0) {
+                ctx.fillStyle = C.sup;
+                ctx.font = '700 13px ' + MONO;
+                ctx.fillText(label, n.x + r + 26, n.y + 1);
+                ctx.fillStyle = 'rgba(63,212,232,0.75)';
+                ctx.font = '8px ' + MONO;
+                ctx.fillText(idCode(n.name) + ' // SUPERVISORY', n.x + r + 26, n.y + 13);
+            } else {
+                ctx.fillStyle = n === hovered ? C.sup : (n.tier === 1 ? 'rgba(207,222,238,0.85)' : 'rgba(140,160,180,0.6)');
+                ctx.font = (n.tier === 1 ? '10.5px ' : '9px ') + MONO;
+                ctx.fillText(label, n.x + r + 6, n.y + 3);
+                if (view.k > 1.05 || n === hovered) {
+                    ctx.fillStyle = 'rgba(92,110,130,0.55)';
+                    ctx.font = '7.5px ' + MONO;
+                    ctx.fillText(idCode(n.name), n.x + r + 6, n.y + 12.5);
+                }
+            }
         }
     }
     ctx.restore();
+
+    // vignette — containment
+    const vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.42, W / 2, H / 2, Math.max(W, H) * 0.75);
+    vg.addColorStop(0, 'rgba(7,10,14,0)');
+    vg.addColorStop(1, 'rgba(4,6,9,0.55)');
+    ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
 }
-function hue32(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h; }
+function hash32(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h; }
 (function loop() { step(); draw(); requestAnimationFrame(loop); })();
 
-/* ── interaction ── */
+/* interaction */
 let dragging = null, panning = false, px = 0, py = 0, moved = false;
 const toWorld = (x, y) => ({ x: (x - view.x) / view.k, y: (y - view.y) / view.k });
 const pick = (x, y) => {
     const w = toWorld(x, y);
-    return nodes.find(n => { const r = nodeR(n) + 4; return (n.x - w.x) ** 2 + (n.y - w.y) ** 2 < r * r; });
+    return nodes.find(n => { const r = nodeR(n) + 5; return (n.x - w.x) ** 2 + (n.y - w.y) ** 2 < r * r; });
 };
 canvas.addEventListener('mousedown', e => {
     moved = false;
@@ -387,7 +555,7 @@ canvas.addEventListener('mousemove', e => {
     else if (panning) { view.x += e.offsetX - px; view.y += e.offsetY - py; px = e.offsetX; py = e.offsetY; }
     else {
         const h = pick(e.offsetX, e.offsetY);
-        if (h !== hovered) { hovered = h; if (h) setStatus('ACTIVE', esc(h.name).slice(0, 34)); else if (center) setStatus('STABLE', `N:${pad(nodes.length)} · R:${pad(links.length)}`); }
+        if (h !== hovered) { hovered = h; setSig(h ? 'ACTIVE' : (center ? 'STABLE' : 'IDLE')); }
     }
 });
 window.addEventListener('mouseup', () => {
