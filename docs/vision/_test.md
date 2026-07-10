@@ -1,0 +1,4 @@
+# vision: node_sync (topic — auto-created by `journal`)
+
+<!-- ===VISION DELTA: id-tagged appends below = the gap (`vision diff <m>`); `doc-mirror-commit --realizes <ids>` drops them on build === -->
+- [v1]  2026-06-21T03:48:16  FINDING: TYPED-ROUTER landed + verified: parser self-tests 32/0 (untouched-green), tests/test_sm_typed_router.py ALL PASS x2 deterministic (live neo4j). SM graph (is_a==State_Machine) routes to create_sm_chain_live building a 2-SM stack -> Concept HAS_SM_CHAIN with 2 SM_CHAIN_RUNS, gating step required_pattern=query_wiki_graph, sm_chain_visit ARMS require_next. Non-SM graph (is_a Skill) still writes a queue file (regression unbroken). pip install --no-deps done. KEY: the test ONLY surfaces the router correctly AFTER pip install (the script run resolves the installed heaven_tree_repl) — early FAIL was the stale installed copy, not the code.  tags:[node_sync, sm_gate, state_machine, carton, test]

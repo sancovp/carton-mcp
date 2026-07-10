@@ -107,8 +107,19 @@ def _fmt_inner(data) -> str:
         return ", ".join(_fmt_inner(x) for x in data)
     return str(data)
 
-# Create FastMCP server
-mcp = FastMCP("carton")
+# Create FastMCP server. auth is None on stdio (the default — local carton
+# byte-identical); a static-token verifier on the opt-in network path. The
+# gateway module also enforces the no-SSE law and fails closed without
+# CARTON_API_KEY — see network_gateway.py. Env-read only; nothing blocking
+# at import (the transport rule's startup-timeout lesson).
+from .network_gateway import (
+    STDIO as _GW_STDIO,
+    build_auth_verifier as _gw_build_auth_verifier,
+    network_run_kwargs as _gw_network_run_kwargs,
+    resolve_transport as _gw_resolve_transport,
+)
+
+mcp = FastMCP("carton", auth=_gw_build_auth_verifier())
 
 # Initialize shared Neo4j connection (lives for MCP lifetime)
 def _create_shared_neo4j():
@@ -3624,8 +3635,11 @@ def _ensure_daemon_running():
 def main():
     """Entry point for carton-mcp console script"""
     _ensure_daemon_running()
-    transport = os.environ.get("CARTON_TRANSPORT", "stdio")
-    mcp.run(transport=transport)
+    transport = _gw_resolve_transport()  # refuses 'sse'; errors on unknowns
+    if transport == _GW_STDIO:
+        mcp.run(transport=transport)
+    else:
+        mcp.run(transport=transport, **_gw_network_run_kwargs())
 
 if __name__ == "__main__":
     main()
