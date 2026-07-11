@@ -78,8 +78,23 @@ class RuleSubstrate(BaseModel):
     output_dir_override: str | None = Field(None, description="Override output dir, ignoring has_scope/has_starsystem")
 
 
+class FrameworkSubstrate(BaseModel):
+    """Project a CartON framework concept to its FRAMEWORK.md document.
+
+    The framework document is the CORE artifact of the framework system
+    (Isaac 2026-07-11): chapter/blog renders are downstream consumers of it
+    (stage 4). Renders deterministically from the concept's node properties
+    (obstacle/overcome/dream/definition + the four-facts/classification/link
+    fields) with the node description as the definition fallback. Writes to
+    HEAVEN_DATA_DIR/frameworks/{slug}/FRAMEWORK.md; diffs before writing;
+    never deletes.
+    """
+    type: Literal["framework"] = "framework"
+    output_dir: str | None = Field(None, description="Override output dir. Defaults to HEAVEN_DATA_DIR/frameworks/{slug}")
+
+
 # Union of all substrate types
-Substrate = Union[FileSubstrate, DiscordSubstrate, RegistrySubstrate, EnvSubstrate, SkillSubstrate, RuleSubstrate]
+Substrate = Union[FileSubstrate, DiscordSubstrate, RegistrySubstrate, EnvSubstrate, SkillSubstrate, RuleSubstrate, FrameworkSubstrate]
 
 # Registry of all substrate classes for dynamic instruction building
 SUBSTRATE_CLASSES: List[type] = [
@@ -89,6 +104,7 @@ SUBSTRATE_CLASSES: List[type] = [
     EnvSubstrate,
     SkillSubstrate,
     RuleSubstrate,
+    FrameworkSubstrate,
 ]
 
 
@@ -1047,6 +1063,94 @@ def project_to_rule(substrate: RuleSubstrate, concept_name: str, shared_connecti
     return result
 
 
+def project_to_framework(substrate: FrameworkSubstrate, concept_name: str, shared_connection=None) -> str:
+    """Project a CartON framework concept to its FRAMEWORK.md document.
+
+    THE CANONICAL FRAMEWORK PROJECTOR (stage 1 of the framework system, Isaac
+    2026-07-11). The framework document is the CORE artifact — chapter/blog
+    renders are downstream consumers of it (stage 4 rewires the writer). Reads
+    the concept's node PROPERTIES (the scalar-state lane: definition, obstacle,
+    overcome, dream, skilltome_location, github_url, build_time_estimate,
+    layer, state, framework_type, phase, deep_dive_url, plugin_url,
+    name_provenance, scorer_score) with the node description as the definition
+    fallback, renders the hero's-journey document deterministically, diffs
+    against the existing file, writes only if different. Never deletes.
+
+    Dispatch: dchain_framework_project (soma_prolog/foundation/framework.py)
+    surfaces release_effect('carton_mcp.substrate_projector:project_framework',
+    C) — gated on zero missing_slot, so an incomplete framework never reaches
+    this projector; the guard below is fail-safe, not the gate.
+    """
+    from carton_mcp.carton_utils import CartOnUtils
+
+    utils = CartOnUtils(shared_connection=shared_connection)
+    result = utils.query_wiki_graph(
+        "MATCH (c:Wiki) WHERE c.n = $name RETURN c.n as name, c.d as description, properties(c) as props",
+        {"name": concept_name},
+    )
+    if not result.get("success") or not result.get("data"):
+        return f"skipped: concept {concept_name} not found"
+
+    data = result["data"][0]
+    props = data.get("props") or {}
+    description = data.get("description", "") or ""
+
+    def p(key: str) -> str:
+        v = props.get(key)
+        return str(v).strip() if v is not None else ""
+
+    definition = p("definition") or description.strip()
+    obstacle, overcome, dream = p("obstacle"), p("overcome"), p("dream")
+    if not (definition and obstacle and overcome and dream):
+        missing = [k for k, v in [("definition", definition), ("obstacle", obstacle),
+                                  ("overcome", overcome), ("dream", dream)] if not v]
+        return f"skipped: {concept_name} not fully made (missing: {', '.join(missing)})"
+
+    display = concept_name.replace("_", " ").strip()
+    facts = []
+    if p("skilltome_location"):
+        facts.append(f"lives in SkillTome: {p('skilltome_location')}")
+    if p("github_url"):
+        facts.append(f"see it on GitHub: {p('github_url')}")
+    if p("build_time_estimate"):
+        facts.append(f"build this yourself in {p('build_time_estimate')}")
+
+    lines = [f"# {display}", "", f"> A FRAMEWORK — instructions about agent skills to give to agents."]
+    for fact in facts:
+        lines.append(f"> {fact}")
+    lines += ["", "## Definition", "", definition, "",
+              "## The Obstacle", "", obstacle, "",
+              "## The Journey", "", overcome, "",
+              "## The Dream", "", dream, ""]
+    classification = [(label, p(key)) for label, key in
+                      [("Layer", "layer"), ("State", "state"),
+                       ("Type", "framework_type"), ("Phase", "phase")] if p(key)]
+    if classification:
+        lines += ["## Classification", ""]
+        lines.append(" · ".join(f"{label}: {val}" for label, val in classification))
+        lines.append("")
+    links = [(label, p(key)) for label, key in
+             [("Deep dive", "deep_dive_url"), ("Plugin", "plugin_url")] if p(key)]
+    if links:
+        lines += ["## Links", ""]
+        lines += [f"- {label}: {val}" for label, val in links]
+        lines.append("")
+    body = "\n".join(lines)
+
+    slug = re.sub(r"[^a-z0-9_-]", "-", concept_name.lower())
+    out_dir = Path(substrate.output_dir) if substrate.output_dir else (
+        Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data")) / "frameworks" / slug
+    )
+    out_path = out_dir / "FRAMEWORK.md"
+    if out_path.exists() and out_path.read_text() == body:
+        return f"unchanged: {out_path}"
+    action = "updated" if out_path.exists() else "created"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(body)
+    logger.info("Framework projected: %s -> %s (%s)", concept_name, out_path, action)
+    return f"{action}: {out_path}"
+
+
 # ── release_effect dispatch entrypoints (FIX-5: projection-as-d-chain) ──────────
 # These are NOT new projectors — they are thin single-argument shims so the SOMA
 # projection d-chains can dispatch the CANONICAL rich projectors above through the
@@ -1075,6 +1179,14 @@ def project_rule(concept_name: str, shared_connection=None) -> str:
     Dispatched by the carton observation worker daemon (the RELEASE-LAW outer
     layer) which passes its shared neo4j connection (FIX-5 step 3)."""
     return project_to_rule(RuleSubstrate(), concept_name, shared_connection=shared_connection)
+
+
+def project_framework(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for dchain_framework_project → project_to_framework.
+
+    Dispatched by the carton observation worker daemon (the RELEASE-LAW outer
+    layer) which passes its shared neo4j connection (FIX-5 step 3)."""
+    return project_to_framework(FrameworkSubstrate(), concept_name, shared_connection=shared_connection)
 
 
 def project_giint_hierarchy(concept_name: str, shared_connection=None) -> str:
