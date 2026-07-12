@@ -947,9 +947,11 @@ def create_sm_chain_live(concept_name, state_machines, *, sm_chain_name=None,
 # PORTED from `manifold.py`'s `SoftmaxBanditSelector` (`manifold.py:160-210`) — that module stays PURE
 # IN-MEMORY (no `to_carton`/persistence anywhere in it) and is NOT imported here; only its ~30 lines of
 # math are re-derived as this module's own function, per this task's explicit scope (no import dependency
-# between the two files). NEITHER function is wired into `auto_progress`/`gate_call` yet — that wiring is
-# step 2, a separate future task; this is the data + selection logic step 2 will consume, built and
-# unit-tested standalone (see tests/test_sm_branching.py).
+# between the two files). Step 2 HAS SINCE LANDED for auto_progress: `select_branch` decides among the
+# candidate next-steps at auto_progress (:359) and `reinforce_transition` persists the learning plus the
+# `branch_chosen` episode record (:406). `gate_call` has no decision point and does not route through
+# `select_branch`. (An earlier version of this header said neither function was wired yet — stale once
+# the wiring landed; corrected 2026-07-12.) Unit tests: tests/test_sm_branching.py.
 def select_branch(candidates: List[Dict[str, Any]], call_text: str) -> Optional[str]:
     """Choose which branch's `to` step id an agent's current call is routed to.
 
