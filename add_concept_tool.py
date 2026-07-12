@@ -17,6 +17,7 @@ import json
 import re
 import os
 import sys
+import time
 import traceback
 from difflib import get_close_matches
 import logging
@@ -604,8 +605,11 @@ def _auto_link_core(description: str, base_path: str, current_concept: str, conc
     if not existing_concepts:
         return description
     
-    # Build or get cached automaton
-    cache_key = len(existing_concepts)  # Simple cache invalidation by size
+    # Build or get cached automaton. Time-bucket key (rebuild at most once per 300s):
+    # the old key was the concept COUNT — but the worker itself ingests concepts, so the
+    # count moved almost every batch and the ~573k-pattern automaton rebuilt continuously
+    # (the 2026-07-12 CPU storm + RSS growth). New concepts wait <=300s to enter the linker.
+    cache_key = int(time.time() // 300)
     if cache_key not in _automaton_cache:
         _automaton_cache.clear()  # Evict old automatons to prevent memory accumulation
         print(f"[auto_link] Building Aho-Corasick automaton for {cache_key} concepts...", file=sys.stderr)
