@@ -38,3 +38,5 @@ coherently, then the gate: `python3 test_network_gateway.py` all green
 `CARTON_API_KEY` · `CARTON_HOST` · `CARTON_PORT` · `CARTON_CLIENT_ID`.
 Remember the installed-package law: a source edit without
 `pip install --no-deps` + restart changes nothing running.
+
+→ Why / history / how-to behind this rule: read the `understand-carton-mcp-rules` skill.

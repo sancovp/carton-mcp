@@ -8,3 +8,4 @@ This repo is a STARSYSTEM. Before working:
 4. `fly()` to browse available flight configs
 5. Log insights/bugs/decisions to debug diary as you work
 6. `end_starlog()` when session is done
+

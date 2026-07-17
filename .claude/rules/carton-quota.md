@@ -40,3 +40,5 @@ files. If your change goes anywhere NEAR the optional-fields params or
 `edit-add-concept-optional-fields` dev-flow, non-negotiable. Installed-package
 law applies: source edits change nothing running without
 `pip install --no-deps` + restart.
+
+→ Why / history / how-to behind this rule: read the `understand-carton-mcp-rules` skill.

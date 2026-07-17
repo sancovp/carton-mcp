@@ -24,3 +24,4 @@ nohup python3 -m carton_mcp.observation_worker_daemon > /tmp/carton_daemon.log 2
 - NEVER restart daemon without setting env vars
 - NEVER assume env vars are inherited from Claude Code
 - Check /tmp/carton_daemon.log after restart for "Neo4j shared connection established"
+
