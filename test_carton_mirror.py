@@ -51,8 +51,8 @@ class TheMirrorOnTheGraph(unittest.TestCase):
         name = cm.record_name("contact", "AbC1")
         with self.conn.driver.session() as s:
             row = s.run("MATCH (c:Wiki {n: $n})-[:IS_A]->(t), (c)-[:PART_OF]->(sa) RETURN t.n AS t, sa.n AS sa, "
-                        "c.linked AS l, c.ghl_id AS id", n=name).single()
-        self.assertEqual((row["t"], row["sa"], row["l"], row["id"]), ("Ghl_Contact", "Ghl_Sub_Account_Loc1", True, "AbC1"))
+                        "c.linked AS l, c.crm_id AS id", n=name).single()
+        self.assertEqual((row["t"], row["sa"], row["l"], row["id"]), ("Crm_Contact", "Crm_Account_Loc1", True, "AbC1"))
         self.assertEqual(cm.read(self.conn, "calls", {"limit": 1})[0]["function"], "contacts.search")
         self.assertIn(["contact", "AbC1"], cm.read(self.conn, "changed_since", {"call": first["n"]}))
 

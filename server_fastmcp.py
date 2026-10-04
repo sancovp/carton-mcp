@@ -838,9 +838,9 @@ def set_properties(concept_name: str, properties: dict, mode: str = "merge") -> 
 def mirror_write(op: str, payload: dict) -> str:
     """Write an outside system's mirrored records into THIS graph (carton_mirror.py) — synchronously.
 
-    The GHL wrapper calls this for every call it makes to GHL, so the tenant's business lives on its own graph:
-    each record as `Ghl_<Kind>_<id>` (its JSON, kind, id, version), each version as `..._V<n>`, every call raw as
-    `Ghl_Call_<n>`, GHL's events as `Ghl_Event_<n>`, every full pass as `Ghl_Pass_<n>`. A new version only when the
+    The business system's mirror calls this for every call it makes, so the tenant's business lives on its own graph:
+    each record as `Crm_<Kind>_<id>` (its JSON, kind, id, version), each version as `..._V<n>`, every call raw as
+    `Crm_Call_<n>`, the system's events as `Crm_Event_<n>`, every full pass as `Crm_Pass_<n>`. A new version only when the
     same function's answer for the record changed. Written already linked, so the background linker leaves them.
 
     Args:
