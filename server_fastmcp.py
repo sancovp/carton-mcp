@@ -835,6 +835,49 @@ def set_properties(concept_name: str, properties: dict, mode: str = "merge") -> 
 
 
 @mcp.tool()
+def mirror_write(op: str, payload: dict) -> str:
+    """Write an outside system's mirrored records into THIS graph (carton_mirror.py) — synchronously.
+
+    The GHL wrapper calls this for every call it makes to GHL, so the tenant's business lives on its own graph:
+    each record as `Ghl_<Kind>_<id>` (its JSON, kind, id, version), each version as `..._V<n>`, every call raw as
+    `Ghl_Call_<n>`, GHL's events as `Ghl_Event_<n>`, every full pass as `Ghl_Pass_<n>`. A new version only when the
+    same function's answer for the record changed. Written already linked, so the background linker leaves them.
+
+    Args:
+        op: record_call · mark_deleted · record_event · event_read · record_pass
+        payload: record_call {function, location, args, exchanges, status, ok, error, answer, ms,
+                 records: [[kind, id, record]], gone: [kind, id] | null} · mark_deleted {kind, id} ·
+                 record_event {n, event} · event_read {n, read} · record_pass {report}
+
+    Returns: JSON — record_call {n, written} · mark_deleted {removed} · record_event {new} · record_pass {n}
+    """
+    from .carton_mirror import write as _mirror_write
+    try:
+        return json.dumps(_mirror_write(_neo4j_conn, op, payload or {}), default=str)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
+@mcp.tool()
+def mirror_read(op: str, args: dict = None) -> str:
+    """Read the mirrored records held in THIS graph (carton_mirror.py).
+
+    Args:
+        op: current {kind, location?, limit?, offset?} · current_ids {kind, location?} · changed_since {call} ·
+            kinds · kinds_from {source} · learned_from {sources} · kinds_of {id} · versions {kind, id} ·
+            calls {limit?, function?} · events {limit?} · passes {limit?, children?}
+        args: as listed
+
+    Returns: JSON — the records, ids, counts or rows asked for
+    """
+    from .carton_mirror import read as _mirror_read
+    try:
+        return json.dumps(_mirror_read(_neo4j_conn, op, args or {}), default=str)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
+@mcp.tool()
 def query_by_properties(where: dict, limit: int = 25) -> str:
     """Find concepts whose properties EXACTLY match every key/value in `where` (AND).
 
