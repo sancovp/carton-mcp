@@ -64,11 +64,24 @@ def _program(run):
     run("MERGE (p:Wiki {n:'Zztest_Core_Plain'}) SET p.d='plain content, no gate'", {})
     # SINGLE: a Core holding ONE SM whose entry HAS a required_pattern. Under the stack-size rule this is
     # still OFF (stack size == 1) — proving a single show-SM is ungated even with a pattern.
+    # THE TYPE NODES ARE BOUND, NEVER INLINE. An anonymous inline `:Wiki {n:'X'}` as the TARGET of a
+    # relationship MERGE matches the WHOLE PATH, so for a new source it creates the entire pattern
+    # INCLUDING A FRESH TYPE NODE — leaked once per run, and invisible to `_cleanup` because it
+    # carries no `Zztest_Core_` prefix. The loop above merging the types by name does NOT save you;
+    # the inline form never looks at them. `WITH ... LIMIT 1` collapses each match because these
+    # names are still shattered (Merge_Amplification_On_Shattered_Graph).
+    # See .claude/rules/wiki-type-shattering-repair.md.
     run("""
+        MERGE (t_c:Wiki {n:'Sm_Chain'})
+        WITH t_c LIMIT 1
+        MERGE (t_m:Wiki {n:'State_Machine'})
+        WITH t_c, t_m LIMIT 1
+        MERGE (t_s:Wiki {n:'Traversal_Step'})
+        WITH t_c, t_m, t_s LIMIT 1
         MERGE (s:Wiki {n:'Zztest_Core_Single'}) SET s.d='single-SM concept (OFF: stack size 1)'
-        MERGE (core:Wiki {n:'Zztest_Core_Single_Core'}) MERGE (core)-[:IS_A]->(:Wiki {n:'Sm_Chain'})
-        MERGE (sm:Wiki {n:'Zztest_Core_Single_Sm'}) MERGE (sm)-[:IS_A]->(:Wiki {n:'State_Machine'})
-        MERGE (es:Wiki {n:'Zztest_Core_Single_Step'}) MERGE (es)-[:IS_A]->(:Wiki {n:'Traversal_Step'})
+        MERGE (core:Wiki {n:'Zztest_Core_Single_Core'}) MERGE (core)-[:IS_A]->(t_c)
+        MERGE (sm:Wiki {n:'Zztest_Core_Single_Sm'}) MERGE (sm)-[:IS_A]->(t_m)
+        MERGE (es:Wiki {n:'Zztest_Core_Single_Step'}) MERGE (es)-[:IS_A]->(t_s)
         SET es.required_pattern='query_wiki_graph', es.text='(would require, but stack size 1 => off)'
         MERGE (s)-[:HAS_SM_CHAIN]->(core)
         MERGE (core)-[r:SM_CHAIN_RUNS]->(sm) SET r.order=0
@@ -77,14 +90,20 @@ def _program(run):
     # SUBJECT: a Core holding TWO SMs => GATED. order-0 = show-SM (no required_pattern, serves content);
     # order-1 = gating-SM whose entry REQUIRES the next move be query_wiki_graph.
     run("""
+        MERGE (t_c:Wiki {n:'Sm_Chain'})
+        WITH t_c LIMIT 1
+        MERGE (t_m:Wiki {n:'State_Machine'})
+        WITH t_c, t_m LIMIT 1
+        MERGE (t_s:Wiki {n:'Traversal_Step'})
+        WITH t_c, t_m, t_s LIMIT 1
         MERGE (subj:Wiki {n:'Zztest_Core_Subject'}) SET subj.d='served content (a Core does not withhold)'
-        MERGE (core:Wiki {n:'Zztest_Core_Core'}) MERGE (core)-[:IS_A]->(:Wiki {n:'Sm_Chain'})
-        MERGE (sm0:Wiki {n:'Zztest_Core_Sm'}) MERGE (sm0)-[:IS_A]->(:Wiki {n:'State_Machine'})
-        MERGE (es0:Wiki {n:'Zztest_Core_EntryStep'}) MERGE (es0)-[:IS_A]->(:Wiki {n:'Traversal_Step'})
+        MERGE (core:Wiki {n:'Zztest_Core_Core'}) MERGE (core)-[:IS_A]->(t_c)
+        MERGE (sm0:Wiki {n:'Zztest_Core_Sm'}) MERGE (sm0)-[:IS_A]->(t_m)
+        MERGE (es0:Wiki {n:'Zztest_Core_EntryStep'}) MERGE (es0)-[:IS_A]->(t_s)
         SET es0.text='show step (no requirement)'
         MERGE (sm0)-[:HAS_STEP]->(es0)
-        MERGE (sm1:Wiki {n:'Zztest_Core_Sm2'}) MERGE (sm1)-[:IS_A]->(:Wiki {n:'State_Machine'})
-        MERGE (es1:Wiki {n:'Zztest_Core_EntryStep2'}) MERGE (es1)-[:IS_A]->(:Wiki {n:'Traversal_Step'})
+        MERGE (sm1:Wiki {n:'Zztest_Core_Sm2'}) MERGE (sm1)-[:IS_A]->(t_m)
+        MERGE (es1:Wiki {n:'Zztest_Core_EntryStep2'}) MERGE (es1)-[:IS_A]->(t_s)
         SET es1.required_pattern='query_wiki_graph',
             es1.text='REQUIRED NEXT after Zztest_Core_Subject: run query_wiki_graph(...) to continue.'
         MERGE (sm1)-[:HAS_STEP]->(es1)

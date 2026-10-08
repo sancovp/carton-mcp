@@ -1,0 +1,4 @@
+# vision: Socrates (topic — auto-created by `journal`)
+
+<!-- ===VISION DELTA: id-tagged appends below = the gap (`vision diff <m>`); `doc-mirror-commit --realizes <ids>` drops them on build === -->
+- [v1]  2026-08-10T09:34:36  Isaac interjection captured (2026-08-10): Socrates_Go_To_Market added as Hj_Archetype (verbatim: he literally stopped doing everything, gave the reasoning, just did his thing -- the whole funnel is consistent reasoning about his workflow + giving people the information) + Deuteros_Plous (the Phaedo second-voyage passage verbatim: first voyage physis fails -> Anaxagoras Nous disappoints -> flight into the logoi, examine reality through hypotheses/Forms). Webbed to the method-first funnel decisions + (marked as interpretation) the Spec/soup resonance: logoi = strings about things = the soup layer.  tags:[Socrates, Funnel, Hj]

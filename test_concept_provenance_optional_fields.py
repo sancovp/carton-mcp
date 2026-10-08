@@ -20,7 +20,11 @@ these fields validate correctly but never actually reach the graph (caught live 
 verification 2026-07-04, before this function's final shape was settled).
 """
 
-from carton_mcp.add_concept_tool import merge_optional_domain_fields, PERSONAL_DOMAINS
+from carton_mcp.add_concept_tool import (
+    merge_optional_domain_fields,
+    validate_personal_domain_value,
+    PERSONAL_DOMAINS,
+)
 
 
 def test_all_none_returns_equivalent_list_unchanged():
@@ -96,6 +100,62 @@ def test_empty_produces_list_is_a_noop_not_an_error():
     print("✓ empty produces list -> no-op (matches falsy-value skip, not a crash)")
 
 
+def test_illegal_personal_domain_via_relationships_list_raises():
+    """THE HOLE (measured 2026-08-26, closed the same day).
+
+    The enum was 'documented and enforced' while 640 illegal has_personal_domain edges sat in
+    the graph across 7 non-enum values (Frameworks 606, _Unnamed 19, Discord 5,
+    Potential_Offers 3, Starsystem 3, Gnosys 3, Testing 1). They got in because the gate only
+    ever read the personal_domain PARAM — a caller stating the same fact through the raw
+    relationships list walked straight past it. A gate on one of two doors is not a gate.
+    """
+    rels = [
+        {"relationship": "is_a", "related": ["Bug_Report"]},
+        {"relationship": "has_personal_domain", "related": ["Frameworks"]},
+    ]
+    try:
+        merge_optional_domain_fields(rels, None, None, None, None)
+        raise AssertionError(
+            "expected Exception: 'Frameworks' is not in the personal_domain enum and must be "
+            "refused when supplied via the relationships list, exactly as via the param"
+        )
+    except AssertionError:
+        raise
+    except Exception as e:
+        assert "Frameworks" in str(e), str(e)
+        assert "relationships list" in str(e), f"error must name WHICH door it came through: {e}"
+    print("✓ illegal has_personal_domain via the relationships list raises (the 640-edge hole)")
+
+
+def test_titlecase_personal_domain_is_accepted_via_both_doors():
+    """CartON normalizes relationship targets to Title_Case, so the graph holds `Cave`, not
+    `cave`. A case-SENSITIVE gate would refuse 604 legal, already-stored values — and a
+    migration that 'corrected' them would flatten all 604 to misc. Both doors must accept it.
+    """
+    result = merge_optional_domain_fields([], None, None, "Cave", None)
+    by_type = {r["relationship"]: r["related"] for r in result}
+    assert by_type["has_personal_domain"] == ["Cave"], by_type
+    rels = [{"relationship": "has_personal_domain", "related": ["Paiab", "Sanctum"]}]
+    result = merge_optional_domain_fields(rels, None, None, None, None)
+    by_type = {r["relationship"]: r["related"] for r in result}
+    assert by_type["has_personal_domain"] == ["Paiab", "Sanctum"], by_type
+    print("✓ Title_Case personal_domain accepted via BOTH the param and the relationships list")
+
+
+def test_validate_personal_domain_value_directly():
+    for legal in ("cave", "Cave", "CAVE", "misc", "Personal"):
+        validate_personal_domain_value(legal, "a test")
+    for illegal in ("Frameworks", "", "sanctuary", "Misc_Ideas"):
+        try:
+            validate_personal_domain_value(illegal, "a test")
+            raise AssertionError(f"expected Exception for {illegal!r}")
+        except AssertionError:
+            raise
+        except Exception as e:
+            assert "a test" in str(e), f"error must name its source: {e}"
+    print("✓ validate_personal_domain_value: case-insensitive accept, names its source on raise")
+
+
 if __name__ == "__main__":
     print("Testing merge_optional_domain_fields — pure lib-level unit tests")
     print("=" * 70)
@@ -107,5 +167,8 @@ if __name__ == "__main__":
     test_dedupes_against_value_already_present_via_generic_relationships()
     test_produces_merges_alongside_existing_produces_targets()
     test_empty_produces_list_is_a_noop_not_an_error()
+    test_illegal_personal_domain_via_relationships_list_raises()
+    test_titlecase_personal_domain_is_accepted_via_both_doors()
+    test_validate_personal_domain_value_directly()
     print("=" * 70)
     print("ALL CONCEPT-PROVENANCE OPTIONAL-FIELDS UNIT TESTS PASSED")

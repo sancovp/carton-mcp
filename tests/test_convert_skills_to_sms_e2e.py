@@ -64,8 +64,17 @@ def main():
     for t in (sm_gate.T_SM_CHAIN, sm_gate.T_STATE_MACHINE, sm_gate.T_TRAVERSAL_STEP):
         run("MERGE (n:Wiki {n:$n})", {"n": t})
     run("MERGE (a:Wiki {n:$n})", {"n": ACTOR})
+    # THE TYPE NODE IS BOUND, NEVER INLINE. An anonymous inline `:Wiki {n:'Skill'}` as the TARGET of
+    # a relationship MERGE matches the WHOLE PATH, so for each new skill it created the entire
+    # pattern INCLUDING A FRESH `Skill` TYPE NODE — this loop leaked one PER SKILL PER RUN, and
+    # `_cleanup` could never see them (no `Zztest_Csts_` prefix). `Skill` is one of the duplicated
+    # names measured in the live graph. `WITH ... LIMIT 1` collapses the match because it is still
+    # shattered (Merge_Amplification_On_Shattered_Graph).
+    # See .claude/rules/wiki-type-shattering-repair.md.
     for s in SKILLS:
-        run("MERGE (sk:Wiki {n:$n}) MERGE (sk)-[:IS_A]->(:Wiki {n:'Skill'}) "
+        run("MERGE (t_sk:Wiki {n:'Skill'}) "
+            "WITH t_sk LIMIT 1 "
+            "MERGE (sk:Wiki {n:$n}) MERGE (sk)-[:IS_A]->(t_sk) "
             "SET sk.has_when=$w", {"n": s, "w": f"when you need {s}"})
 
     results = {}

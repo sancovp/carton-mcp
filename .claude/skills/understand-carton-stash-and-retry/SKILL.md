@@ -1,9 +1,11 @@
 ---
 name: understand-carton-stash-and-retry
-description: "WHAT: CartON's server-side payload stashing — on a failed/exception add_concept the partial payload is stashed so a retry merges new fields without re-typing everything. WHEN: an add_concept errors and you want to re-send only the missing fields, or you're reasoning about the stash/clear_stash params."
+description: "WHAT: CartON stashes a failed add_concept payload so a retry sends only the missing fields. WHEN: an add_concept errored and you will retry it."
 ---
 
 # understand-carton-stash-and-retry
+
+**In full:** WHAT: CartON's server-side payload stashing — on a failed/exception add_concept the partial payload is stashed so a retry merges new fields without re-typing everything. WHEN: an add_concept errors and you want to re-send only the missing fields, or you're reasoning about the stash/clear_stash params.
 
 ## The pattern (IS, current 2026-06-17)
 

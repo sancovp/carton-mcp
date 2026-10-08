@@ -1,8 +1,7 @@
-# The Node-Quota Gate (carton_quota.py) — dev-flow + states
-
-**BUILT 2026-07-09 (v0.1.82).** The carton-saas metering gate (monorepo
-`designs/carton-saas-DESIGN.md` §4): one self-contained module + ONE guarded
-call at the top of `add_concept_tool_func` (before the queue write).
+The node-quota gate is one self-contained module, `carton_quota.py`, plus ONE guarded call at the top of
+`add_concept_tool_func` — after the empty-relationships check, BEFORE the optional-fields merge and the
+queue write. It does NOT touch the guarded optional-fields capability; domain, subdomain, personal_domain
+and produces stay untouched.
 
 ## States
 
@@ -14,32 +13,39 @@ call at the top of `add_concept_tool_func` (before the queue write).
 | the observation queue (`add_observation_batch` · `observe_from_identity_pov`) | **NOT GATED** | queued concepts are written by the daemon's own batch write (`observation_worker_daemon.py:840`), never through `add_concept_tool_func`, so the quota never sees them; a tenant box must gate this path too |
 | daemon-side stub drift | NAMED, accepted | auto-created relationship-target stubs bypass the chokepoint; front door blocks all deliberate growth; the BLACKBOX nightly gauge shows true counts. Daemon-side enforcement = a separate capability with its own dev-flow if ever needed |
 
-## The laws (in code)
+NO-OP UNLESS `CARTON_MAX_NODES` IS SET. Unset means byte-identical behaviour and zero queries. A quota
+never appears uninvited.
 
-1. **No-op unless `CARTON_MAX_NODES` is set** — unset = byte-identical, zero
-   queries. A quota never appears uninvited.
-2. **Refuse growth, not refinement** — at/over quota, EXISTING concepts still
-   edit (add_concept is also the update path); only NEW nodes raise
-   `QuotaExceeded` (actionable message: limit, count, the upgrade path). The
-   existence query runs only on the rare over-quota branch.
-3. **The LIVE path is the enforced path** — rejection fires before the queue
-   write, so it provably never reaches the graph (the optional-fields build's
-   burned lesson, designed-in: never enforce on a derived view).
-4. **Enforcement reads the live count; BLACKBOX only observes** — separate
-   lanes, never conflated.
-5. **Loud on garbage** — a non-integer/negative `CARTON_MAX_NODES` raises; a
-   broken limit must never silently mean unlimited.
+REFUSE GROWTH, NOT REFINEMENT. At or over quota, EXISTING concepts still edit — `add_concept` is also the
+update path — and only NEW nodes raise `QuotaExceeded`, with an actionable message naming the limit, the
+count and the upgrade path. The existence query runs only on the rare over-quota branch.
 
-## Dev-flow (the edit-set — NEVER edit one place only)
+THE LIVE PATH IS THE ENFORCED PATH. Rejection fires before the queue write, so it provably never reaches
+the graph. Never enforce on a derived view.
 
-Touching `check_quota`/`quota_limit`/the cache, or the one call site in
-`add_concept_tool_func` → edit `carton_quota.py` + the call site coherently,
-then the gate: `python3 test_carton_quota.py` all green AND
-`python3 test_network_gateway.py` still green AND `py_compile` on both edited
-files. If your change goes anywhere NEAR the optional-fields params or
-`merge_optional_domain_fields`, STOP — that is the
-`edit-add-concept-optional-fields` dev-flow, non-negotiable. Installed-package
-law applies: source edits change nothing running without
-`pip install --no-deps` + restart.
+ENFORCEMENT READS THE LIVE COUNT; BLACKBOX ONLY OBSERVES. Never conflate the two lanes.
 
-→ Why / history / how-to behind this rule: read the `understand-carton-mcp-rules` skill.
+BE LOUD ON GARBAGE. A non-integer or negative `CARTON_MAX_NODES` raises; a broken limit must never
+silently mean unlimited.
+
+THE ENVELOPE LAW: `query_wiki_graph` returns `{'success':…,'data':[rows]}`, so `_rows()` unwraps it and
+FAILS LOUD on a failed query. A meter that cannot count must never fail-open into "unlimited".
+
+⚠ NEVER set `CARTON_MAX_NODES` on Isaac's live carton. His graph exceeds any test limit and it would
+start rejecting real writes.
+
+Dev-flow, and NEVER edit one place only. Touching `check_quota` / `quota_limit` / the TTL cache (default
+60s, `CARTON_QUOTA_TTL_S`), or the one call site in `add_concept_tool_func` → edit `carton_quota.py` and
+the call site coherently, then the gate: `python3 test_carton_quota.py` all green AND `python3
+test_network_gateway.py` still green AND `py_compile` on both edited files.
+
+If your change goes anywhere NEAR the optional-fields params or `merge_optional_domain_fields`, STOP:
+that is the `edit-add-concept-optional-fields` dev-flow, non-negotiable.
+
+Installed-package law: source edits change nothing running without `pip install --no-deps` and a restart.
+
+Known bound, named and accepted: daemon-side auto-created relationship-target stubs bypass the
+chokepoint. The front door blocks all deliberate growth, and the BLACKBOX nightly gauge shows true
+counts. Daemon-side enforcement is a separate capability with its own dev-flow if ever needed.
+
+Read the `understand-carton-mcp-rules` skill for the history behind this rule.

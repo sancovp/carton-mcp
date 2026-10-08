@@ -10,8 +10,21 @@ Proves the scientifically-exact CyberneticiRcus gate mechanic works on carton's 
   (4) terminal unlock: passing the final step UNLOCKS the Execution_State;
   (5) trigger: a result carrying trigger_traversal locks a fresh actor into the flow.
 
-Self-cleaning: every node it creates is prefixed 'Zztest_Sm_' and DETACH-DELETEd at the end
-(its own test artifacts — not the accumulation). Run:
+⚠ THIS RUNS AGAINST WHATEVER `NEO4J_URI` NAMES, AND ITS DEFAULT IS PRODUCTION —
+`bolt://host.docker.internal:7687` is the identical default the live daemon uses
+(observation_worker_daemon.py:1302). Run bare, it writes to the real graph. That is deliberate
+(this is a live-graph E2E), but it means every node this file creates must be cleanable, which is
+what the bound-type discipline in `_program_sm` protects.
+
+Self-cleaning: every node it creates is named `Zztest_Sm_*` and DETACH-DELETEd at the end (its own
+test artifacts — not the accumulation). This is TRUE ONLY BECAUSE the type nodes are bound rather
+than inlined: until 2026-08-22 the relationship MERGEs inlined their `:Wiki` targets, so each run
+ALSO minted fresh `State_Machine` / `Traversal_Step` / `Execution_State` nodes — which carry no
+`Zztest_Sm_` prefix, so `_cleanup` could not see them and they leaked into the graph permanently.
+The docstring claimed self-cleaning throughout; the claim was false, and being false is exactly why
+the leak stayed invisible. Keep the types bound and this line stays true.
+
+Run:
   NEO4J_URI=... NEO4J_USER=... NEO4J_PASSWORD=... python3 tests/test_sm_gate_e2e.py
 """
 import os
@@ -56,17 +69,30 @@ NODES = [ACTOR, ACTOR2, "Zztest_Sm_Machine",
 
 
 def _program_sm(run):
-    # type nodes
+    # THE TYPE NODES ARE BOUND, NEVER INLINE. An anonymous inline `:Wiki {n:'X'}` sitting as the
+    # TARGET of a relationship MERGE matches the WHOLE PATH -- for a new source that path has never
+    # existed, so Cypher creates the entire pattern INCLUDING A FRESH TYPE NODE, once per run,
+    # forever. Merging the type by name up-front does NOT save you: the inline form never looks at
+    # it. (Anonymous_Inline_Type_Merge_Defect; .claude/rules/wiki-type-shattering-repair.md.)
+    #
+    # Every MERGE on a type name is collapsed with `WITH ... LIMIT 1` because these names are STILL
+    # shattered in the live graph -- an uncollapsed MERGE matches all N copies and every downstream
+    # clause then runs once per row (Merge_Amplification_On_Shattered_Graph). The collapse is
+    # correct both before and after the dedupe lands.
     for t in (sm_gate.T_STATE_MACHINE, sm_gate.T_TRAVERSAL_STEP, sm_gate.T_EXECUTION_STATE):
         run("MERGE (n:Wiki {n:$n})", {"n": t})
     # machine + 3 steps (step1 requires 'add_concept', step2 requires 'set_properties', step3 terminal)
     run("""
-        MERGE (m:Wiki {n:'Zztest_Sm_Machine'}) MERGE (m)-[:IS_A]->(:Wiki {n:'State_Machine'})
-        MERGE (s1:Wiki {n:'Zztest_Sm_Step1'}) MERGE (s1)-[:IS_A]->(:Wiki {n:'Traversal_Step'})
+        MERGE (t_m:Wiki {n:'State_Machine'})
+        WITH t_m LIMIT 1
+        MERGE (t_s:Wiki {n:'Traversal_Step'})
+        WITH t_m, t_s LIMIT 1
+        MERGE (m:Wiki {n:'Zztest_Sm_Machine'}) MERGE (m)-[:IS_A]->(t_m)
+        MERGE (s1:Wiki {n:'Zztest_Sm_Step1'}) MERGE (s1)-[:IS_A]->(t_s)
         SET s1.required_pattern='add_concept', s1.text='Step 1: you must add_concept.'
-        MERGE (s2:Wiki {n:'Zztest_Sm_Step2'}) MERGE (s2)-[:IS_A]->(:Wiki {n:'Traversal_Step'})
+        MERGE (s2:Wiki {n:'Zztest_Sm_Step2'}) MERGE (s2)-[:IS_A]->(t_s)
         SET s2.required_pattern='set_properties', s2.text='Step 2: you must set_properties.'
-        MERGE (s3:Wiki {n:'Zztest_Sm_Step3'}) MERGE (s3)-[:IS_A]->(:Wiki {n:'Traversal_Step'})
+        MERGE (s3:Wiki {n:'Zztest_Sm_Step3'}) MERGE (s3)-[:IS_A]->(t_s)
         SET s3.text='Step 3: terminal.'
         MERGE (m)-[:HAS_STEP]->(s1) MERGE (m)-[:HAS_STEP]->(s2) MERGE (m)-[:HAS_STEP]->(s3)
         MERGE (s1)-[r1:NEXT_STEP]->(s2) SET r1.weight=1.0
@@ -74,8 +100,10 @@ def _program_sm(run):
     """, {})
     # actor + locked Execution_State at step1
     run("""
+        MERGE (t_e:Wiki {n:'Execution_State'})
+        WITH t_e LIMIT 1
         MERGE (a:Wiki {n:'Zztest_Sm_Actor'})
-        MERGE (st:Wiki {n:'Zztest_Sm_State'}) MERGE (st)-[:IS_A]->(:Wiki {n:'Execution_State'})
+        MERGE (st:Wiki {n:'Zztest_Sm_State'}) MERGE (st)-[:IS_A]->(t_e)
         SET st.status='locked'
         MERGE (a)-[:HAS_LIFECYCLE]->(st)
         WITH st MATCH (s1:Wiki {n:'Zztest_Sm_Step1'})
@@ -84,8 +112,10 @@ def _program_sm(run):
     """, {})
     # actor2 + UNLOCKED Execution_State (for trigger test)
     run("""
+        MERGE (t_e:Wiki {n:'Execution_State'})
+        WITH t_e LIMIT 1
         MERGE (a:Wiki {n:'Zztest_Sm_Actor2'})
-        MERGE (st:Wiki {n:'Zztest_Sm_State2'}) MERGE (st)-[:IS_A]->(:Wiki {n:'Execution_State'})
+        MERGE (st:Wiki {n:'Zztest_Sm_State2'}) MERGE (st)-[:IS_A]->(t_e)
         SET st.status='unlocked'
         MERGE (a)-[:HAS_LIFECYCLE]->(st)
     """, {})
@@ -94,6 +124,10 @@ def _program_sm(run):
 
 
 def _cleanup(run):
+    # ⚠ THE PREFIX GUARD IS LOAD-BEARING, NOT AN OVERSIGHT. `NODES` also lists the three real type
+    # names (sm_gate.T_*) so the test can reason about them, and this guard is what stops the
+    # cleanup from DETACH-DELETING the production universals every other concept in the graph is
+    # `IS_A` into. Never "fix" it by dropping the check.
     for n in NODES:
         if n.startswith("Zztest_Sm_"):
             run("MATCH (n:Wiki {n:$n}) DETACH DELETE n", {"n": n})

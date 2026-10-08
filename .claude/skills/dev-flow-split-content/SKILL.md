@@ -1,9 +1,11 @@
 ---
 name: dev-flow-split-content
-description: "WHAT: the development-flow for the split-content capability — separating a concept whose description (n.d) holds raw CONTENT (a data dump / pasted document) from a real DESCRIPTION, by splitting the raw content into its own `{concept_name}_Desc_Content` node. Covers `carton_split_content.py` (both `build_split_spec`, the pure spec function, and `split_content_concept`, the thin neo4j-writing wrapper — self-contained, ONE module, per the one-capability-one-module law), the `Desc_Content` universal type, the `has_desc_content` relationship, and the `split_content_concept` MCP tool. WHEN: when editing `carton_split_content.py`, `split_content_concept`, the `Desc_Content` type, or the `has_desc_content` relationship; or adding a new capability that also needs the content-vs-description split (any of)."
+description: "WHAT: the dev flow for splitting a concept's raw content into its own Desc_Content node. WHEN: editing carton_split_content.py or Desc_Content."
 ---
 
 # dev-flow-split-content — dev-flow for the CartON content/description split capability
+
+**In full:** WHAT: the development-flow for the split-content capability — separating a concept whose description (n.d) holds raw CONTENT (a data dump / pasted document) from a real DESCRIPTION, by splitting the raw content into its own `{concept_name}_Desc_Content` node. Covers `carton_split_content.py` (both `build_split_spec`, the pure spec function, and `split_content_concept`, the thin neo4j-writing wrapper — self-contained, ONE module, per the one-capability-one-module law), the `Desc_Content` universal type, the `has_desc_content` relationship, and the `split_content_concept` MCP tool. WHEN: when editing `carton_split_content.py`, `split_content_concept`, the `Desc_Content` type, or the `has_desc_content` relationship; or adding a new capability that also needs the content-vs-description split (any of).
 
 > Split-content = separating a concept's description (`n.d`) into what it SHOULD be — annotation that
 > traces relationships (per `carton-description-is-annotation-not-knowledge`) — from what a caller

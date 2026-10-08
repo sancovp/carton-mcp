@@ -1,9 +1,11 @@
 ---
 name: edit-the-webbing-agent
-description: "WHAT: the dev-flow for editing the WEBBING AGENT — carton's standing CONCEPT-ATOMIZATION daemon, CLONED from the proven Sophia (docmirror-cohere) architecture: CODE detects a batch of under-structured, autolinker-processed, main-agent-authored concepts (linked=true, source in CHAT_SOURCES, webbed IS NULL), serves them to a fresh SDNAC run each tick, the agent ADDS real is_a/part_of/instantiates/produces structure + child concepts, and CODE verifies + marks webbed=true. Covers webbing_agent.py, webbing_agent_worker.py, and the one-line SYSTEM_SOURCES coupling in observation_worker_daemon.py. WHEN: when editing webbing_agent.py, webbing_agent_worker.py, the eligibility predicate (_is_underdeveloped), the batch-goal builder (_build_batch_goal), the WEBBER_SYSTEM_PROMPT, the webbed/source recursion-guard, or CHAT_SOURCES/SYSTEM_SOURCES in observation_worker_daemon.py (any of)."
+description: "WHAT: the dev flow for the webbing agent, carton's concept-atomization daemon. WHEN: editing webbing_agent.py, its worker, prompt or write guard."
 ---
 
 # edit-the-webbing-agent — dev-flow for carton's standing concept-atomization daemon
+
+**In full:** WHAT: the dev-flow for editing the WEBBING AGENT — carton's standing CONCEPT-ATOMIZATION daemon, CLONED from the proven Sophia (docmirror-cohere) architecture: CODE detects a batch of under-structured, autolinker-processed, main-agent-authored concepts (linked=true, source in CHAT_SOURCES, webbed IS NULL), serves them to a fresh SDNAC run each tick, the agent ADDS real is_a/part_of/instantiates/produces structure + child concepts and acts on the SOMA verdict each write returns, and CODE verifies + marks webbed=true. Covers webbing_agent.py, webbing_agent_worker.py, and the one-line SYSTEM_SOURCES coupling in observation_worker_daemon.py. WHEN: when editing webbing_agent.py, webbing_agent_worker.py, the eligibility predicate (_is_underdeveloped), the batch-goal builder (_build_batch_goal), the WEBBER_SYSTEM_PROMPT, SOMA_RESULT_ACTIONS (what the agent does with each SOMA verdict or refusal), the webbed/source recursion-guard, the webbing write guard (webbing_write_guard.py and its one call in add_concept_tool.py), or CHAT_SOURCES/SYSTEM_SOURCES in observation_worker_daemon.py (any of).
 
 The webbing agent's WHOLE JOB: take a concept a real conversation just wrote as unstructured prose
 (it has a real `is_a`/`part_of`, but little else) and ADD the proper multi-node graph structure the
@@ -16,18 +18,15 @@ a sibling `{journal}_Momentum` node) to this agent's unit (ANY carton concept, "
 `webbed=true` scratch-lane property ON THE SAME NODE — atomization adds structure to the concept
 itself, it does not create a side-car observation).
 
-> ⚠️ **PATH CORRECTION (2026-07-04, this skill's own build session):** the original design brief said
-> the source files live at `knowledge/carton-mcp/carton_mcp/webbing_agent.py`. That path is WRONG for
-> this repo — `pyproject.toml` declares `packages = ["carton_mcp"]` with
-> `package-dir = {"carton_mcp" = "."}`, meaning the **repo ROOT** (`knowledge/carton-mcp/`) IS the
-> `carton_mcp` package (exactly where `observation_worker_daemon.py`/`carton_utils.py`/`soma_fillers.py`
-> already live, as siblings, not nested under a `carton_mcp/` subdirectory). A stray `carton_mcp/`
-> subdirectory DOES exist in this repo (only a `.claude/` copy + two orphaned `.pyc` files, no real
-> source) — do NOT be misled by it into thinking it is the package. The REAL files are:
+The repo ROOT `knowledge/carton-mcp/` IS the `carton_mcp` package (`pyproject.toml`:
+`package-dir = {"carton_mcp" = "."}`); the stray `carton_mcp/` subdirectory holds no source. The files:
 
 - **`knowledge/carton-mcp/webbing_agent.py`** — the SDNAC primitive + CODE detection + verify.
 - **`knowledge/carton-mcp/webbing_agent_worker.py`** — the thin PID-locked driver daemon.
 - **`knowledge/carton-mcp/test_webbing_agent.py`** — the pure-function unit tests.
+- **`knowledge/carton-mcp/webbing_write_guard.py`** — the write guard, called once from
+  `add_concept_tool.add_concept_tool_func` right after the circuit breaker.
+- **`knowledge/carton-mcp/test_webbing_write_guard.py`** — the guard suite.
 
 ## Part 1 — How you edit (read the whole file first — the ONION, pure functions first)
 
@@ -43,14 +42,25 @@ itself, it does not create a side-car observation).
        EXCLUDES `INSTANTIATES`/`PRODUCES`, which DO count as real structure).
      - `_format_rels(rels)` / `_build_batch_goal(batch, rels_by_concept)` — the goal-text builder that
        SERVES the batch (names + description + existing relationships) so the SDNAC agent never has to
-       hunt for what to atomize.
-   - **The two-function primitive pattern (mirrors Sophia's "call_sophia() and
-     call_sophia_with_this_prompt() — that is it"):**
+       hunt for what to atomize. Its step 8 carries `SOMA_RESULT_ACTIONS`.
+     - `SOMA_RESULT_ACTIONS` — the one constant saying what the agent does with each `add_concept`
+       result, named by the text it sees. A MEREO or SOUP grade means the concept is not validly the type
+       it claims, its execution failed, and CartON keeps the write so it can be seen (Isaac 2026-09-29).
+       Every fill DO line opens `this is important to fill next, but only if ... is inside the meaning you
+       meant`; for the webber that meaning is the served concept's prose, and it never expands past it
+       because SOMA names a part. The DEATH block, CRITICAL, D2, CB and the help line are read past;
+       `DO MEREO[n]: ... define Y` gives Y its four lists when the prose means Y, else drops the claim, and
+       a REFUSED fill leaves Y (a CartON declaration SOMA has not admitted, issue 961); `... declare Y a
+       type` drops the claim; `DO SOUP[n]: ... add_concept X with properties P` supplies P from the prose
+       or drops the `is_a T` claim; every other DO line is left; `❌ REFUSED (not written)` or `REJECTED`
+       leaves that concept alone; no DO line goes on. `WEBBER_SYSTEM_PROMPT` and the goal both carry it.
+   - **The two-function primitive pattern (mirrors Sophia's `call_sophia()` and
+     `call_sophia_with_this_prompt()`):**
      - `call_webber_with_this_prompt(prompt, model)` — runs ONE SDNAC to completion on an arbitrary
-       goal. Copied near-verbatim from `docmirror-cohere.call_sophia_with_this_prompt` (same
-       `HeavenInputs`/`HermesConfig` shape, same `_get_mcp()` carton MCP wiring). `history_id=None` —
-       UNLIKE Sophia, there is no cross-run momentum web to rehydrate (each run is a fresh, bounded,
-       self-contained batch), so a fresh history every run is correct here, not a gap.
+       goal. Same `HeavenInputs`/`HermesConfig` shape and `_get_mcp()` carton MCP wiring as
+       `docmirror-cohere.call_sophia_with_this_prompt`. `history_id=None`: each run is a fresh, bounded,
+       self-contained batch, so no history carries between runs — which is why everything the agent
+       must know about SOMA's answers lives in its prompt.
      - `call_webber(model, dry_run, cap, concept_names=None)` — detect → build goal → run → verify →
        mark webbed. `concept_names` is the **TEST/DEBUG direct-invocation escape hatch** (via
        `_batch_for_names`, wired to the CLI `--concept NAME` flag) — mirrors Sophia's
@@ -58,17 +68,14 @@ itself, it does not create a side-car observation).
        surface from a real, potentially enormous, oldest-first backlog. NEVER used by the normal
        `--loop`/`--once` production path.
    - **CODE detection (no LLM):** `_next_batch(carton, cap)` — the eligibility Cypher (`linked=true AND
-     source IN CHAT_SOURCES AND webbed IS NULL`, plus the housekeeping-relationship count), over-fetches
-     `cap * FETCH_MULTIPLIER` candidates (oldest-linked first) because the description-score signal
-     needs the full `concept_cache` computed in Python and cannot be pushed into Cypher, then
-     Python-filters via `_is_underdeveloped` and truncates to `cap`. `_pending_count(carton)` is an
-     honest UPPER BOUND (the coarse Cypher filter only — documented in its own docstring as such, never
-     silently treated as exact).
+     source IN CHAT_SOURCES AND webbed IS NULL`, plus the housekeeping-relationship count and the
+     stored `c.score`), oldest-linked first, truncated to `cap`. `_pending_count(carton)` is the
+     EXACT count: the same predicate `_next_batch` selects on, read from the `c.score` D2 stores, so the
+     count and the selection cannot disagree.
    - **Verify (CODE, not the agent):** `_verify_and_mark_webbed(carton, batch)` — re-checks each served
-     concept's CURRENT description/rel-count against the SAME `_is_underdeveloped` predicate; only a
-     concept that NOW passes (is no longer under-structured) gets `webbed=true` via
-     `set_concept_properties`. A concept the agent failed to improve stays un-webbed (eligible again
-     next tick) — no silent partial credit.
+     concept's CURRENT score/rel-count against the SAME predicate; only a concept that NOW passes (is no
+     longer under-structured) gets `webbed=true` via `set_concept_properties`. A concept the agent failed
+     to improve stays un-webbed (eligible again next tick) — no silent partial credit.
    - **`loop(model, limit, dry_run, cap)`** — ratchets batch-by-batch until caught up (or `limit`
      batches), with the SAME no-progress spin-guard as Sophia's `loop()` (2 no-progress batches in a row
      → abort with an explicit error, never spins forever).
@@ -80,8 +87,10 @@ itself, it does not create a side-car observation).
    from `sophia_worker.py`: PID-file lifecycle (`_alive`/`_running_pid`/`daemon`/`ensure_running`/
    `wait_caught_up`), the `--daemon`/`--catch-up`/`--ensure`/`--ensure-and-wait`/`--status` flags, the
    FAIL-LOUD empty/unparseable-stdout handling in `_pending_concepts` (empty stdout is a FAILURE
-   returning `-1`, NEVER silently "0 pending"), and the `_live()` DRY-by-default gate (`live.flag` file
-   OR `WEBBING_AGENT_LIVE=1` env var — **ships DRY; Isaac flips it live explicitly, never the build**).
+   returning `-1`, NEVER silently "0 pending"), and the `_live()` gate (`live.flag` file OR
+   `WEBBING_AGENT_LIVE=1` env var). Whether it writes is the presence of
+   `$HEAVEN_DATA_DIR/webbing_agent/live.flag` and `sophia-status`'s webber lane; read those, never
+   this file. Only Isaac flips the flag.
    ONE structural difference from `sophia_worker.py`: `webbing_agent.py` lives INSIDE the `carton_mcp`
    package (not a `plugin/bin/` installed console script like `docmirror-cohere`), so the worker invokes
    it via `python3 -m carton_mcp.webbing_agent` (module invocation), never a bare command name.
@@ -100,60 +109,94 @@ itself, it does not create a side-car observation).
    derived spec — env-overridable (`WEBBING_AGENT_SCORE_THRESHOLD`/`WEBBING_AGENT_MIN_REL_COUNT`); flag
    any change to Isaac explicitly rather than silently re-tuning.
 
-2. **THE RECURSION GUARD (the one safety property Isaac was explicit about — never weaken this).**
+2. **THE RECURSION GUARD — never weaken this.**
    `_next_batch` ONLY ever queries `c.source IN CHAT_SOURCES` (imported from
    `observation_worker_daemon.py`, never redefined locally — a second copy WILL drift). `WEBBER_SYSTEM_PROMPT`
    + `_build_batch_goal` instruct the agent to pass `source='webbing_agent'` on EVERY `add_concept` call
    it makes. `'webbing_agent'` lives in `SYSTEM_SOURCES`, NEVER in `CHAT_SOURCES` — so any concept this
    agent touches or creates is STRUCTURALLY excluded from ever being re-served to it, with zero extra
-   bookkeeping. **If you ever add `'webbing_agent'` to `CHAT_SOURCES` (even by accident, e.g. a future
-   merge of the two sets), this agent will start recursively re-processing its own output — this is the
-   ONE thing this dev-flow exists to protect.** If a real agent later re-engages a webbing-agent-authored
-   concept and re-queues it with `source='agent'`, it becomes eligible again automatically — this is NOT
-   special-cased anywhere; it falls straight out of the eligibility query being source-based (Isaac's
-   design: "unless they become involved in the main agent's context and re-enter through the queue").
+   bookkeeping. **Never add `'webbing_agent'` to `CHAT_SOURCES` (a merge of the two sets does it too):
+   the agent would then recursively re-process its own output — this is the ONE thing this dev-flow
+   exists to protect.** A webbing-agent-authored concept a real agent re-queues with `source='agent'` is
+   eligible again automatically, because the eligibility query is source-based; build nothing extra for
+   the re-entry case.
 
-3. **THE NEVER-TOUCH-DESCRIPTION MECHANISM (load-bearing, same as `dev-flow-split-content`'s item 4 —
-   verify on any daemon change).** `WEBBER_SYSTEM_PROMPT` instructs the agent to OMIT the `concept`
-   (description) argument when amending an EXISTING served concept. This relies on the SAME mechanism
-   `dev-flow-split-content` documents: an absent/omitted description normalizes to `""`
-   (`add_concept_tool_func`), and `observation_worker_daemon.batch_create_concepts_neo4j`'s UNWIND
-   write-CASE branch `WHEN n.d CONTAINS c.description THEN n.d` leaves an existing non-empty `n.d`
-   COMPLETELY UNCHANGED (an empty string is contained in every string). If that CASE's branch ORDER is
-   ever refactored, re-verify this still holds BEFORE the `update_mode == 'append'` branch — proven live
-   2026-07-04 (see Part 3's E2E run: a byte-for-byte sha256 compare of the test concept's description,
-   before vs. after a real atomization run, matched exactly).
+3. **THE NEVER-TOUCH-DESCRIPTION MECHANISM — re-verify on any daemon change.** `WEBBER_SYSTEM_PROMPT`
+   instructs the agent to OMIT the `concept` (description) argument when amending an EXISTING served
+   concept. This relies on the mechanism `dev-flow-split-content` documents: an absent/omitted
+   description normalizes to `""` (`add_concept_tool_func`), and
+   `observation_worker_daemon.batch_create_concepts_neo4j`'s UNWIND write-CASE branch
+   `WHEN n.d CONTAINS c.description THEN n.d` leaves an existing non-empty `n.d` COMPLETELY UNCHANGED (an
+   empty string is contained in every string). If that CASE's branch ORDER is ever refactored, re-verify
+   this still holds BEFORE the `update_mode == 'append'` branch, with the byte-for-byte sha256 compare of
+   Part 3.
 
 4. **DEPLOY (the running daemon is the INSTALLED package, NOT the source).** After editing:
    `pip install --no-deps /home/GOD/gnosys-plugin-v2/knowledge/carton-mcp` (per
    `pip-install-our-packages-no-deps`; NEVER `--force-reinstall`). The webbing-agent worker is a
-   SEPARATE process from `observation_worker_daemon` — if you only changed `webbing_agent.py`/
-   `webbing_agent_worker.py`, no daemon restart is needed (the worker's `--catch-up`/`--daemon` always
-   subprocess-invokes the freshly-pip-installed module by path, so a fresh subprocess call always picks
-   up the new code — UNLESS a `--daemon` process is already running its own long-lived Python
-   interpreter, in which case restart it: find the PID via `webbing_agent_worker.py --status` or the
-   PID file at `$HEAVEN_DATA_DIR/webbing_agent/worker.pid`, kill it, `ensure_running` again). If you
-   changed the ONE `SYSTEM_SOURCES` line in `observation_worker_daemon.py`, that daemon (a genuinely
-   long-running process) DOES need a restart — follow `skill-carton-daemon-restart`.
+   SEPARATE process from `observation_worker_daemon` — if you only changed `webbing_agent.py`, no restart
+   is needed: the worker's `--daemon` subprocess-invokes the installed module on every tick, so the next
+   tick runs the new code, and a run already in flight keeps the code it started with. If you changed
+   `webbing_agent_worker.py`, restart the `--daemon` process (PID via `webbing_agent_worker.py --status`
+   or `$HEAVEN_DATA_DIR/webbing_agent/worker.pid`, then `ensure_running`). If you changed the ONE
+   `SYSTEM_SOURCES` line in `observation_worker_daemon.py`, that daemon DOES need a restart — follow
+   `skill-carton-daemon-restart`.
+
+5. **THE FRONT-DOOR WRITE GUARD — the webbing agent never writes onto a declared system type, never
+   declares one, and never names a merged label.** A system type is code, declared with params through
+   vault or `declare-a-soma-type`. A merged label no longer exists; the label it was merged into records
+   it in `merged_from`. The agent reaches CartON through its own carton MCP, so the rule is enforced where
+   the write lands: `webbing_write_guard.webbing_write_refusal` (pure) refuses any `source='webbing_agent'`
+   write whose concept `is_declared_system_type` (a failed read counting as declared), whose `is_a`
+   carries `System_Type` in any spelling, or whose name or `is_a`/`instantiates` target is a merged label
+   (`merged_labels_named` reads `merged_from`, a failed read refusing), and `add_concept_tool_func`
+   returns that refusal before the SOMA POST and the queue write. The prompt's fourth law
+   (`WEBBER_SYSTEM_PROMPT`) and step 7 of `_build_batch_goal` state the system-type rule to the agent;
+   change them together, with `test_webbing_write_guard.py` and the `assert "declared system type"` line
+   in `test_webbing_agent.py`. The agent's fresh carton MCP subprocess imports the installed package, so
+   `pip install --no-deps` is the whole deploy. Prove a refusal by calling `add_concept_tool_func(...,
+   source='webbing_agent')` in a fresh python process of the installed package and counting queue files
+   before and after; never probe a refusal through your own session's carton MCP, which serves the code
+   it started with until a reconnect is confirmed, and whose old code accepts the write and mints the
+   refused label as an auto stub.
+
+6. **SOMA_RESULT_ACTIONS moves with what CartON and SOMA actually return.** Its scenarios quote the
+   result text the agent sees, so a change to the verdict wording (`add_concept_tool.py`'s verdict tags,
+   SOMA's report blocks, the DEATH block, the guard's refusal text — card 710 reworks these) changes
+   what the agent must match: update the constant and `SOMA_SCENARIO_ACTIONS` in `test_webbing_agent.py`
+   in the same edit. Measure the forms before writing them — read the run histories under
+   `$HEAVEN_DATA_DIR/agents/webbing_agent/memories/histories/<day>/`, where each tool result is stored as
+   the repr of a `(text, None)` tuple opening with the CartON header — never write a scenario from the
+   code alone.
 
 ## Part 3 — How you test it (the E2E gate — "the unit tests passed" is NOT sufficient alone)
 
 **Unit gate (necessary, NOT sufficient):** `pip install --no-deps <repo>` then
-`python3 test_webbing_agent.py` — 10 pure assertions on `_is_underdeveloped`/`_format_rels`/
+`python3 test_webbing_agent.py` — every pure check passing, ending ALL WEBBING_AGENT UNIT TESTS PASSED, on `_is_underdeveloped`/`_format_rels`/
 `_build_batch_goal` (the strict `<` threshold boundary, the OR semantics, the never-touch-description +
-additive-only + source-tag laws literally present in the built goal text, and that
-`BASE_RELS_EXCLUDED` never excludes `INSTANTIATES`/`PRODUCES`).
+additive-only + source-tag + no-system-type laws literally present in the built goal text, every SOMA
+scenario and its action present in BOTH `WEBBER_SYSTEM_PROMPT` and the goal, and that
+`BASE_RELS_EXCLUDED` never excludes `INSTANTIATES`/`PRODUCES`). Then `python3 test_webbing_write_guard.py`
+— ending ALL N PASS with every marker printed: the refusals, a case variant of a declared type refused, and `add_concept_tool_func` with
+SOMA, breaker, graph and queue faked, a refused webber write reaching neither SOMA nor the queue while
+ordinary writes still land.
 
-**The REAL E2E gate — through the actual live surface (proven 2026-07-04, this build's own verification
-run):**
+**The live surface for the prompt and the guard:** read the agent's first run history written after
+the install whose text carries the new prompt, under
+`$HEAVEN_DATA_DIR/agents/webbing_agent/memories/histories/<day>/`. For the guard, count its `❌ REFUSED`
+tool results and its writes onto declared system types in `carton_queue/processed` (every processed
+write keeps its `source`). For `SOMA_RESULT_ACTIONS`, find a MEREO or SOUP result and confirm the
+agent's NEXT call is the fill it names (an `add_concept` on the undefined type with its four lists, or on
+the concept with the missing param) or that the named type appears in no later `is_a` of that run.
+
+**The REAL E2E gate for atomization — through the actual live surface:**
 1. `add_concept` (the real MCP tool) a test concept with a real `is_a`/`part_of` but genuinely
    under-structured prose, `source='agent'`.
 2. Wait for the autolinker (`linker_thread` in `observation_worker_daemon.py`) to set `linked=true`
    (poll `query_wiki_graph`; takes seconds to tens of seconds depending on queue depth).
 3. Run the agent against that ONE concept via the direct-invocation escape hatch (`--concept NAME`) —
-   NOT `--loop`/`--once` against the live backlog, which is FIFO oldest-first and can be tens of
-   thousands deep (measured live: ~44,000 pending under `CHAT_SOURCES`), so a brand-new test concept
-   would never surface in a bounded test run.
+   NOT `--loop`/`--once` against the live backlog, which is FIFO oldest-first and tens of thousands
+   deep, so a brand-new test concept would never surface in a bounded test run.
 4. `query_wiki_graph` and confirm ALL of:
    - Real `is_a`/`part_of`/`instantiates`/`produces`/`has_part` structure now exists, derived from the
      prose (NOT a placeholder — genuinely reflects what the description described).
@@ -163,24 +206,16 @@ run):**
    - Any NEW child concept the agent created carries `source='webbing_agent'`.
    - Re-running `_next_batch` (a fresh call, no `--concept` override) does NOT surface the now-webbed
      concept.
-5. **Recursion-guard proof (the one safety property Isaac was explicit about — never skip):** confirm,
-   via a direct query, that every `source='webbing_agent'` concept has `source IN CHAT_SOURCES` = FALSE,
-   and that none of them appear in a fresh `_next_batch()` call. (Proven live 2026-07-04: both new child
-   concepts confirmed `in_chat_sources: False`; neither ever appeared across a 50-concept fresh batch.)
+5. **Recursion-guard proof — never skip:** confirm, via a direct query, that every
+   `source='webbing_agent'` concept has `source IN CHAT_SOURCES` = FALSE, and that none of them appear
+   in a fresh `_next_batch()` call.
 
 A queued-write confirmation string is NOT the gate (per `verify-via-user-surface-before-done`) — only
 the byte-for-byte `n.d` compare + the live recursion-guard query prove the capability actually works.
 
-## Status
-
-**IS — built + live-E2E-verified 2026-07-04** (unit tests 10/10 green; live run against the real neo4j
-graph atomized a real test concept, added real `instantiates`/`produces`/`has_part` structure, left the
-original description byte-identical, tagged both new children `source='webbing_agent'`, and confirmed
-the recursion guard holds). Ships DRY (`webbing_agent_worker.py`'s `_live()` gate defaults off, same as
-Sophia's) — **NOT yet flipped `--live` for the standing daemon** (Isaac's call, per Part 2 item 4's
-design and this build's own report). The eligibility thresholds
-(`DEFAULT_SCORE_THRESHOLD=50`/`DEFAULT_MIN_REL_COUNT=2`) are UNVERIFIED-AS-TUNED judgment calls this
-build chose — flag them for Isaac's review before relying on them at scale (see item 1 above).
+**Re-seal:** `seem working-on webbing_agent`, `seem retrace webbing_agent` (it re-checks its anchors and
+carries every range an edit only shifted), `hop-move` every range whose text changed (`seem check` names
+them), probe one shifted range with `seem admits`, then `SEEM_CARTON_SEAL=1 seem seal webbing_agent`.
 
 ## Cross-refs (canonical)
 

@@ -88,8 +88,10 @@ def _lock_actor_at_step_a(run):
     """Directly lock (or re-lock) ACTOR's Execution_State at STEP_A — same idiom as
     tests/test_sm_gate_e2e.py's `_program_sm` actor-locking cypher."""
     run(f"""
+        MERGE (t_e:Wiki {{n: 'Execution_State'}})
+        WITH t_e LIMIT 1
         MERGE (a:Wiki {{n: $actor}})
-        MERGE (st:Wiki {{n: $state}}) MERGE (st)-[:IS_A]->(:Wiki {{n: 'Execution_State'}})
+        MERGE (st:Wiki {{n: $state}}) MERGE (st)-[:IS_A]->(t_e)
         SET st.status = 'locked'
         MERGE (a)-[:HAS_LIFECYCLE]->(st)
         WITH st MATCH (s:Wiki {{n: $step_a}})

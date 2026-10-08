@@ -1,0 +1,9 @@
+{
+  "domain": "Claude_Code_Hooks",
+  "subdomain": "Pretooluse_Context_Injection",
+  "category": "understand",
+  "what": "How to inject GNOSYS planning patterns into plan mode",
+  "when": "When agent enters plan mode and needs GNOSYS-aware planning guidance",
+  "produces": "Planning_Context_Injection",
+  "describes_component": "Giint_Component_Compile_Memory_Tier"
+}

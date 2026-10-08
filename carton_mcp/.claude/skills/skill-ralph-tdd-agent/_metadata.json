@@ -1,0 +1,9 @@
+{
+  "domain": "Compoctopus",
+  "subdomain": "Ralph_Agent",
+  "category": "understand",
+  "what": "How Ralph runs N independent fresh conversations over shared workspace to self-correct via MoE lottery",
+  "when": "When you need an autonomous TDD agent to code against a callgraph + requirements doc",
+  "produces": "Working_Code_On_Disk",
+  "describes_component": "Giint_Component_Ralph_Agent"
+}

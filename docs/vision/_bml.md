@@ -1,0 +1,4 @@
+# vision: milo (topic — auto-created by `journal`)
+
+<!-- ===VISION DELTA: id-tagged appends below = the gap (`vision diff <m>`); `doc-mirror-commit --realizes <ids>` drops them on build === -->
+- [v1]  2026-08-10T13:11:50  OPEN: OPEN (Isaac, 2026-08-10, at compact seam): should the MILO loop be wired into the GNOSYS BML mission system flight config instruction strings? VERIFIED CURRENT STATE: zero FP/milo references in the heaven flight_configs registry, starship/starsystem/waypoint sources, and starport skills; the only mission-flow references are the 3 OMNISANC injection strings (renamed ask_milo in the monorepo canonical; the omnisanc runtime is the disabled diverged Apr-28 copy, so nothing fires today). His question implies the wiring decision is on the table -- his call on where it goes (flight-config instruction strings vs the omnisanc reconnect vs both).  tags:[milo, bml, flight-configs]

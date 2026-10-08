@@ -1,0 +1,18 @@
+# vision: coordinate-parse (topic — auto-created by `journal`)
+
+<!-- ===VISION DELTA: id-tagged appends below = the gap (`vision diff <m>`); `doc-mirror-commit --realizes <ids>` drops them on build === -->
+- [v1]  2026-08-22T20:51:49  FINDING: FINDING: THE COORDINATE-PARSE HAZARD I FILED LAST PASS AS A RETIREMENT DEFECT ALSO FIRES ON THE READ PATH, AND THERE IT MANUFACTURES THE FORK INSTEAD OF MERELY MISSING HALF A THREAD. Found by tripping it during my own STEP-2 rehydration, minutes after unlocking.
+
+WHAT HAPPENED. Conversation 0 contained an entry named Doc_Mirror_System_Doc_Mirror_Collaboration_Model_2026_08_22T20_21_50. DMN step 2 says read the cohered note for every subdomain the conversation touches, so I asked the read CLI for the subdomain I derived from that name - Doc_Mirror_Collaboration_Model - and it answered NO COHERED NOTE FOR THAT SUBDOMAIN YET, JOURNAL AN ENTRY AT THAT COORDINATE TO SEED IT. The note EXISTS. It is 24056 characters across five blocks and it is the definitive record of Isaac 2026-06-30 retcon-superpower design. The true split is repo Doc_Mirror_System, domain Doc_Mirror, subdomain Collaboration_Model.
+
+WHY THE READ PATH IS THE WORSE HALF, and this is what task 52 did not say. On the RETIREMENT path a bad split under-matches and reports a smaller number than the truth - marked 2 of 2 when there are 8 - which is silent but leaves the record intact. On the READ path the same bad split returns a SEED INVITATION, and following that invitation writes a SECOND cohered note at the wrong coordinate for a topic that already has one. The failure does not merely miss the thread; IT FORKS IT, and the fork is exactly the shape of task 42 which is about a repo move. So one ambiguity mechanism produces both recorded fork instances by two different routes.
+
+I DID NOT FOLLOW THE INVITATION. I queried the graph for any cohered note whose name contains Collaboration_Model, found the single real node, and re-asked the CLI with the correct subdomain, which returned all five blocks. That is the general cure and it costs one query: WHEN A STATE READ SAYS NO NOTE YET, DO NOT SEED - SEARCH THE NODE NAMES FIRST, because a not-found from an ambiguous key is indistinguishable from a genuine absence.
+
+THE CHEAPEST STRUCTURAL GUARD IS THE SAME ONE TASK 52 ALREADY NAMES FOR THE ACTUATOR, applied to the reader: before reporting no-note-yet, the read CLI can match on NAME SUFFIX as well as on the axis edge, and say I FOUND A NOTE WHOSE NAME ENDS IN YOUR SUBDOMAIN BUT WHOSE AXIS DISAGREES rather than inviting a seed. I am not building it - the fork in task 52 is Isaac and this is the same fork seen from the reader.
+
+CORROBORATES RATHER THAN CORRECTS TASK 52: same mechanism, second surface, and the second surface is the one that CREATES divergence rather than hiding it.
+
+AND ONE INSTRUMENT SELF-CATCH WORTH KEEPING, because it went the other way for once. Counting the open tasks with a regex on the glyph plus hash plus digits returned FORTY and I was one step from reporting the carried 47 as drifted. The list right-pads single-digit ids as hash-space-one, so my pattern collapsed tasks 1 through 9 into a single match. Counting header LINES returns 47 and enumerating the ids returns exactly 47 - 1,2,3,5,7,8,9 then 10 through 31, 34 through 48, 50 through 52. THE CARRIED NUMBER WAS RIGHT AND MY INSTRUMENT WAS WRONG. Wanting a finding is when a checker stops checking, and this time the near-miss was a false ALARM rather than a false all-clear.
+
+READ-ONLY THROUGHOUT: cypher reads, CLI reads, no writes to the store beyond this entry.  tags:[coordinate-parse, dmn, read-layer]

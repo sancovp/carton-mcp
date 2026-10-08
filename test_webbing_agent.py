@@ -18,7 +18,27 @@ from carton_mcp.webbing_agent import (
     _build_batch_goal,
     _format_rels,
     BASE_RELS_EXCLUDED,
+    DOMAIN_AXIS_LAW,
+    WEBBER_SYSTEM_PROMPT,
+    _webber_run_config,
 )
+
+# Each SOMA result the agent meets, as the text it sees, paired with the action it must take.
+MEREO_FILL = "DO MEREO[n]: this is important to fill next, but only if Y is inside the meaning you meant: "
+SOUP_FILL = "DO SOUP[n]: this is important to fill next, but only if it is inside the meaning you meant: "
+SOMA_SCENARIO_ACTIONS = [
+    ("DEATH block", "read past them"),
+    ("not validly the type it claims: its execution failed", "CartON keeps the write so it can be seen"),
+    ("only if it is inside the meaning you meant", "Never expand past that prose"),
+    (MEREO_FILL + "define Y", "give Y its four lists"),
+    (MEREO_FILL + "define Y", "drop the claim"),
+    (MEREO_FILL + "declare Y a type", "declaring a type is not"),
+    (SOUP_FILL + "add_concept X with properties", "supply it"),
+    (SOUP_FILL + "add_concept X with properties", "drop the claim"),
+    ("DO SOUP[n]: leave it", "leave it"),
+    ("REFUSED (not written)", "leave that concept alone"),
+    ("REJECTED", "leave that concept alone"),
+]
 
 
 # ── _is_underdeveloped ───────────────────────────────────────────────────────────────────────────
@@ -105,7 +125,68 @@ def test_build_batch_goal_states_the_never_touch_description_law():
     assert "OMIT the" in goal and "concept" in goal
     assert "source='webbing_agent'" in goal
     assert "NEVER delete" in goal
-    print("✓ the goal explicitly states the never-touch-description / additive-only / source-tag laws")
+    assert "declared system type" in goal and "System_Type in an is_a list" in goal
+    print("✓ the goal explicitly states the never-touch-description / additive-only / source-tag / "
+          "no-system-type laws")
+
+
+def test_prompt_and_goal_carry_every_soma_scenario_and_its_action():
+    goal = _build_batch_goal([{"n": "Concept_A", "d": "x", "t": "2026-07-01T00:00:00"}], {})
+    for where, text in (("WEBBER_SYSTEM_PROMPT", WEBBER_SYSTEM_PROMPT), ("the batch goal", goal)):
+        for scenario, action in SOMA_SCENARIO_ACTIONS:
+            assert scenario in text, f"{where} does not name the SOMA result {scenario!r}"
+            assert action in text, f"{where} does not state the action {action!r}"
+    print("✓ the system prompt and the goal both name every SOMA result and the action for it")
+
+
+def test_the_do_lines_add_concept_writes_start_as_the_prompt_names_them():
+    from carton_mcp.add_concept_tool import soma_result_lines
+    verdict = ("mereo_errors=2\n  - zz_x is_a zz_type (not a known/defined type)\n"
+               "  - zz_x is_a zz_other (defined but not DECLARED)\n"
+               "soup_gaps=2\n  - zz_x claims to be skill. skill requires has_content (string_value). zz_x does "
+               "not have has_content. Provide it.\n  - paiab claims to be personal_domain. personal_domain requires "
+               "undefined_type_ref (personal_domain). paiab does not have undefined_type_ref. Provide it.")
+    _, mereo = soma_result_lines(verdict, "Zz_X", "mereo_error")
+    _, soup = soma_result_lines(verdict, "Zz_X", "soup")
+    meant = "this is important to fill next, but only if {} is inside the meaning you meant: "
+    shapes = [(mereo[0], "DO MEREO[1]: " + meant.format("Zz_Type") + "define Zz_Type"),
+              (mereo[1], "DO MEREO[2]: " + meant.format("Zz_Other") + "declare Zz_Other a type"),
+              (soup[0], "DO SOUP[1]: " + meant.format("it") + "add_concept Zz_X with properties has_content"),
+              (soup[1], "DO SOUP[2]: leave it")]
+    for line, prefix in shapes:
+        assert line.startswith(prefix), (line, prefix)
+    for named in (MEREO_FILL + "define Y", MEREO_FILL + "declare Y a type", SOUP_FILL + "add_concept X with properties",
+                  "DO SOUP[n]: leave it"):
+        assert named in WEBBER_SYSTEM_PROMPT, named
+    assert soup[0].endswith("otherwise drop the is_a Skill claim."), soup[0]
+    print("✓ each DO line add_concept writes starts with a shape the prompt names")
+
+
+def test_prompt_and_goal_carry_the_domain_axis_law():
+    # Card 726 condition 6: the webber reuses the served concept's domain and subdomain, and a name that is not
+    # yet a domain node goes through the front door's about params; rooting is part_of, never an hwss_rooted edge.
+    for phrase in ("HAS_DOMAIN and HAS_SUBDOMAIN", "pass subdomain_about", "domain_about and domain_part_of",
+                   "not validly a Domain, its execution failed", "never write an hwss_rooted relationship",
+                   "did not name new this run is not yours; leave it"):
+        assert phrase in DOMAIN_AXIS_LAW, phrase
+    goal = _build_batch_goal([{"n": "Concept_A", "d": "x", "t": "2026-07-01T00:00:00"}], {})
+    for where, text in (("WEBBER_SYSTEM_PROMPT", WEBBER_SYSTEM_PROMPT), ("the batch goal", goal)):
+        assert DOMAIN_AXIS_LAW in text, f"{where} does not carry DOMAIN_AXIS_LAW"
+    print("✓ the system prompt and the goal both carry the domain axis law")
+
+
+def test_one_run_is_three_iterations_of_200_tool_calls_and_ends_on_the_fenced_signal():
+    # max_turns is heaven's iteration count; max_tool_calls reaches the agent constructor only as
+    # HeavenAgentArgs.max_tool_calls (extra_agent_kwargs drops it, leaving heaven's 10 per iteration);
+    # heaven ends agent mode only on the fenced GOAL ACCOMPLISHED, so both texts ask for exactly that.
+    cfg = _webber_run_config("the goal", "a-model", {})
+    assert cfg.max_turns == 3
+    assert cfg.heaven_inputs.agent.max_tool_calls == 200
+    assert "max_tool_calls" not in cfg.heaven_inputs.agent.extra_agent_kwargs
+    goal = _build_batch_goal([{"n": "Concept_A", "d": "x", "t": "2026-07-01T00:00:00"}], {})
+    for where, text in (("WEBBER_SYSTEM_PROMPT", WEBBER_SYSTEM_PROMPT), ("the batch goal", goal)):
+        assert "```GOAL ACCOMPLISHED```" in text, f"{where} does not ask for the fenced completion"
+    print("✓ one run is 3 iterations of up to 200 tool calls and ends on the fenced completion")
 
 
 def test_base_rels_excluded_does_not_include_instantiates_or_produces():
@@ -130,6 +211,10 @@ if __name__ == "__main__":
     test_format_rels_sorted_and_joined()
     test_build_batch_goal_serves_every_concept_name_and_description()
     test_build_batch_goal_states_the_never_touch_description_law()
+    test_prompt_and_goal_carry_every_soma_scenario_and_its_action()
+    test_the_do_lines_add_concept_writes_start_as_the_prompt_names_them()
+    test_prompt_and_goal_carry_the_domain_axis_law()
+    test_one_run_is_three_iterations_of_200_tool_calls_and_ends_on_the_fenced_signal()
     test_base_rels_excluded_does_not_include_instantiates_or_produces()
     print("=" * 70)
     print("ALL WEBBING_AGENT UNIT TESTS PASSED")

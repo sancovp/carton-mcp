@@ -1,6 +1,6 @@
 # doc(m): substrate_projector.py
 
-**Module:** `/home/GOD/gnosys-plugin-v2/knowledge/carton-mcp/substrate_projector.py`  •  **Mirrors:** the module 1:1  •  **Last derived:** 2026-06-10 (added `hydrate_template_content` + `PublishManifest`; module-level `RenderablePiece` import; `_build_template_content` None-description coercion)
+**Module:** `/home/GOD/gnosys-plugin-v2/knowledge/carton-mcp/substrate_projector.py`  •  **Mirrors:** the module 1:1  •  **Last derived:** 2026-08-29 (DELTA derivation ×3: added the #206 canonical-path gate to `project_to_file` — see its entry below; previously 2026-08-28 ×2: added the `sync_task_kanban_card` release-effect handler, issue #148, then the `flush_starlog_diary` carton mirror, issue #118 leg 2 — that handler now has its own section below; the rest of this doc last fully derived 2026-06-10 and the remaining later-landed handlers — the giint/state-machine/EC projectors — are documented in their own dev-flow rules rather than here)
 
 ## Purpose (one paragraph)
 
@@ -51,8 +51,9 @@ Pydantic `BaseModel` subclasses describing projection targets. All are members o
 - `get_concept_content(concept_name, description_only) -> str`  — `substrate_projector.py:159`
   - Fetches concept data from Neo4j via `CartOnUtils().query_wiki_graph`. Applies wiki-link stripping (5-pass loop, same patterns as `strip_wiki_links` but re-implemented locally). If `description_only=False`, appends a `## Relationships` section. Used by all non-skill, non-rule projectors.
 
-- `project_to_file(substrate: FileSubstrate, content: str) -> str`  — `substrate_projector.py:213`
-  - Creates new file if path doesn't exist; otherwise reads existing lines and injects at line, at marker, or appends. Returns status string.
+- `project_to_file(substrate: FileSubstrate, content: str) -> str`  — `substrate_projector.py:235`
+  - **GUARDED (#206, 2026-08-29):** first act is `check_write(substrate.path, 'create' if not exists else 'append')` from `carton_mcp.carton_pathguard` (imported lazily at the top of the function). Mode is decided by EXISTENCE: the create branch only fires for a nonexistent path; every existing-file branch (append / inject_at_line / inject_at_marker) rewrites, so it is 'append' — and append is wiki-only ($HEAVEN_DATA_DIR/wiki); registered $CARTON_DOC_ROOTS are CREATE-only. A `CartonPathRefused` propagates uncaught — it subclasses ValueError, the error contract callers already handle.
+  - Then: creates new file if path doesn't exist; otherwise reads existing lines and injects at line, at marker, or appends. Returns status string.
 
 - `project_to_discord(substrate: DiscordSubstrate, content: str) -> str`  — `substrate_projector.py:265`
   - STUB. Attempts import of `mcp__our_discord__*` from `server_fastmcp` (silently ignores `ImportError`). Returns placeholder strings only.
@@ -86,7 +87,56 @@ Pydantic `BaseModel` subclasses describing projection targets. All are members o
   - Phase 3: walks `HAS_DESCRIBES_COMPONENT` → `PART_OF*1..6` → `Starsystem_*` and direct `HAS_STARSYSTEM` to find starsystem filesystem paths (via nested `_resolve_starsystem_path`), copies skill dir to `{ss_path}/.claude/skills/{skill_name}`, writes a `use-{skill_name}.md` rule, and calls `_project_giint_hierarchy_rule`.
   - Returns status string with optional `+ ChromaDB skillgraph written` and `+ projected to N starsystem(s)` suffixes.
 
-### Rule projection helpers — `substrate_projector.py:834`
+### Starlog-diary handler — `flush_starlog_diary` (STAGE A4; carton mirror = issue #118 leg 2)
+
+- `flush_starlog_diary(concept_name: str, shared_connection=None) -> str` — the release_effect
+  entrypoint for the 8 per-typed-EC starlog-diary d-chains (gnosys_vault/starlog_diary.py). Ports
+  dragonbones compiler.py._flush_to_starlog_diary: reads the concept's `d`/`isa` off neo4j, maps
+  is_a → entry_type (Bug/Potential_Solution/Skill/GIINT_Deliverable/GIINT_Task/Design/Idea/
+  Inclusion_Map, default "observation"), routes to the starlog project detected from file paths in
+  the description (`detect_starsystems_for_entry`; multi-detection → the joint starlog name), and
+  writes the DebugDiaryEntry via `sl._save_debug_diary_entry` (the REGISTRY lane).
+- **THE CARTON MIRROR (issue #118 leg 2):** after the registry save the entry ALSO mirrors to the
+  graph via `sl.mirror_to_carton`, with EXACTLY the agent lane's pass-1 mechanism (update_debug_diary,
+  starlog_mcp.py): the CONTENT node first (`Debug_Diary_{ts}_Content`, is_a Desc_Content, prose in
+  the DESCRIPTION — a relationship target is always MERGEd as a node keyed on its name, so the
+  target must be an identifier), then the diary node (`Debug_Diary_{ts}`, is_a Debug_Diary_Entry +
+  has_content → the content node + related_to → the source concept + references_starsystem on the
+  joint case), with entry_type/source riding as scratch-lane PROPERTIES and part_of the starlog
+  project via `project_name=`. This is what makes dragonbones-lane typed rows visible to
+  SOPHIA-starlog (the starlog-cohere unit query over un-annotated Debug_Diary_Entry rows) — before
+  the mirror they existed only in the registry JSON.
+- **NON-IDEMPOTENT, ACCEPTED EXPLICITLY:** the d-chain premise carries no starlog_diaried marker,
+  so a re-observation appends a NEW registry row AND a NEW node pair (fresh entry timestamp = fresh
+  node names) — both lanes duplicate in LOCKSTEP; the tightening (a first-create gate) belongs to
+  the d-chain, not this mirror. Node names carry 1-second resolution (`%Y%m%d_%H%M%S`), the same
+  resolution the agent lane uses — same-second entries collide on the node name (pre-existing shape,
+  kept identical to pass-1 deliberately).
+- Never-raises: ImportError on starlog_mcp → graceful "starlog unavailable" skip; a graph read
+  failure is absorbed inside query_wiki_graph (reads as "not found" skip); anything raising through
+  (e.g. the registry save) returns a "starlog-diary error" string. mirror_to_carton itself never
+  raises. Unit test: `test_flush_diary_carton_mirror.py` (script mode, FakeGraph + captured writer,
+  14/14 ALL_PASS 2026-08-28).
+
+### Task kanban-card handler — `sync_task_kanban_card` (issue #148)
+
+- `sync_task_kanban_card(concept_name: str, shared_connection=None) -> str` — the release_effect
+  entrypoint for `dchain_carton_task_kanban_card` (gnosys_vault/carton_task.py). The treekanban
+  join half of the docmirror-task→carton port: a carton_task node's `status` property IS the
+  card's lane (lane name == status value, no mapping). Reads the task's LIVE `d`/`status`/`repo`
+  off neo4j at dispatch time (the set_properties property-trail drops release effects; only the
+  add_concept queue path dispatches, so the store is the truth). ENV-GATED on
+  `CARTON_TASK_TREEKANBAN_BOARD` (unset → graceful skip — the sancrev-opera TK surface is absent
+  on the builder, so the visual half is UNVERIFIED); `heaven_bml_sqlite` ImportError → graceful
+  skip. Finds the card by tag == concept_name via `get_all_cards`; absent → `create_card(board,
+  title, desc, lane, tags=[concept_name, "carton_task"])`; lane differs → the PBML-precedent
+  `PUT /api/sqlite/cards/{id} {"status": lane, "board": board}`; lane matches → unchanged.
+  Never-raises (returns an error string). Dispatch requires membership in the daemon's
+  `_GRADE_EXEMPT_EFFECTS` (a task instance never grades is_system_type). Unit test:
+  `test_sync_task_kanban_card.py` (script mode, FakeGraph + fake TK client, 6/6 ALL_PASS
+  2026-08-28).
+
+
 
 - `_resolve_starsystem_dir(starsystem_name: str) -> str | None`  — `substrate_projector.py:834`
   - Module-level version of the nested `_resolve_starsystem_path` inside `project_to_skill`. Converts `Starsystem_X` concept name to filesystem path by reverse-engineering the slug transform (`path.replace("-","_").title()`). Scans `["/home/GOD", "/tmp", "/home/GOD/gnosys-plugin-v2"]` as known parent dirs. Returns path string or None if not found.

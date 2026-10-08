@@ -210,6 +210,8 @@ def test_create_sm_chain_new_branches_multiple_edges():
 # --- reinforce_transition -------------------------------------------------------------------------
 
 def test_reinforce_transition_issues_the_expected_write():
+    # warrant=None is the BACK-COMPAT contract: the write stays byte-identical to the
+    # pre-warrant build (the Edge_Warrant_Field change is purely additive).
     fake = _FakeRun()
     reinforce_transition("Step_A", "Step_B", 0.5, fake)
     assert len(fake.calls) == 1, f"expected exactly 1 write, got {len(fake.calls)}"
@@ -217,7 +219,46 @@ def test_reinforce_transition_issues_the_expected_write():
     assert "NEXT_STEP" in query, f"query does not mention NEXT_STEP: {query}"
     assert "SET r.weight" in query, f"query does not update r.weight: {query}"
     assert params == {"curr_id": "Step_A", "next_id": "Step_B", "delta": 0.5}, f"got {params}"
+    assert "warrant" not in query, f"warrant=None must not touch the warrant field: {query}"
     print("✓ reinforce_transition issues exactly one MATCH+SET write with the expected params")
+
+
+# --- the warrant field (Edge_Warrant_Field, 2026-08-09) ---------------------------------------------
+
+def test_reinforce_transition_with_warrant_records_evidence_verbatim():
+    fake = _FakeRun()
+    ev = "traversed by tester: call matched branch pattern 'read_file' from step 'Step_A'"
+    reinforce_transition("Step_A", "Step_B", 0.5, fake, warrant=ev)
+    assert len(fake.calls) == 1, f"expected exactly 1 write, got {len(fake.calls)}"
+    query, params = fake.calls[0]
+    assert "r.warrant = $warrant" in query and "r.warrant_at" in query, \
+        f"warranted write must set warrant + warrant_at: {query}"
+    assert params["warrant"] == ev, f"evidence must be recorded VERBATIM, got {params['warrant']!r}"
+    assert params["delta"] == 0.5 and params["curr_id"] == "Step_A"
+    assert params.get("warrant_at"), "warrant_at must carry a real timestamp"
+    print("✓ reinforce_transition(warrant=...) records the evidence verbatim + a real timestamp")
+
+
+def test_reinforce_transition_refuses_blank_warrant():
+    fake = _FakeRun()
+    try:
+        reinforce_transition("Step_A", "Step_B", 0.5, fake, warrant="   ")
+        raise AssertionError("expected ValueError on blank warrant, none was raised")
+    except ValueError as e:
+        assert "non-empty" in str(e), f"refusal must name the law: {e}"
+    assert not fake.calls, "a refused reinforcement must write NOTHING"
+    print("✓ reinforce_transition refuses a blank warrant (no potentiation under a blank flag)")
+
+
+def test_reinforce_transition_refuses_mock_warrant_the_b5_law():
+    fake = _FakeRun()
+    try:
+        reinforce_transition("Step_A", "Step_B", 0.5, fake, warrant="MOCK: pretend evidence")
+        raise AssertionError("expected ValueError on mock warrant, none was raised")
+    except ValueError as e:
+        assert "mock" in str(e).lower() and "B5" in str(e), f"refusal must name the B5 law: {e}"
+    assert not fake.calls, "a mock-warranted reinforcement must write NOTHING"
+    print("✓ reinforce_transition hard-refuses mock-tagged warrant (the B5 law)")
 
 
 # --- auto_progress: step 2's wiring of select_branch/reinforce_transition into the live traversal ---
@@ -248,10 +289,15 @@ def test_auto_progress_matches_pattern_gated_branch_not_highest_weight():
     # reinforce_transition was called on the edge ACTUALLY taken (Step_A -> Step_Match), default delta 0.1
     reinforce_calls = [(q, p) for q, p in fake.calls if "SET r.weight = coalesce" in q]
     assert len(reinforce_calls) == 1, f"expected exactly 1 reinforce write, got {len(reinforce_calls)}"
-    assert reinforce_calls[0][1] == {"curr_id": "Step_A", "next_id": "Step_Match", "delta": 0.1}, \
-        f"got {reinforce_calls[0][1]}"
+    rp = reinforce_calls[0][1]
+    assert (rp["curr_id"], rp["next_id"], rp["delta"]) == ("Step_A", "Step_Match", 0.1), f"got {rp}"
+    # Edge_Warrant_Field (2026-08-09): the auto-reinforce now carries lived-traversal evidence
+    # verbatim — the warrant names the matched branch pattern and the step traversed from.
+    assert "read_file" in rp.get("warrant", "") and "Step_A" in rp.get("warrant", ""), \
+        f"the warrant must name the matched pattern + the from-step, got {rp.get('warrant')!r}"
     print("✓ auto_progress: a call matching only the low-weight pattern-gated branch advances there "
-          "(not the higher-weight non-matching branch), and reinforces the edge actually taken")
+          "(not the higher-weight non-matching branch), and reinforces the edge actually taken "
+          "with lived-traversal warrant evidence")
 
 
 def test_auto_progress_no_eligible_branch_refuses_naming_all_patterns():
@@ -332,6 +378,9 @@ if __name__ == "__main__":
     test_create_sm_chain_backward_compat_next_only_single_edge()
     test_create_sm_chain_new_branches_multiple_edges()
     test_reinforce_transition_issues_the_expected_write()
+    test_reinforce_transition_with_warrant_records_evidence_verbatim()
+    test_reinforce_transition_refuses_blank_warrant()
+    test_reinforce_transition_refuses_mock_warrant_the_b5_law()
     test_auto_progress_matches_pattern_gated_branch_not_highest_weight()
     test_auto_progress_no_eligible_branch_refuses_naming_all_patterns()
     test_auto_progress_explicit_target_step_id_bypasses_branching_unchanged()

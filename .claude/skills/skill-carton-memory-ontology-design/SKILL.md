@@ -1,9 +1,11 @@
 ---
 name: skill-carton-memory-ontology-design
-description: "WHAT: where the memory-tier ontology (Memory_Tier, Memory_Tier_0..3, UltraMap, Hypercluster) lives now — it MOVED to SOMA's OWL; do NOT design it in CartON. WHEN: you need to find/edit the memory-tier ontology types, or you're tempted to re-add a CartON memory-ontology bootstrap."
+description: "WHAT: the memory-tier ontology moved to SOMA's OWL; design it there, not in CartON. WHEN: finding or editing the memory-tier types."
 ---
 
 # skill-carton-memory-ontology-design
+
+**In full:** WHAT: where the memory-tier ontology (Memory_Tier, Memory_Tier_0..3, UltraMap, Hypercluster) lives now — it MOVED to SOMA's OWL; do NOT design it in CartON. WHEN: you need to find/edit the memory-tier ontology types, or you're tempted to re-add a CartON memory-ontology bootstrap.
 
 ## STATUS: the carton-side how-to is REMOVED — the intent lives in SOMA now (2026-06-17)
 

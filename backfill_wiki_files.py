@@ -21,21 +21,13 @@ import sys
 from pathlib import Path
 
 
-def normalize_concept_name(name: str) -> str:
-    """Normalize concept name for filesystem."""
-    if not name:
-        return ""
-    # Replace spaces with underscores, title case each word
-    normalized = name.replace(' ', '_')
-    # Title case but preserve existing caps in acronyms
-    parts = normalized.split('_')
-    result_parts = []
-    for part in parts:
-        if part.isupper() and len(part) > 1:
-            result_parts.append(part)
-        elif part:
-            result_parts.append(part[0].upper() + part[1:] if len(part) > 1 else part.upper())
-    return '_'.join(result_parts)
+# THE CANONICAL NORMALIZER, imported — never re-implemented. add_concept_tool's
+# normalize_concept_name says of itself: "This is the single source of truth for concept name
+# normalization. Used for filesystem paths, Neo4j node names, and all concept references."
+# This file used to carry its OWN fifth variant (it preserved all-caps acronyms and never
+# touched hyphens), so the same name normalized differently depending on which module
+# happened to touch it — and a name that normalizes two ways is TWO NODES.
+from carton_mcp.add_concept_tool import normalize_concept_name  # noqa: F401  (re-export)
 
 
 def get_all_concepts_from_neo4j():

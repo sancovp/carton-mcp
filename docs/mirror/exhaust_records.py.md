@@ -27,7 +27,7 @@
 - **third-party:** `pydantic.BaseModel` — the ONLY import beyond typing.
 - **intra-repo:** none — this module imports nothing from the rest of `carton_mcp`.
 - **consumers:**
-  - `base/gnosys-vault/gnosys_vault/carton_exhaust.py` — `from carton_mcp.exhaust_records import (SomaRejectionRecord, SmEpisodeRecord, FiredChainsRecord)`, collected into a `_MODELS` list — the vault-side consumer the module docstring names, which `vault()`s these three shapes into SOMA as defined system types. (This file is OUTSIDE the doc-mirror scope for this dispatch — `base/gnosys-vault` has no `docs/mirror` tree — but is confirmed here as a real, live importer, not merely a planned one.)
+  - `base/soma-prolog/gnosys-vault/gnosys_vault/carton_exhaust.py` — `from carton_mcp.exhaust_records import (SomaRejectionRecord, SmEpisodeRecord, FiredChainsRecord)`, collected into a `_MODELS` list — the vault-side consumer the module docstring names, which `vault()`s these three shapes into SOMA as defined system types. (This file is OUTSIDE the doc-mirror scope for this dispatch — `base/soma-prolog/gnosys-vault` has no `docs/mirror` tree — but is confirmed here as a real, live importer, not merely a planned one.)
   - `tests/test_p0_exhaust_ledgers.py:272-298` — the shape-coherence test: constructs each writer's ACTUAL dict output (or a representative sample of it) and instantiates `SomaRejectionRecord(**rec)` / `FiredChainsRecord(**rec)` / `SmEpisodeRecord(**rec)` against it, so a writer that drifts from these declared shapes fails this test rather than silently diverging.
 
 ## Notes

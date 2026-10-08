@@ -4,10 +4,17 @@ set_concept_properties (sync direct SET/REMOVE, reserved-key + value-type guards
 not-found refusal), query_concepts_by_properties (parameterized exact-match build),
 and remove_concept_relationship (rel_type sanitization, sync DELETE).
 
+Issue #201: the write-path matchers (set_concept_properties, remove_concept_
+relationship) now resolve names EXACT-FIRST with a NORMALIZED fallback (aligning
+with add_concept's normalize_concept_name so remove+add cycles cannot split one
+concept into a hyphen/underscore/case twin pair). The new tests below pin that:
+exact always wins; the fallback fires only when exact matches nothing.
+
 Pure logic — uses a FakeGraph stub (no real neo4j), same pattern as
 test_carton_kv_schema.py. Run: python3 test_carton_properties.py
 """
 import os
+import re
 import tempfile
 
 os.environ["HEAVEN_DATA_DIR"] = tempfile.mkdtemp(prefix="kvprops_")
@@ -19,12 +26,15 @@ from carton_mcp.carton_utils import (  # noqa: E402
 
 class FakeGraph:
     """Stub KnowledgeGraphBuilder: an existence set + recorded write queries.
-    `names` = the set of concept names that EXIST. `last` captures the final
-    (query, params) so tests can assert the parameterized shape was built right."""
-    def __init__(self, names, query_rows=None):
+    `names` = the set of concept names that EXIST. `edges` (optional) = a set of
+    (source, REL_TYPE, target) tuples backing the DELETE handler — when given,
+    a DELETE only deletes (and counts) a matching edge; when omitted, DELETE
+    reports 1 unconditionally (the original stub behavior, kept for old tests)."""
+    def __init__(self, names, query_rows=None, edges=None):
         self.names = set(names)
         self.calls = []                 # every (query, params) issued
         self.query_rows = query_rows or []   # rows returned for a match-by-property query
+        self.edges = set(edges) if edges is not None else None
 
     def execute_query(self, query, params=None):
         params = params or {}
@@ -44,8 +54,41 @@ class FakeGraph:
             return list(self.query_rows)
         # remove_concept_relationship DELETE
         if "DELETE r RETURN count(r) AS deleted" in q:
-            return [{"deleted": 1}]
+            if self.edges is None:
+                return [{"deleted": 1}]
+            m = re.search(r"\[r:([A-Za-z_]+)\]", q)
+            rel = m.group(1) if m else ""
+            edge = (params["s"], rel, params["t"])
+            if edge in self.edges:
+                self.edges.remove(edge)
+                return [{"deleted": 1}]
+            return [{"deleted": 0}]
         return []
+
+    # ── connection-API methods (integration 2026-08-28) ──────────────────────
+    # carton_utils moved these three writes/reads from inline Cypher to
+    # connection methods (a schema-full backend cannot take a property key as a
+    # Cypher identifier verbatim). The fake mimics the NEO4J backend's contract
+    # by recording the same (query, params) shapes that backend issues — which
+    # is what the pre-existing assertions below check (parameterized SET map,
+    # backtick-quoted REMOVE keys, per-key $w_i WHERE clauses). The suite was
+    # 9-failed against HEAD before this: the connection-API change never
+    # updated the fake.
+    def set_properties(self, name, props):
+        self.calls.append(("MATCH (c:Wiki {n: $n}) SET c += $props",
+                           {"n": name, "props": dict(props)}))
+
+    def remove_properties(self, name, keys):
+        clauses = ", ".join(f"c.`{k}`" for k in keys)
+        self.calls.append((f"MATCH (c:Wiki {{n: $n}}) REMOVE {clauses}", {"n": name}))
+
+    def find_by_properties(self, where, limit):
+        conds = " AND ".join(f"c.`{k}` = $w_{i}" for i, k in enumerate(where))
+        params = {f"w_{i}": v for i, v in enumerate(where.values())}
+        params["lim"] = limit
+        self.calls.append((
+            f"MATCH (c:Wiki) WHERE {conds} RETURN c.n AS n LIMIT $lim", params))
+        return list(self.query_rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -252,6 +295,89 @@ def test_remove_rel_no_connection_refused():
         _act._get_module_connection = orig
     assert res["success"] is False
     assert "connection" in res["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Issue #201 — exact-first, normalized-fallback on the write-path matchers
+# --------------------------------------------------------------------------- #
+def test_remove_rel_exact_match_wins_and_reports_exact():
+    g = FakeGraph({"A", "B"}, edges={("A", "PART_OF", "B")})
+    res = remove_concept_relationship("A", "PART_OF", "B", shared_connection=g)
+    assert res["success"] is True
+    assert res["deleted_count"] == 1
+    assert res["matched_via"] == "exact"
+    assert "normalized_source" not in res
+    # exactly ONE delete query was issued (no needless fallback attempt)
+    deletes = [(q, p) for q, p in g.calls if "DELETE r" in q]
+    assert len(deletes) == 1
+
+
+def test_remove_rel_normalized_fallback_fires_on_exact_miss():
+    # The live #201 divergence shape: the edge lives on the NORMALIZED names
+    # (add_concept wrote it there) while the caller passes the raw form.
+    g = FakeGraph({"A_B", "C_D"}, edges={("A_B", "PART_OF", "C_D")})
+    res = remove_concept_relationship("a-b", "PART_OF", "c d", shared_connection=g)
+    assert res["success"] is True
+    assert res["deleted_count"] == 1
+    assert res["matched_via"] == "normalized"
+    assert res["normalized_source"] == "A_B"
+    assert res["normalized_target"] == "C_D"
+    # original caller-supplied names still reported untouched
+    assert res["source"] == "a-b" and res["target"] == "c d"
+    # two delete queries: exact miss first, then the normalized retry
+    deletes = [(q, p) for q, p in g.calls if "DELETE r" in q]
+    assert len(deletes) == 2
+    assert deletes[0][1] == {"s": "a-b", "t": "c d"}
+    assert deletes[1][1] == {"s": "A_B", "t": "C_D"}
+
+
+def test_remove_rel_zero_after_both_is_honest_zero():
+    g = FakeGraph(set(), edges=set())
+    res = remove_concept_relationship("a-b", "PART_OF", "c", shared_connection=g)
+    assert res["success"] is True
+    assert res["deleted_count"] == 0
+    assert res["matched_via"] == "exact"   # nothing matched; no normalized_* keys claimed
+    assert "normalized_source" not in res
+
+
+def test_remove_rel_already_normalized_names_issue_one_query():
+    # Names already normalization-stable → the fallback pair equals the exact pair,
+    # so a miss must NOT re-issue the identical query.
+    g = FakeGraph(set(), edges=set())
+    res = remove_concept_relationship("A_B", "PART_OF", "C_D", shared_connection=g)
+    assert res["deleted_count"] == 0
+    deletes = [(q, p) for q, p in g.calls if "DELETE r" in q]
+    assert len(deletes) == 1
+
+
+def test_set_properties_normalized_fallback_resolves_node():
+    # Concept stored under the normalized name; caller passes the raw form.
+    g = FakeGraph({"Task_1"})
+    res = set_concept_properties("task-1", {"status": "open"}, shared_connection=g)
+    assert res["success"] is True
+    assert res["concept"] == "Task_1"          # the node actually written
+    set_calls = [(q, p) for q, p in g.calls if "SET c += $props" in " ".join(q.split())]
+    assert len(set_calls) == 1
+    assert set_calls[0][1]["n"] == "Task_1"    # the SET addressed the normalized node
+
+
+def test_set_properties_exact_name_always_wins():
+    # A node stored under the RAW (unstable) name is addressed exactly — the
+    # fallback never overrides a literal hit.
+    g = FakeGraph({"task-1", "Task_1"})
+    res = set_concept_properties("task-1", {"status": "open"}, shared_connection=g)
+    assert res["success"] is True
+    assert res["concept"] == "task-1"
+    set_calls = [(q, p) for q, p in g.calls if "SET c += $props" in " ".join(q.split())]
+    assert set_calls[0][1]["n"] == "task-1"
+
+
+def test_set_properties_not_found_after_fallback_still_refuses():
+    g = FakeGraph(set())
+    res = set_concept_properties("task-1", {"status": "open"}, shared_connection=g)
+    assert res["success"] is False
+    assert "not found" in res["error"]
+    assert not any("SET c += $props" in " ".join(q.split()) for q, _ in g.calls)
 
 
 # --------------------------------------------------------------------------- #

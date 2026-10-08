@@ -1,0 +1,33 @@
+{
+  "_what": "One reconstruction run. Copy to <run dir>/recon_config.json, fill every field, and pass its path as the specifics. Every script reads it through RECON_CONFIG.",
+  "_fields": {
+    "subject": "what is thought lost, in the record's own words, with the issue number and the user's verbatim order",
+    "repo": "the git repository the code lives in",
+    "path_regex": "Python regex over ABSOLUTE file paths selecting the files in scope; it also selects the Bash commands that name them",
+    "path_aliases": "pairs [old_prefix, new_prefix] of repo-relative prefixes for a file that moved, so its history is read under both spellings",
+    "from / to": "the window, YYYY-MM-DD inclusive; ops outside it are still read, because a later edit is what proves an earlier one superseded",
+    "out_dir": "the run directory, in the session scratchpad; the ONLY place the agent writes",
+    "transcripts_root": "where the Claude Code transcripts live; they hold exact bytes from the day the earliest one starts",
+    "priority_subjects": "the specific fixes to answer for first, each in the words the record uses",
+    "journal_axis": "the repo axis journal KEYED the subject's entries by: a registered project's registered name (soma-prolog), otherwise its monorepo path (knowledge/carton-mcp)",
+    "base_ref / cutoff": "left null; the agent sets them after classification to the commit just before the loss and that commit's time",
+    "scratch_key_regex": "optional regex over the TEXT of Writes outside the repo (scratchpads, /tmp): the scripts that did the real work and were never committed",
+    "copy_checks": "optional [[repo_relative_path, other_copy_abs_path], ...]: surviving copies a recovered file must equal byte for byte",
+    "installed_pairs": "optional [[repo_dir_abs, copy_dir_abs, repo_relative_root], ...]: installed or vendored copies that may still hold lost code"
+  },
+  "subject": "",
+  "repo": "/home/GOD/gnosys-plugin-v2",
+  "path_regex": "",
+  "path_aliases": [],
+  "from": "",
+  "to": "",
+  "out_dir": "",
+  "transcripts_root": "/home/GOD/.claude/projects",
+  "priority_subjects": [],
+  "journal_axis": "",
+  "base_ref": null,
+  "cutoff": null,
+  "scratch_key_regex": null,
+  "copy_checks": [],
+  "installed_pairs": []
+}

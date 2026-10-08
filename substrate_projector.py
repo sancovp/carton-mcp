@@ -234,7 +234,15 @@ def get_concept_content(concept_name: str, description_only: bool) -> str:
 
 def project_to_file(substrate: FileSubstrate, content: str) -> str:
     """Project content to file"""
+    from carton_mcp.carton_pathguard import check_write
+
     path = Path(substrate.path)
+
+    # #206 canonical-path gate, BEFORE any touch: a new file is a 'create'; any
+    # rewrite of an existing file (append / inject_at_line / inject_at_marker)
+    # is an 'append', which is wiki-only. A CartonPathRefused is a ValueError —
+    # the error contract the callers of this function already handle.
+    check_write(substrate.path, "create" if not path.exists() else "append")
 
     if not path.exists():
         # Create new file with content
@@ -475,18 +483,22 @@ def project_to_skill(substrate: SkillSubstrate, concept_name: str, shared_connec
                 _existing_meta = json.loads(_meta_path.read_text())
                 _fs_requires = _existing_meta.get("requires", [])
                 if _fs_requires:
+                    # THE CANONICAL NORMALIZER — this hand-inlined its body twice, which is
+                    # how a concept name ends up computed by code that cannot be kept in
+                    # step with the rule it is implementing. A name that normalizes two ways
+                    # is TWO NODES, and here the name is a MERGE target, so a drifted copy
+                    # silently creates a second node and points the REQUIRES edge at it.
+                    from carton_mcp.add_concept_tool import normalize_concept_name
+                    _skill_concept = lambda s: "Skill_" + normalize_concept_name(s)
                     # Create REQUIRES edges in Neo4j
                     for req_skill in _fs_requires:
-                        req_concept = "Skill_" + req_skill.replace("-", "_").title().replace(" ", "_")
+                        req_concept = _skill_concept(req_skill)
                         backfill_cypher = (
                             "MATCH (s:Wiki {n: $src}), (t:Wiki {n: $tgt}) "
                             "MERGE (s)-[:REQUIRES]->(t)"
                         )
                         utils.query_wiki_graph(backfill_cypher, {"src": concept_name, "tgt": req_concept})
-                    requires = [
-                        "Skill_" + r.replace("-", "_").title().replace(" ", "_")
-                        for r in _fs_requires
-                    ]
+                    requires = [_skill_concept(r) for r in _fs_requires]
                     logger.info(f"Backfilled REQUIRES edges from _metadata.json: {requires}")
             except Exception:
                 pass  # Non-critical — projection continues without backfill
@@ -1099,8 +1111,15 @@ def project_to_framework(substrate: FrameworkSubstrate, concept_name: str, share
         v = props.get(key)
         return str(v).strip() if v is not None else ""
 
-    definition = p("definition") or description.strip()
-    obstacle, overcome, dream = p("obstacle"), p("overcome"), p("dream")
+    # B-fix (2026-08-01): manualcore/L6 frameworks store the hero's-journey as has_*/
+    # story_* PROPERTIES (the vault has_ convention + the story_ TEXT), NOT bare
+    # obstacle/overcome/dream keys — so a plain p("obstacle") returned empty and this
+    # handler self-skipped a real, GAS-certified framework. Read a per-field fallback
+    # chain, preferring the story_ prose for the FRAMEWORK.md body; has_ is the ref fallback.
+    definition = p("definition") or p("has_definition") or description.strip()
+    obstacle = p("obstacle") or p("story_obstacle") or p("has_obstacle")
+    overcome = p("overcome") or p("story_overcome") or p("has_overcome")
+    dream = p("dream") or p("dream_outcome") or p("has_dream")
     if not (definition and obstacle and overcome and dream):
         missing = [k for k, v in [("definition", definition), ("obstacle", obstacle),
                                   ("overcome", overcome), ("dream", dream)] if not v]
@@ -1566,6 +1585,441 @@ def project_state_machine(concept_name: str, shared_connection=None) -> str:
         return f"state-machine error for {concept_name}: {type(e).__name__}: {e}"
 
 
+def _readable(name):
+    """Title_Case concept-ref → readable text (the project_to_skill _resolve_arg_text idiom)."""
+    return name.replace("_", " ") if name else None
+
+
+def _ensure_skill_symlink(slug: str, canonical_dir) -> str:
+    """Ensure ~/.claude/skills/<slug> is a symlink to canonical_dir; restore if missing
+    (Isaac's placement ruling 2026-08-09: heaven-data canonical, project symlink, both
+    directions allowed, ALWAYS restored if missing). A REAL pre-existing dir is NEVER
+    clobbered (hand-authored wins) — the returned string says which case happened."""
+    proj = Path.home() / ".claude" / "skills" / slug
+    try:
+        if proj.is_symlink():
+            if proj.resolve() != Path(canonical_dir).resolve():
+                proj.unlink()
+                proj.symlink_to(canonical_dir)
+                return "symlink repointed"
+            return "symlink ok"
+        if proj.exists():
+            return f"project path {proj} is a REAL dir (hand-authored) — left untouched"
+        proj.parent.mkdir(parents=True, exist_ok=True)
+        proj.symlink_to(canonical_dir)
+        return "symlink created"
+    except Exception as e:  # noqa: BLE001 — deploy repair is best-effort
+        return f"symlink error: {type(e).__name__}: {e}"
+
+
+def project_ec_skill(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for THE EC BUTTON (dchain_ec_type_project — issue 140,
+    Isaac's build ruling 2026-08-09).
+
+    THE SELF-MINTING LOOP: an agent declares a NEW dragonbones EC type entirely in the
+    graph — a concept `is_a Dragonbones_Ec_Type` carrying has_what/has_when/
+    has_landing_path edges and its constraint content as the description (the single
+    source, the issue-140 no-doubling law). SOMA fires the d-chain only when the
+    declaration is COMPLETE; the daemon dispatches this handler AFTER the neo4j write.
+
+    What it does (all idempotent — firing on create AND update is safe):
+      1. writes $HEAVEN_DATA_DIR/skills/<slug>/SKILL.md as the CANONICAL REAL FILE
+         (diff-write), the skill being the concept's PROJECTION: frontmatter description
+         from the HAS_WHAT/HAS_WHEN edges, body = the concept description with wiki-links
+         stripped + landing paths + breadcrumb cross-refs from the concept's own edges;
+      2. ensures the ~/.claude/skills/<slug> symlink, restoring it if missing (the
+         placement ruling); a REAL pre-existing dir is never clobbered;
+      3. MERGEs the concept into Dragonbones_Ec_Types_Collection (HAS_PART + PART_OF);
+      4. stamps accrual properties (ec_skill_projected/ec_skill_path/ec_skill_projected_at)
+         + human_reviewed=false ONCE via coalesce — Isaac's human-gates ruling: mint
+         happens, the review list accrues in carton (collection members with
+         human_reviewed=false), the human toggles; a true is never reset.
+
+    Best-effort / never-raises; skip strings are fill signals (the projector-lane contract).
+    """
+    from datetime import datetime
+    from carton_mcp.carton_utils import CartOnUtils
+
+    try:
+        utils = CartOnUtils(shared_connection=shared_connection)
+        res = utils.query_wiki_graph(
+            "MATCH (c:Wiki {n: $name}) "
+            "OPTIONAL MATCH (c)-[r]->(t:Wiki) "
+            "RETURN c.d AS description, c.skill_slug AS slug_prop, "
+            "collect({type: type(r), target: t.n}) AS rels",
+            {"name": concept_name},
+        )
+        if not res.get("success") or not res.get("data"):
+            return f"ec-skill skipped: {concept_name} not found"
+        row = res["data"][0]
+        description = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', row.get("description") or "").strip()
+        rels = [r for r in (row.get("rels") or []) if r and r.get("target")]
+
+        def _targets(rel_type):
+            return [r["target"] for r in rels if r.get("type") == rel_type]
+
+        what = next(iter(_targets("HAS_WHAT")), None)
+        when = next(iter(_targets("HAS_WHEN")), None)
+        landing = _targets("HAS_LANDING_PATH")
+        missing = [n for n, v in (("has_what", what), ("has_when", when),
+                                  ("has_landing_path", landing)) if not v]
+        if missing:
+            return (f"ec-skill skipped: {concept_name} missing {', '.join(missing)} — "
+                    f"add the edge(s) and re-save to re-fire the EC button")
+        if not description:
+            return (f"ec-skill skipped: {concept_name} has no description — the description "
+                    f"IS the skill body (the single source); write it and re-save")
+
+        slug = (row.get("slug_prop") or concept_name).strip().lower().replace("_", "-")
+        heaven = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data"))
+        skill_dir = heaven / "skills" / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = skill_dir / "SKILL.md"
+
+        breadcrumbs = sorted(set(
+            _targets("ABSORBS_SKILL_CONTENT") + _targets("CURRENT_AUTHORING_PATH")
+            + _targets("RELATED_TO")))
+        crumb_line = (" · ".join(f"`{_readable(b)}`" for b in breadcrumbs)
+                      if breadcrumbs else "`dragonbones-concept-ec` (the base block)")
+        content = (
+            "---\n"
+            f"name: {slug}\n"
+            f'description: "WHAT: {_readable(what)}. WHEN: {_readable(when)}."\n'
+            "---\n\n"
+            f"# {slug}\n\n"
+            f"**PROJECTION of the graph concept `{concept_name}` (the single source — the "
+            "issue-140 no-doubling law), minted by the EC button (`project_ec_skill`). "
+            "Edits belong ON THE CONCEPT, never in this file — re-saving the concept "
+            "re-projects it.**\n\n"
+            f"{description}\n\n"
+            "## Landing path(s)\n\n"
+            + "".join(f"- {_readable(t)}\n" for t in landing)
+            + "\n## Cross-refs (breadcrumbs — never repeated here)\n\n"
+            f"{crumb_line}\n"
+        )
+        if not skill_md.exists() or skill_md.read_text() != content:
+            skill_md.write_text(content)
+            wrote = "written"
+        else:
+            wrote = "unchanged"
+
+        link_state = _ensure_skill_symlink(slug, skill_dir)
+
+        # WRITE path: query_wiki_graph is a READ-ONLY facade (it refuses CREATE/MERGE),
+        # so the collection weld + accrual stamps go through the internal executor —
+        # the same connection the read facade uses, raise-on-failure (caught below).
+        utils._execute_neo4j_query(
+            "MATCH (c:Wiki {n: $name}) "
+            "MERGE (col:Wiki {n: 'Dragonbones_Ec_Types_Collection'}) "
+            "MERGE (col)-[:HAS_PART]->(c) MERGE (c)-[:PART_OF]->(col) "
+            "SET c.ec_skill_projected = true, c.ec_skill_path = $path, "
+            "c.ec_skill_projected_at = $ts, "
+            "c.human_reviewed = coalesce(c.human_reviewed, false)",
+            {"name": concept_name, "path": str(skill_md),
+             "ts": datetime.now().isoformat()},
+        )
+        logger.info("EC button: %s → %s (%s, %s)", concept_name, skill_md, wrote, link_state)
+        return (f"ec-skill {concept_name}: {skill_md} {wrote}; {link_state}; "
+                f"collection + review accrual stamped")
+    except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
+        logger.warning("EC button failed for %s: %s", concept_name, e, exc_info=True)
+        return f"ec-skill error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def project_ec_favorites(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for THE FAVORITES CONTROL (dchain_ec_favorites_project).
+
+    The agent controls, via graph edges, the list of EC skills it is told about: an
+    agent_identity concept carrying `has_favorite_ec` edges fires this on save. It renders
+    the favorites ADVERTISEMENT BLOCK to $HEAVEN_DATA_DIR/dragonbones_favorites/<identity>.md
+    — the file the output-style / generate_system_prompt lane reads (the read-side wire into
+    the style is the separate reconnect act; the claude -p gnosys lane has no disconnect).
+    One source (the edges), one projection (the block) — same law as everything else here.
+    Favorites pointing at concepts with a projected skill advertise the skill slug; ones
+    without are listed as graph-only (a fill signal, not an error). Never raises.
+    """
+    try:
+        from carton_mcp.carton_utils import CartOnUtils
+        utils = CartOnUtils(shared_connection=shared_connection)
+        # path resolution: ec_skill_path (minted) OR skill_path (hand-authored — the
+        # 2026-08-09 EC concepts carry this) — either yields the slug via its parent dir.
+        res = utils.query_wiki_graph(
+            "MATCH (c:Wiki {n: $name})-[:HAS_FAVORITE_EC]->(f:Wiki) "
+            "RETURN f.n AS name, coalesce(f.ec_skill_path, f.skill_path) AS path, "
+            "coalesce(f.human_reviewed, false) AS reviewed ORDER BY f.n",
+            {"name": concept_name},
+        )
+        favs = (res.get("data") or []) if res.get("success") else []
+        if not favs:
+            return f"ec-favorites skipped: {concept_name} has no has_favorite_ec edges"
+        out_dir = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data")) / "dragonbones_favorites"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{concept_name}.md"
+        lines = [f"<!-- PROJECTION of {concept_name}'s has_favorite_ec edges — edit the graph, not this file -->",
+                 f"# Dragonbones EC favorites — {_readable(concept_name)}", ""]
+        for f in favs:
+            slug = Path(f["path"]).parent.name if f.get("path") else None
+            marker = "" if f.get("reviewed") else " (unreviewed)"
+            lines.append(f"- `/{slug}`{marker}" if slug
+                         else f"- {f['name']} (graph-only — no projected skill yet)")
+        content = "\n".join(lines) + "\n"
+        if not out.exists() or out.read_text() != content:
+            out.write_text(content)
+        logger.info("EC favorites: %s → %s (%d favorites)", concept_name, out, len(favs))
+        return f"ec-favorites {concept_name}: {len(favs)} favorites → {out}"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("EC favorites failed for %s: %s", concept_name, e, exc_info=True)
+        return f"ec-favorites error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def project_list(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for LIST PROJECTION (dchain_projected_list_project —
+    Isaac's 2026-08-09 generalization of the favorites control: "a list for xyz then gets
+    projected... the way to make an 'xyz favorites' type rule").
+
+    A `projected_list` concept's HAS_MEMBER edges are the list; scratch properties steer
+    the render: `list_kind` (plain | favorites | checklist), `member_order` (a flat list of
+    member names — the parallel-flat-list idiom; unlisted members follow alphabetically),
+    `as_rule` (ambient placement intent). The render is ALWAYS written to
+    $HEAVEN_DATA_DIR/dragonbones_lists/<slug>.md (the always-known projection). AMBIENT
+    placement (~/.claude/rules/dragonbones-list-<slug>.md — auto-injected every session)
+    happens ONLY when `as_rule` is set AND `human_reviewed` is true — the human-gates
+    ruling: the intent accrues on the graph, the human toggles `human_reviewed`, and the
+    next re-fire places it. A checklist member's state is ITS OWN `status` property
+    (done → checked box). Favorites members render as skill slugs when they carry
+    ec_skill_path/skill_path (the favorites-handler convention). Never raises; idempotent
+    diff-writes; skip strings are fill signals.
+    """
+    from datetime import datetime
+    from carton_mcp.carton_utils import CartOnUtils
+
+    try:
+        utils = CartOnUtils(shared_connection=shared_connection)
+        res = utils.query_wiki_graph(
+            "MATCH (c:Wiki {n: $name}) "
+            "OPTIONAL MATCH (c)-[:HAS_MEMBER]->(m:Wiki) "
+            "RETURN c.d AS description, c.list_kind AS kind, c.member_order AS member_order, "
+            "c.as_rule AS as_rule, c.human_reviewed AS reviewed, "
+            "collect({name: m.n, status: m.status, "
+            "path: coalesce(m.ec_skill_path, m.skill_path)}) AS members",
+            {"name": concept_name},
+        )
+        if not res.get("success") or not res.get("data"):
+            return f"list skipped: {concept_name} not found"
+        row = res["data"][0]
+        members = {m["name"]: m for m in (row.get("members") or []) if m and m.get("name")}
+        if not members:
+            return f"list skipped: {concept_name} has no has_member edges yet"
+        kind = (row.get("kind") or "plain").strip().lower()
+        order = [n for n in (row.get("member_order") or []) if n in members]
+        order += sorted(n for n in members if n not in order)
+
+        def _line(name):
+            m = members[name]
+            if kind == "checklist":
+                box = "[x]" if str(m.get("status") or "").lower() == "done" else "[ ]"
+                return f"- {box} {_readable(name)}"
+            if kind == "favorites" and m.get("path"):
+                return f"- `/{Path(m['path']).parent.name}`"
+            return f"- {_readable(name)}"
+
+        slug = concept_name.strip().lower().replace("_", "-")
+        desc = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', row.get("description") or "").strip()
+        content = (
+            f"<!-- PROJECTION of the graph list `{concept_name}` ({kind}) — edit the graph, "
+            "not this file -->\n"
+            f"# {_readable(concept_name)}\n\n"
+            + (desc + "\n\n" if desc else "")
+            + "\n".join(_line(n) for n in order) + "\n"
+        )
+        out_dir = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data")) / "dragonbones_lists"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{slug}.md"
+        if not out.exists() or out.read_text() != content:
+            out.write_text(content)
+
+        rule_state = ""
+        if row.get("as_rule"):
+            rule_path = Path.home() / ".claude" / "rules" / f"dragonbones-list-{slug}.md"
+            if row.get("reviewed") is True:
+                if not rule_path.exists() or rule_path.read_text() != content:
+                    rule_path.write_text(content)
+                rule_state = f"; ambient rule placed at {rule_path}"
+            else:
+                rule_state = ("; as_rule PENDING human review — set human_reviewed=true on "
+                              f"{concept_name} and re-save to place the ambient rule")
+
+        utils._execute_neo4j_query(
+            "MATCH (c:Wiki {n: $name}) SET c.list_projected = true, c.list_path = $path, "
+            "c.list_projected_at = $ts, "
+            "c.human_reviewed = coalesce(c.human_reviewed, false)",
+            {"name": concept_name, "path": str(out), "ts": datetime.now().isoformat()},
+        )
+        logger.info("List projection: %s (%s, %d members) → %s%s",
+                    concept_name, kind, len(order), out, rule_state)
+        return f"list {concept_name} ({kind}): {len(order)} members → {out}{rule_state}"
+    except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
+        logger.warning("List projection failed for %s: %s", concept_name, e, exc_info=True)
+        return f"list error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def project_skillchain(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for UCO SEMANTICS (dchain_skill_uco_chain).
+
+    When skill concepts carry universal-chain-ontology edges (`chains_to`, Link-to-Link),
+    the skillchain emerges FROM the graph: this walks the chains_to chain both ways from
+    the fired concept (head = no incoming chains_to within the chain; cycle-guarded),
+    builds the skillchain-compiler spec (the chaincompiler SDK's canonical JSON — one
+    `skill` step per link, resolved against the on-disk skill index so every referenced
+    skill must EXIST), compiles it to a chain package (SKILL.md + chain.json) under
+    $HEAVEN_DATA_DIR/skills/<chain-slug>/ with the project symlink (the placement law),
+    and — when SKILLTREE_ROOT (+ optional SKILLTREE_NODE, default 'practice') are
+    configured — folds the chain skill into the skilltree tome (env-gated: a tree root is
+    operator config, never guessed; absent config is a named skip, not an error).
+
+    The chain concept-to-skill resolution: each link concept resolves to its projected
+    skill slug (ec_skill_path) when present, else its name lowercase-hyphenated (the
+    hand-authored convention), validated against the skillchain-compiler's own index.
+    Never raises; skip strings name exactly what is missing.
+    """
+    try:
+        import importlib.util as _ilu
+        import json as _json
+        from carton_mcp.carton_utils import CartOnUtils
+        utils = CartOnUtils(shared_connection=shared_connection)
+
+        # Walk the chain: pull every CHAINS_TO edge reachable from this concept (both
+        # directions, bounded), then order head→tail following the edges.
+        res = utils.query_wiki_graph(
+            "MATCH p = (a:Wiki)-[:CHAINS_TO*0..12]->(b:Wiki) "
+            "WHERE a.n = $name OR b.n = $name "
+            "UNWIND relationships(p) AS r "
+            "RETURN DISTINCT startNode(r).n AS src, endNode(r).n AS dst",
+            {"name": concept_name},
+        )
+        edges = [(row["src"], row["dst"]) for row in (res.get("data") or [])
+                 if row.get("src") and row.get("dst")] if res.get("success") else []
+        if not edges:
+            return f"skillchain skipped: {concept_name} has no chains_to edges"
+        nodes = {n for e in edges for n in e}
+        dsts = {d for _, d in edges}
+        heads = [n for n in nodes if n not in dsts]
+        if len(heads) != 1:
+            return (f"skillchain skipped: chain around {concept_name} has "
+                    f"{len(heads)} head(s) ({', '.join(sorted(heads)) or 'a cycle'}) — "
+                    f"a chain needs exactly one head (no incoming chains_to)")
+        nxt = dict(edges)
+        if len(nxt) != len(edges):
+            return (f"skillchain skipped: a link in the chain around {concept_name} has "
+                    f"multiple outgoing chains_to — a chain is linear (one next per link)")
+        order, seen, cur = [], set(), heads[0]
+        while cur and cur not in seen:
+            order.append(cur); seen.add(cur); cur = nxt.get(cur)
+        if cur:
+            return f"skillchain skipped: chains_to cycle detected at {cur}"
+
+        # Resolve each link concept to an on-disk skill alias.
+        slug_rows = utils.query_wiki_graph(
+            "UNWIND $names AS n MATCH (c:Wiki {n: n}) "
+            "RETURN c.n AS name, c.ec_skill_path AS path", {"names": order})
+        paths = {r["name"]: r.get("path") for r in (slug_rows.get("data") or [])}
+        aliases = []
+        for n in order:
+            p = paths.get(n)
+            aliases.append(Path(p).parent.name if p else n.lower().replace("_", "-"))
+
+        # The skillchain-compiler SDK (chaincompiler packages) — imported by path.
+        sc_path = None
+        for cand in (
+            Path("/home/GOD/gnosys-plugin-v2/base/chaincompiler/packages/skillchain-compiler/skillchain.py"),
+            Path("/tmp/chaincompiler/packages/skillchain-compiler/skillchain.py"),
+        ):
+            if cand.exists():
+                sc_path = cand
+                break
+        if sc_path is None:
+            return ("skillchain skipped: skillchain-compiler not found "
+                    "(base/chaincompiler/packages/skillchain-compiler/skillchain.py)")
+        spec_mod = _ilu.spec_from_file_location("_skillchain_sdk", sc_path)
+        sdk = _ilu.module_from_spec(spec_mod)
+        spec_mod.loader.exec_module(sdk)
+
+        # Existence check: the SDK's index_skills rglob does NOT traverse directory
+        # SYMLINKS (pathlib semantics) and never scans $HEAVEN_DATA_DIR/skills — but our
+        # placement law makes heaven-data the canonical root with project symlinks. So
+        # check both canonical roots directly (a direct path .exists() DOES follow
+        # symlinks), with the SDK index as the fallback for plugin-shipped skills.
+        idx = sdk.index_skills()
+        heaven_skills = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data")) / "skills"
+
+        def _on_disk(alias):
+            for root in (heaven_skills, Path.home() / ".claude" / "skills"):
+                if (root / alias / "SKILL.md").exists():
+                    return True
+            return alias in idx
+
+        unresolved = [a for a in aliases if not _on_disk(a)]
+        if unresolved:
+            return (f"skillchain skipped: link skill(s) not on disk: "
+                    f"{', '.join(unresolved)} — project them first (the EC button / "
+                    f"hand-authoring), then re-save to re-fire")
+
+        chain_slug = heads[0].lower().replace("_", "-") + "-chain"
+        spec = {"name": chain_slug,
+                "description": ("UCO skillchain derived emergently from chains_to edges: "
+                                + " -> ".join(order)),
+                "steps": [{"kind": "skill", "skill": a, "args": ""} for a in aliases]}
+        heaven = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data"))
+        out_root = heaven / "skills"
+        compiled = sdk.compile_chain(spec, out_root) if hasattr(sdk, "compile_chain") else None
+        if compiled is None:
+            # The SDK's compile entrypoint is CLI-shaped; fall back to its own spec →
+            # package writer if exposed differently, else write the canonical package
+            # ourselves in the SDK's documented shape (SKILL.md + chain.json).
+            chain_dir = out_root / chain_slug
+            chain_dir.mkdir(parents=True, exist_ok=True)
+            (chain_dir / "chain.json").write_text(_json.dumps(spec, indent=2))
+            body = ("---\n"
+                    f"name: {chain_slug}\n"
+                    f'description: "Skillchain: {" -> ".join(aliases)}. Execute each step in order."\n'
+                    "---\n\n"
+                    f"# {chain_slug}\n\n"
+                    "**UCO skillchain — PROJECTION of the chains_to edges on the graph "
+                    f"(head `{heads[0]}`). Edit the graph, not this file.**\n\n"
+                    "Execute the steps in order, carrying each result forward:\n\n"
+                    + "".join(f"{i+1}. invoke `/{a}`\n" for i, a in enumerate(aliases))
+                    + "\nThe machine-readable spec is `chain.json` beside this file "
+                    "(the skillchain-compiler canonical shape).\n")
+            (chain_dir / "SKILL.md").write_text(body)
+            compiled = str(chain_dir)
+        link_state = _ensure_skill_symlink(chain_slug, out_root / chain_slug)
+
+        # skilltree fold — env-gated (a tree root is operator config, never guessed).
+        tree_root = os.environ.get("SKILLTREE_ROOT")
+        fold_state = "skilltree fold skipped: SKILLTREE_ROOT not configured"
+        if tree_root:
+            try:
+                import skilltree as _st
+                _st.fold_skill(str(out_root / chain_slug),
+                               into=os.environ.get("SKILLTREE_NODE", "practice"),
+                               tree_root=tree_root)
+                fold_state = f"folded into skilltree {tree_root}"
+            except Exception as e:  # noqa: BLE001
+                fold_state = f"skilltree fold error: {type(e).__name__}: {e}"
+
+        # WRITE path (query_wiki_graph refuses writes — see project_ec_skill).
+        utils._execute_neo4j_query(
+            "MATCH (c:Wiki {n: $head}) SET c.skillchain_projected = true, "
+            "c.skillchain_path = $path", {"head": heads[0], "path": str(compiled)})
+        logger.info("UCO skillchain: %s → %s (%s; %s)", " -> ".join(order), compiled,
+                    link_state, fold_state)
+        return (f"skillchain {chain_slug}: {' -> '.join(aliases)} → {compiled}; "
+                f"{link_state}; {fold_state}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("UCO skillchain failed for %s: %s", concept_name, e, exc_info=True)
+        return f"skillchain error for {concept_name}: {type(e).__name__}: {e}"
+
+
 def flush_starlog_diary(concept_name: str, shared_connection=None) -> str:
     """release_effect entrypoint for the per-typed-EC starlog-diary d-chains (STAGE A4).
 
@@ -1575,12 +2029,32 @@ def flush_starlog_diary(concept_name: str, shared_connection=None) -> str:
     project (detected from file paths in its description); maps is_a → entry_type the
     same way compiler.py did.
 
+    THE CARTON MIRROR (issue #118 leg 2): the registry write alone left the dragonbones
+    lane's typed rows invisible to the graph — sl._save_debug_diary_entry is the
+    REGISTRY path only, so SOPHIA-starlog (the starlog-cohere unit query over
+    un-annotated Debug_Diary_Entry rows) never saw them. The entry now ALSO mirrors to
+    carton via sl.mirror_to_carton with EXACTLY the agent lane's mechanism (the pass-1
+    update_debug_diary join, starlog_mcp.py): the CONTENT node first (an
+    identifier-named node, is_a Desc_Content, whose DESCRIPTION holds the prose), then
+    the diary node (is_a Debug_Diary_Entry + has_content -> the content node +
+    related_to -> the source concept), entry_type/source riding as scratch-lane
+    PROPERTIES, part_of the starlog project via project_name=.
+
+    NON-IDEMPOTENT, ACCEPTED EXPLICITLY: the diary d-chain premise
+    (gnosys_vault/starlog_diary.py) carries no starlog_diaried marker, so a
+    re-observation of the same concept appends a NEW registry row AND a NEW node pair
+    here (a fresh DebugDiaryEntry gets a fresh timestamp, hence fresh node names) —
+    both lanes duplicate in LOCKSTEP, which keeps registry and graph equivalent. The
+    tightening (a first-create gate) belongs to the d-chain, not this mirror.
+
     Best-effort / never-raises. starlog_mcp is part of the intentionally-disconnected
     GNOSYS stack, so while it is unavailable this no-ops gracefully (ImportError caught)
     and becomes live on starlog reconnect — the same replace-now / effect-on-reconnect
     contract as project_giint_registry / project_state_machine. Cross-cutting by design:
     UNTYPED concepts have no vaulted type, hence no diary d-chain (goal-consistent —
-    "d-chains for vaulted system types").
+    "d-chains for vaulted system types"). mirror_to_carton itself never raises (it
+    returns error strings and no-ops when carton_mcp is unimportable), so the mirror
+    preserves both contracts.
     """
     from carton_mcp.carton_utils import CartOnUtils
 
@@ -1641,11 +2115,130 @@ def flush_starlog_diary(concept_name: str, shared_connection=None) -> str:
             concept_ref=concept_name, bug_report=(entry_type == "bug"),
         )
         sl._save_debug_diary_entry(project_name, entry)
-        logger.info("Starlog diary: %s [%s] → %s", concept_name, entry_type, project_name)
-        return f"starlog-diary {entry_type} for {concept_name} → {project_name}"
+
+        # CARTON MIRROR — the agent lane's exact mechanism (update_debug_diary,
+        # starlog_mcp.py pass-1 join): content node FIRST (identifier-named, its
+        # DESCRIPTION holds the prose — a relationship target is always MERGEd as a
+        # node keyed on its name, so the target must be an identifier, never prose),
+        # then the diary node carrying is_a + has_content + related_to, with
+        # entry_type/source as scratch-lane properties and part_of the starlog
+        # project via project_name=. See the docstring for the accepted
+        # non-idempotence (both lanes duplicate in lockstep on re-observation).
+        ts = entry.timestamp.strftime('%Y%m%d_%H%M%S')
+        diary_node = f"Debug_Diary_{ts}"
+        content_node = f"{diary_node}_Content"
+        rels = [{"relationship": "is_a", "related": ["Debug_Diary_Entry"]},
+                {"relationship": "has_content", "related": [content_node]},
+                {"relationship": "related_to", "related": [concept_name]}]
+        if len(detected) > 1:
+            rels.append({"relationship": "references_starsystem", "related":
+                         [f"Starlog_Project_{n}" for n in detected.keys()]})
+        ss_path = detected.get(project_name) if len(detected) == 1 else None
+        sl.mirror_to_carton(
+            concept_name=content_node,
+            description=entry_content,
+            relationships=[
+                {"relationship": "is_a", "related": ["Desc_Content"]},
+                {"relationship": "part_of", "related": [diary_node]},
+            ],
+        )
+        sl.mirror_to_carton(
+            concept_name=diary_node,
+            description=entry_content,
+            relationships=rels,
+            project_name=project_name,
+            starsystem_path=ss_path,
+            properties={"entry_type": entry_type, "source": "dragonbones"},
+        )
+        logger.info("Starlog diary: %s [%s] → %s (carton mirror: %s)",
+                    concept_name, entry_type, project_name, diary_node)
+        return (f"starlog-diary {entry_type} for {concept_name} → {project_name} "
+                f"(carton mirror: {diary_node})")
     except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
         logger.warning("Starlog diary failed for %s: %s", concept_name, e, exc_info=True)
         return f"starlog-diary error for {concept_name}: {type(e).__name__}: {e}"
+
+
+def sync_task_kanban_card(concept_name: str, shared_connection=None) -> str:
+    """release_effect entrypoint for dchain_carton_task_kanban_card (issue #148).
+
+    The treekanban join half of the docmirror-task→carton port: a carton_task node's
+    `status` property IS the card's lane — no mapping, the lane name is the status value
+    (open|in_progress|done). Reads the task's LIVE state off neo4j at dispatch time (the
+    set_properties property-trail POSTs fire-and-forget and drop release effects; only
+    the add_concept queue path dispatches, so the store — not the event — is the truth).
+    Finds the card by tag == concept_name on the board named by
+    CARTON_TASK_TREEKANBAN_BOARD; moves it with the same PUT the PBML lane uses
+    (llm_intelligence.projects._sync_to_treekanban precedent), or creates it if absent.
+
+    Best-effort / never-raises. ENV-GATED: with no CARTON_TASK_TREEKANBAN_BOARD set, or
+    heaven_bml_sqlite unavailable, this no-ops gracefully — the TK visual surface
+    (sancrev-opera) is absent on the builder, so the visual half stays UNVERIFIED until
+    a box with the surface sets the env. Same replace-now / effect-on-reconnect contract
+    as flush_starlog_diary. NOTE: dispatch requires this handler in the daemon's
+    _GRADE_EXEMPT_EFFECTS — a task instance never grades is_system_type; the d-chain's
+    code_gap(C) premise is the gate.
+    """
+    from carton_mcp.carton_utils import CartOnUtils
+
+    try:
+        board = os.environ.get("CARTON_TASK_TREEKANBAN_BOARD")
+        if not board:
+            return (f"task-kanban skipped for {concept_name}: "
+                    "CARTON_TASK_TREEKANBAN_BOARD not set (TK surface env-gated)")
+
+        utils = CartOnUtils(shared_connection=shared_connection)
+        res = utils.query_wiki_graph(
+            "MATCH (t:Wiki {n: $name}) RETURN t.d AS text, t.status AS status, "
+            "t.repo AS repo, t.order AS ord",
+            {"name": concept_name},
+        )
+        if not (res.get("success") and res.get("data")):
+            return f"task-kanban skipped: {concept_name} not found"
+        row = res["data"][0]
+        lane = row.get("status") or "open"
+        text = (row.get("text") or concept_name)[:200]
+
+        try:
+            from heaven_bml_sqlite.heaven_bml_sqlite_client import HeavenBMLSQLiteClient
+        except ImportError as e:
+            return f"task-kanban skipped: TreeKanban client unavailable ({e})"
+
+        client = HeavenBMLSQLiteClient()
+        cards = client.get_all_cards(board) or []
+        matching = None
+        for card in cards:
+            tags = card.get("tags", [])
+            if isinstance(tags, str):
+                tags = json.loads(tags) if tags.startswith("[") else [tags]
+            if concept_name in tags:
+                matching = card
+                break
+
+        if matching is None:
+            created = client.create_card(
+                board, title=text[:80], description=text, lane=lane,
+                tags=[concept_name, "carton_task"],
+            )
+            if not created:
+                return f"task-kanban failed: could not create card for {concept_name}"
+            logger.info("Task kanban: created card for %s in lane %s", concept_name, lane)
+            return f"task-kanban created card for {concept_name} → lane {lane}"
+
+        if matching.get("status") == lane:
+            return f"task-kanban unchanged: {concept_name} already in lane {lane}"
+        result = client._make_request(
+            "PUT", f"/api/sqlite/cards/{matching['id']}",
+            {"status": lane, "board": board},
+        )
+        if not result:
+            return f"task-kanban failed: could not move card {matching['id']} to {lane}"
+        logger.info("Task kanban: moved card %s (%s) → lane %s",
+                    matching["id"], concept_name, lane)
+        return f"task-kanban moved card {matching['id']} for {concept_name} → lane {lane}"
+    except Exception as e:  # noqa: BLE001 — never raise out of a release_effect handler
+        logger.warning("Task kanban failed for %s: %s", concept_name, e, exc_info=True)
+        return f"task-kanban error for {concept_name}: {type(e).__name__}: {e}"
 
 
 def _build_template_content(concept_data: dict, concept_name: str) -> dict:
@@ -1921,7 +2514,14 @@ class PublishManifest(RenderablePiece):
         if self.manifest_comment:
             manifest["_comment"] = self.manifest_comment
         manifest["units"] = [self._unit_to_manifest(u) for u in self.units]
-        return json.dumps(manifest, indent=2, sort_keys=False)
+        # ensure_ascii=False is REQUIRED, not cosmetic: the two other writers of this same
+        # file (scalable-publishing/bin/render_manifest_from_carton.py:93 and
+        # bin/generate_marketplace.py:105) both pass it, so without it this third writer
+        # emits a byte-different manifest — every em-dash in a readme description becomes
+        # — — and the file reads as permanently modified in git against a HEAD that
+        # holds the literal characters. Measured 2026-08-22: 13 escapes on disk, 13
+        # literals at HEAD. Pinned by test_publish_manifest_preserves_non_ascii.
+        return json.dumps(manifest, indent=2, sort_keys=False, ensure_ascii=False)
 
 
 def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hypercluster: str = None) -> str:
@@ -1951,7 +2551,7 @@ def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hyperc
 
     # Tier file paths
     tier_paths = {
-        0: os.path.expanduser("~/.claude/projects/-home-GOD/memory/MEMORY.md"),
+        0: os.path.expanduser("~/.claude/rules/MEMORY.md"),
         1: os.path.expanduser("~/.claude/rules/mid_term_memory.md"),
         2: os.path.expanduser("~/.claude/rules/long_term_memory.md"),
         3: os.path.expanduser("~/.claude/rules/faintest-memories-L2.md"),
@@ -2067,6 +2667,34 @@ def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hyperc
             "- **CartON graph → compiler → MEMORY.md** — the graph is the source; run `python3 ~/.claude/scripts/project_memory.py` to recompile",
             # CONNECTS_TO: /tmp/heaven_data/task_list_backup.json (reference) — ephemeral task list backup
             "- **Backup task list to `/tmp/heaven_data/task_list_backup.json`** before session end (Claude Code tasks are ephemeral)",
+            "",
+            # === THE TIMELINE INDEX ===
+            # Compiled in 2026-08-21 (Isaac). MEMORY.md must tell EVERY agent EVERY timeline it can
+            # read, BY DEFAULT — it did not, so each session re-derived the timelines from a rule or a
+            # tool docstring, or worse: queried for a NODE TYPE named after a timeline, found zero
+            # instances, and reported a LIVE, actively-collecting timeline as non-existent (measured
+            # 2026-08-21 — `System_Odyssey` has 0 instances as a type while the `system` timeline was
+            # writing System_Event_* rows that same minute). MEMORY.md is read by the builder, by
+            # GNOSYS and by CONDUCTOR, so putting the index here fixes all three at once. The weekly
+            # Friendship rollup READS three of these (odyssey/system/chat), so an agent that cannot
+            # name them cannot run the weekly loop at all.
+            "## Timelines — the action record (read these; do NOT query for a node type)",
+            "",
+            "`get_recent_concepts(n=<N>, timeline=<name>)` — the ONLY way to read a timeline.",
+            "A timeline is a FILTER over timeline-linked concepts, **not** a node type. Querying for a",
+            "type named e.g. `System_Odyssey` and finding zero instances proves NOTHING about whether",
+            "that timeline is collecting — it is a different question entirely.",
+            "",
+            "| timeline | what it holds |",
+            "|---|---|",
+            "| `chat` | what was WORKED ON — concepts written by agent/dragonbones during conversations |",
+            "| `system` | SYSTEM HEALTH — background events: daemon, linker batches, SOMA compose/park, projector |",
+            "| `odyssey` | what the system LEARNED — narrative/BML concepts (Episode, Journey, Epic, summaries) |",
+            "| `overall` | every timeline-linked concept, across all timelines |",
+            "",
+            "CHECK THE FRESHNESS HORIZON FIRST, every time: read the newest entry in the timeline you",
+            "are about to trust. If it is older than the period you are asking about, that timeline is",
+            "BLIND for the period — 'not found' then means 'not ingested', NEVER 'never happened'.",
             "",
             "## UltraMap (HC-to-HC morphisms)",
             "",
@@ -2247,7 +2875,7 @@ def compile_memory_tier(tier_num: int = 0, shared_connection=None, active_hyperc
         AND NOT c.n = 'Identity_Collection'
         AND NOT c.n = 'Hypercluster_Collection'
         RETURN DISTINCT c.n as name
-        ORDER BY c.n
+        ORDER BY name
         """
         ltm_result = utils.query_wiki_graph(ltm_query, {})
         ltm_data = ltm_result.get("data", []) if ltm_result.get("success") else []
@@ -2339,7 +2967,7 @@ def memory_tier_stats(shared_connection=None) -> str:
     utils = CartOnUtils(shared_connection=shared_connection)
 
     tier_paths = {
-        0: os.path.expanduser("~/.claude/projects/-home-GOD/memory/MEMORY.md"),
+        0: os.path.expanduser("~/.claude/rules/MEMORY.md"),
         1: os.path.expanduser("~/.claude/rules/mid_term_memory.md"),
         2: os.path.expanduser("~/.claude/rules/long_term_memory.md"),
     }

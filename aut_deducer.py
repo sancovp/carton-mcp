@@ -111,10 +111,20 @@ def make_executor():
 
 
 def _camel_to_title_underscore(name: str) -> str:
-    """OWL CamelCase -> carton Title_Case_With_Underscores (OntologyEngineer -> Ontology_Engineer)."""
+    """OWL CamelCase -> carton Title_Case_With_Underscores (OntologyEngineer -> Ontology_Engineer).
+
+    SEPARATION OF CONCERNS: the CAP-SPLIT below is this function's own job and belongs here —
+    it is the OWL→carton boundary conversion, and it is correct ONLY because an OWL class name
+    is known to be CamelCase. It must never move into the canonical normalizer: that one also
+    receives PROPER NOUNS said by humans and agents, where splitting caps is vandalism
+    (`FastAPI` -> `Fast_API`, and `CartON` -> `Cart_ON`). Once the caps are split, the word
+    boundaries are underscores and the general rule applies, so the title-casing DELEGATES
+    rather than being re-implemented here.
+    """
+    from carton_mcp.add_concept_tool import normalize_concept_name
     s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
     s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", s)
-    return "_".join(p.capitalize() for p in s.split("_"))
+    return normalize_concept_name(s)
 
 
 def owl_class_index(world) -> Dict[str, object]:

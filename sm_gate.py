@@ -206,7 +206,8 @@ def resolve_identity_entity(handle: Optional[str],
         coll = base + "_Collection"
         run(f"""
             MERGE (e:Wiki {{n: $entity}})
-            MERGE (e)-[:IS_A]->(:Wiki {{n: '{T_AGENT_IDENTITY}'}})
+            MERGE (t_ai:Wiki {{n: '{T_AGENT_IDENTITY}'}})
+            MERGE (e)-[:IS_A]->(t_ai)
             WITH e
             OPTIONAL MATCH (c:Wiki {{n: $coll}})
             FOREACH (_ IN CASE WHEN c IS NULL THEN [] ELSE [1] END |
@@ -403,14 +404,25 @@ def auto_progress(active_step: Dict[str, Any],
     # the full decision context (every candidate with its pattern+weight, the call text, the pick,
     # the reinforcement applied); `advance_explicit` = a caller-forced move (no decision was made).
     if should_reinforce:
-        reinforce_transition(curr_id, next_id, reinforce_delta, run)
+        # the warrant is the EVIDENCE of lived operation, composed verbatim from the real
+        # decision just made (never defaulted): who traversed, which branch pattern the call
+        # matched. This is what later distinguishes lived wiring from born-cold wiring.
+        chosen_pattern = next((t.get("required_pattern")
+                               for t in (active_step.get("transitions") or [])
+                               if t.get("id") == next_id), None)
+        warrant = (f"traversed by {actor or 'unknown_actor'}: call matched "
+                   + (f"branch pattern {chosen_pattern!r}" if chosen_pattern
+                      else "an unconditional branch")
+                   + f" from step '{curr_id}'")
+        reinforce_transition(curr_id, next_id, reinforce_delta, run, warrant=warrant)
         _record_sm_episode({"event": "branch_chosen", "actor": actor, "state_id": state_id,
                             "curr_step": curr_id, "chosen": next_id,
                             "candidates": [
                                 {"to": t.get("id"), "required_pattern": t.get("required_pattern"),
                                  "weight": t.get("weight", 1.0)}
                                 for t in (active_step.get("transitions") or [])],
-                            "call_text": call_text, "reinforce_delta": reinforce_delta})
+                            "call_text": call_text, "reinforce_delta": reinforce_delta,
+                            "warrant": warrant})
     else:
         _record_sm_episode({"event": "advance_explicit", "actor": actor, "state_id": state_id,
                             "curr_step": curr_id, "chosen": next_id, "call_text": call_text})
@@ -617,7 +629,8 @@ def _lock_into_sm_chain(actor: str, sm_id: str, entry_id: str,
     run(f"""
         MATCH (a:Wiki {{n: $actor}})
         MERGE (s:Wiki {{n: $state_name}})
-        MERGE (s)-[:IS_A]->(:Wiki {{n: '{T_EXECUTION_STATE}'}})
+        MERGE (t_es:Wiki {{n: '{T_EXECUTION_STATE}'}})
+        MERGE (s)-[:IS_A]->(t_es)
         MERGE (a)-[:{R_HAS_LIFECYCLE}]->(s)
         WITH s
         OPTIONAL MATCH (s)-[c:{R_CURRENT_STEP}]->() DELETE c
@@ -705,9 +718,12 @@ def skill_to_sm(skill_concept: str,
     text = show_text or f"Show skill {skill_concept}: retrieve its content / what-when."
     run(f"""
         MERGE (sk:Wiki {{n: $skill}})
-        MERGE (core:Wiki {{n: $sm_chain_id}}) MERGE (core)-[:IS_A]->(:Wiki {{n: '{T_SM_CHAIN}'}})
-        MERGE (sm:Wiki {{n: $sm_id}}) MERGE (sm)-[:IS_A]->(:Wiki {{n: '{T_STATE_MACHINE}'}})
-        MERGE (es:Wiki {{n: $entry_id}}) MERGE (es)-[:IS_A]->(:Wiki {{n: '{T_TRAVERSAL_STEP}'}})
+        MERGE (t_chain:Wiki {{n: '{T_SM_CHAIN}'}})
+        MERGE (t_sm:Wiki {{n: '{T_STATE_MACHINE}'}})
+        MERGE (t_step:Wiki {{n: '{T_TRAVERSAL_STEP}'}})
+        MERGE (core:Wiki {{n: $sm_chain_id}}) MERGE (core)-[:IS_A]->(t_chain)
+        MERGE (sm:Wiki {{n: $sm_id}}) MERGE (sm)-[:IS_A]->(t_sm)
+        MERGE (es:Wiki {{n: $entry_id}}) MERGE (es)-[:IS_A]->(t_step)
         SET es.text = $text
         MERGE (sk)-[:{R_HAS_SM_CHAIN}]->(core)
         MERGE (core)-[r:{R_SM_CHAIN_RUNS}]->(sm) SET r.order = 0
@@ -845,7 +861,8 @@ def create_sm_chain(concept_name: str,
     #    convention — see `_title_case_node_name`).
     run(f"""
         MERGE (c:Wiki {{n: $concept}})
-        MERGE (core:Wiki {{n: $sm_chain_id}}) MERGE (core)-[:IS_A]->(:Wiki {{n: '{T_SM_CHAIN}'}})
+        MERGE (t_chain:Wiki {{n: '{T_SM_CHAIN}'}})
+        MERGE (core:Wiki {{n: $sm_chain_id}}) MERGE (core)-[:IS_A]->(t_chain)
         MERGE (c)-[:{R_HAS_SM_CHAIN}]->(core)
         MERGE (dom:Wiki {{n: $domain}})
         MERGE (core)-[:HAS_DOMAIN]->(dom)
@@ -871,7 +888,8 @@ def create_sm_chain(concept_name: str,
         # 2) Sm_Chain -SM_CHAIN_RUNS{order}-> State_Machine (order = index in the list).
         run(f"""
             MATCH (core:Wiki {{n: $sm_chain_id}})
-            MERGE (sm:Wiki {{n: $sm_id}}) MERGE (sm)-[:IS_A]->(:Wiki {{n: '{T_STATE_MACHINE}'}})
+            MERGE (t_sm:Wiki {{n: '{T_STATE_MACHINE}'}})
+            MERGE (sm:Wiki {{n: $sm_id}}) MERGE (sm)-[:IS_A]->(t_sm)
             MERGE (core)-[r:{R_SM_CHAIN_RUNS}]->(sm) SET r.order = $order
         """, {"sm_chain_id": sm_chain_id, "sm_id": sm_id, "order": order})
         # 3) State_Machine -HAS_STEP-> Traversal_Step (each step carries required_pattern + text).
@@ -880,7 +898,8 @@ def create_sm_chain(concept_name: str,
             step_names.append(step_id)
             run(f"""
                 MATCH (sm:Wiki {{n: $sm_id}})
-                MERGE (es:Wiki {{n: $step_id}}) MERGE (es)-[:IS_A]->(:Wiki {{n: '{T_TRAVERSAL_STEP}'}})
+                MERGE (t_step:Wiki {{n: '{T_TRAVERSAL_STEP}'}})
+                MERGE (es:Wiki {{n: $step_id}}) MERGE (es)-[:IS_A]->(t_step)
                 SET es.required_pattern = $required_pattern, es.text = $text
                 MERGE (sm)-[:{R_HAS_STEP}]->(es)
             """, {"sm_id": sm_id, "step_id": step_id,
@@ -996,19 +1015,44 @@ def select_branch(candidates: List[Dict[str, Any]], call_text: str) -> Optional[
 
 
 def reinforce_transition(curr_id: str, next_id: str, delta: float,
-                         run: Callable[[str, Dict[str, Any]], List[Dict[str, Any]]]) -> None:
-    """+delta onto the NEXT_STEP edge's weight property from curr_id to next_id.
+                         run: Callable[[str, Dict[str, Any]], List[Dict[str, Any]]],
+                         warrant: Optional[str] = None) -> None:
+    """+delta onto the NEXT_STEP edge's weight property from curr_id to next_id — and, when
+    `warrant` is given, record the evidence VERBATIM on the edge.
+
+    THE WARRANT FIELD (Edge_Warrant_Field, 2026-08-09 — the neuromorphic plasticity law landed on
+    sm_gate's own edges): `warrant` is the EVIDENCE that this reinforcement came from lived
+    operation, recorded verbatim as `r.warrant` (+ `r.warrant_at`), never defaulted. The SDK laws
+    ported here (neuromorphic/computer.py potentiate + loops.py B5): an EMPTY warrant string is
+    refused (unwarranted co-activation must not potentiate under a blank flag), and a MOCK-tagged
+    warrant is HARD-REFUSED from moving real weights. `warrant=None` keeps the pre-existing
+    weight-only write byte-identical (purely additive — a caller with no evidence story reinforces
+    exactly as before; the warrant field is what later lets fire/decay distinguish lived wiring
+    from born-cold wiring).
 
     Thin, synchronous, direct write — the SCRATCH-LANE pattern this file already uses throughout (no
     try/except, no SOMA trail, same shape as `_lock_into_sm_chain`'s direct MERGE/SET writes): `weight`
-    is exactly the automation/work-state class of property `the-property-layer-doctrine` rule keeps on
-    the fast, SOMA-free scratch lane (never load-bearing for MEANING — the ontological fact here is the
-    NEXT_STEP edge's existence, built by `create_sm_chain`; `weight` is just the learning-signal tuning
-    it). Requires the `curr_id --NEXT_STEP--> next_id` edge to already exist; if it does not, the MATCH
+    and `warrant` are exactly the automation/work-state class of property `the-property-layer-doctrine`
+    rule keeps on the fast, SOMA-free scratch lane (never load-bearing for MEANING — the ontological
+    fact here is the NEXT_STEP edge's existence, built by `create_sm_chain`). Requires the
+    `curr_id --NEXT_STEP--> next_id` edge to already exist; if it does not, the MATCH
     finds nothing and this is a silent no-op (the same MATCH-only-no-op shape every other write in this
-    file that assumes prior structure uses, e.g. `auto_progress`'s CURRENT_STEP move). Not wired into
-    `auto_progress` yet — that is step 2, a separate future task.
+    file that assumes prior structure uses, e.g. `auto_progress`'s CURRENT_STEP move).
     """
+    if warrant is not None:
+        if not str(warrant).strip():
+            raise ValueError("reinforce_transition: warrant evidence must be non-empty when given "
+                             "— unwarranted co-activation must not potentiate under a blank flag")
+        if str(warrant).strip().lower().startswith("mock"):
+            raise ValueError("reinforce_transition: mock-tagged warrant is refused from moving "
+                             "real weights (the B5 law — neuromorphic/loops.py)")
+        run(f"""
+            MATCH (a:Wiki {{n: $curr_id}})-[r:{R_NEXT_STEP}]->(b:Wiki {{n: $next_id}})
+            SET r.weight = coalesce(r.weight, 1.0) + $delta,
+                r.warrant = $warrant, r.warrant_at = $warrant_at
+        """, {"curr_id": curr_id, "next_id": next_id, "delta": delta,
+              "warrant": str(warrant), "warrant_at": datetime.now().isoformat()})
+        return
     run(f"""
         MATCH (a:Wiki {{n: $curr_id}})-[r:{R_NEXT_STEP}]->(b:Wiki {{n: $next_id}})
         SET r.weight = coalesce(r.weight, 1.0) + $delta

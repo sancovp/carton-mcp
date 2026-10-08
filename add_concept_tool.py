@@ -23,6 +23,7 @@ from difflib import get_close_matches
 import logging
 
 import urllib.request as _urllib_request  # used by the SOMA integration below
+from urllib.parse import urlparse as _urlparse
 # YOUKNOW removed 2026-06-15: YOUKNOW (:8102) is DEAD CODE — SOMA (:8091) is THE
 # validator now (system-type/ontology validation belongs only in SOMA). The old
 # youknow_validate / _check_youknow_available / YOUKNOW_AVAILABLE health-check block
@@ -30,19 +31,349 @@ import urllib.request as _urllib_request  # used by the SOMA integration below
 
 # SOMA integration - calls the SOMA HTTP daemon (port 8091).
 # SOMA has ONE entrypoint: POST /event. Replaces YOUKNOW for concept validation.
+#
+# ⚠ THIS CALL IS THE DIRECTION OF TRUTH, AND READING EITHER SIDE MUST TEACH YOU BOTH
+# (the counterpart note is soma_prolog/vault.py's module header — keep them in step).
+#
+#   CARTON IS THE TOTAL STORE. SOMA's quadstore is its ~10x-faster REFLECTION: the
+#   thing SOMA deduces from, not itself the record (Isaac, 2026-08-11). A concept
+#   ENTERS here — the carton write — and this POST is what reflects it into SOMA.
+#   That is why the write and the POST live in one function and not two.
+#
+#   ⇒ THE COROLLARY THAT KEEPS BEING MISSED: anything that POSTs to /event WITHOUT
+#   coming through carton — vault(), add_dchain, register_foundation — populates the
+#   REFLECTION ONLY, and the record never learns about it. That is not a bug in those
+#   callers; SOMA is deliberately separable as a library (see vault.py) so it can
+#   outlive carton. But we never SHIP them separated, so in any running system a
+#   /event-only write leaves the two stores disagreeing, and the parity law (Isaac
+#   2026-08-03: their concept counts must never differ) is violated from that moment.
+#   MEASURED: a fresh box with 165 SOMA subjects against 41 carton nodes.
 # ENV-OVERRIDABLE (2026-06-27): set SOMA_URL to reach a REMOTE (containerized) SOMA,
 # e.g. SOMA_URL=http://soma-container:8091/event. Default = local daemon. vault.py is
 # already env-ready (vault.py:58); this makes the carton add_concept path match so the
 # whole system can point at a mem-isolated SOMA container.
 SOMA_URL = os.environ.get("SOMA_URL", "http://localhost:8091/event")
 
-def soma_validate(source, observations, domain="default"):
-    body = json.dumps({"source": source, "observations": observations, "domain": domain}).encode()
+# STORE-PARITY GUARD, carton side (Isaac's ruling 2026-08-03): SOMA never
+# touches neo4j by design — CARTON has the connection — so each event POST
+# carries carton's :Wiki node count as an EPHEMERAL parity observation
+# ({"name": "tc_carton_parity", "carton_node_count": N}). SOMA's core.py pops
+# it before the pipeline (it never reaches Prolog or the store) and SCREAMS a
+# store_parity= block in the verdict when its mirror's distinct-subject count
+# diverges catastrophically (the Jul-5 silent-reset class). TTL-cached count
+# (the counted-window discipline: one count query per window, never per
+# write); an attach failure logs LOUD and skips — a missing count is absence
+# of signal for that event, never a wrong signal, and the SOMA-side sentinel
+# guard covers the catastrophe class structurally.
+_PARITY_COUNT_TTL_S = 300.0
+_parity_count_cache = {"at": 0.0, "count": None}
+
+
+def _carton_node_count():
+    """TTL-cached carton :Wiki node count for the parity observation, or None."""
+    now = time.monotonic()
+    if (_parity_count_cache["count"] is not None
+            and now - _parity_count_cache["at"] <= _PARITY_COUNT_TTL_S):
+        return _parity_count_cache["count"]
+    try:
+        from carton_mcp.carton_utils import CartOnUtils as _ParityUtils
+        row = _ParityUtils().query_wiki_graph(
+            "MATCH (c:Wiki) RETURN count(c) AS n", {})
+        data = (row.get("data") or []) if isinstance(row, dict) else []
+        n = int(data[0]["n"]) if data else None
+        if n is not None:
+            _parity_count_cache["count"] = n
+            _parity_count_cache["at"] = now
+        return n
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "store-parity: carton node count unavailable (guard skipped this "
+            "window): %s", e)
+        return None
+
+
+def soma_validate(source, observations, domain="default", timeout=120):
+    """timeout: urlopen socket timeout (seconds). Default 120 fits the ordinary
+    single-concept event. A MULTI-observation event (the vault lane's atomic step 1)
+    must pass more: the pipeline cost scales with the event, the daemon serializes
+    requests, and a too-short timeout closes the socket mid-response — the server
+    keeps working while the caller reports SOMA_UNREACHABLE (measured 2026-08-18 on
+    the boot-register: chunk step-1 events timing out at 120s behind earlier chunks)."""
+    # Attach the parity observation WITHOUT mutating the caller's list. Only
+    # the list shape carries it (the dict observation_data shape has no place
+    # for it and core.py's extractor only scans lists).
+    obs_out = observations
+    if isinstance(observations, list):
+        n = _carton_node_count()
+        if n is not None:
+            obs_out = list(observations) + [{
+                "name": "tc_carton_parity",
+                "carton_node_count": n,
+                "relationships": [],
+            }]
+    body = json.dumps({"source": source, "observations": obs_out, "domain": domain}).encode()
     req = _urllib_request.Request(SOMA_URL, data=body,
                                   headers={"Content-Type": "application/json"})
-    with _urllib_request.urlopen(req, timeout=120) as resp:
+    with _urllib_request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read())
     return data
+
+
+def soma_critical_lines(soma_result: str) -> str:
+    """The CRITICAL lines of a SOMA verdict, verbatim and newline-joined.
+
+    Args:
+        soma_result: The verdict string SOMA returned for the event.
+
+    Returns:
+        str: Every line that starts with "CRITICAL ", in verdict order, or '' when none does.
+    """
+    return "\n".join(line.strip() for line in (soma_result or "").splitlines()
+                     if line.strip().startswith("CRITICAL "))
+
+
+SOMA_ISA_FILLS_HEADER = "system_type_isa_fills="
+
+
+def soma_isa_fill_lines(soma_result: str, concept_name: str) -> list:
+    """The fill signals SOMA gave for ``concept_name`` in the system_type_isa_fills block of a verdict.
+
+    Each names an undefined ``is_a`` target of a declared system type, which keeps its grade.
+
+    Args:
+        soma_result: The verdict string SOMA returned for the event.
+        concept_name: The concept written, matched to SOMA's normalized name without underscores or case.
+
+    Returns:
+        list: Each fill line naming the concept, without its ``- `` bullet, in verdict order.
+    """
+    key = concept_name.lower().replace("_", "")
+    fills, inside = [], False
+    for line in (soma_result or "").splitlines():
+        if line.startswith(SOMA_ISA_FILLS_HEADER):
+            inside = True
+            continue
+        if not inside:
+            continue
+        body = line.strip()
+        if not body.startswith("- "):
+            break
+        if body[2:].split(" is_a ", 1)[0].lower().replace("_", "") == key:
+            fills.append(body[2:])
+    return fills
+
+
+def split_soma_death_block(text: str) -> tuple:
+    """Split off the DEATH block SOMA opens a verdict with while any system type is soup.
+
+    Args:
+        text: A SOMA verdict, or an add_concept result that carries one.
+
+    Returns:
+        tuple: ``(block, rest)`` — the block verbatim, or '' when there is none, and the text without it.
+    """
+    try:
+        from soma_prolog import soup_system_type_scream as _scream
+    except ImportError:
+        logger.warning("soma_prolog is not importable here: a DEATH block cannot be lifted\n%s",
+                       traceback.format_exc())
+        return "", text or ""
+    block = _scream.extract(text)
+    return block, (_scream.without(text) if block else (text or ""))
+
+
+SOMA_HELP_POINTER = "SOMA help: use the soma-help skill if you have not used it yet."
+SOMA_INSTRUCTIONS_POINTER = "Any lines starting DO at the end are the instructions and must be followed."
+
+_SOMA_REQUIRES = re.compile(
+    r"^(\S+) claims to be (\S+)\. \2 requires (\S+) \(([^)]+)\)\. \1 does not have \3\. Provide it\.(?: .*)?$")
+_SOMA_ALL_MISSING = re.compile(
+    r"^\[(.+)\] all claim to be (\S+) and are missing (\S+) \(([^)]+)\)\. Provide it\.(?: .*)?$")
+_SOMA_FAILED = "not validly the type it claims, its execution failed"
+_SOMA_IF_MEANT = "this is important to fill next, but only if"
+_SOMA_PROPERTY_KINDS = {"string_value": "", "int_value": "an integer", "float_value": "a number",
+                        "bool_value": "true or false", "list_value": "a list", "dict_value": "a mapping"}
+
+
+def _soma_key(name: str) -> str:
+    return (name or "").lower().replace("_", "")
+
+
+def _verdict_block_items(soma_result: str, header: str) -> list:
+    """The ``- `` items under one block header of a SOMA verdict, without their bullet, in verdict order."""
+    items, inside = [], False
+    for line in (soma_result or "").splitlines():
+        if line.startswith(header):
+            inside = True
+            continue
+        if inside:
+            body = line.strip()
+            if not body.startswith("- "):
+                break
+            items.append(body[2:].strip())
+    return items
+
+
+def _soma_join(items: list) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def soma_concept_status(soma_result: str, concept_name: str) -> Optional[str]:
+    """The grade a ``status=<concept>:<grade>`` line of a SOMA verdict gives one concept, names compared without
+    underscores or case; None when no status line names it."""
+    for line in (soma_result or "").splitlines():
+        if line.startswith("status="):
+            for entry in line[len("status="):].split(","):
+                name, sep, grade = entry.strip().rpartition(":")
+                if sep and _soma_key(name) == _soma_key(concept_name):
+                    return grade.strip().lower()
+    return None
+
+
+def soma_grade_flags(status: Optional[str], unmet: int, has_soup: bool, all_core_met: bool) -> tuple:
+    """(is_soup, is_code, is_system_type) for one concept: from SOMA's status= grade when it gave one (a mereo_error is
+    soup; system_type, an instance with exactly the shape of its system type, is SYSTEM_TYPE; code and ont are
+    SYSTEM_TYPE with no unmet d-chain and CODE otherwise), else from the soup gaps and core requirements of the
+    verdict."""
+    if status in ("soup", "mereo_error"):
+        return True, False, False
+    if status == "system_type":
+        return False, False, True
+    if status in ("code", "ont"):
+        return False, unmet > 0, unmet == 0
+    return has_soup, (not has_soup) and all_core_met and unmet > 0, (not has_soup) and all_core_met and unmet == 0
+
+
+def soma_grade_line(status: Optional[str], unmet: int, flags: tuple, error: str = "") -> str:
+    """The SOMA line of a result: MEREO, SOUP, CODE or SYSTEM_TYPE with the d-chain count, or the SOMA error."""
+    if error:
+        return f"SOMA error: {error}. The write was not graded."
+    is_soup, is_code, is_system_type = flags
+    pending = f", {unmet} d-chain{'' if unmet == 1 else 's'} pending" if unmet else ""
+    if status == "mereo_error":
+        return f"SOMA: MEREO{pending}: {_SOMA_FAILED}; CartON keeps the write so it can be seen."
+    if is_soup:
+        return f"SOMA: SOUP{pending}: {_SOMA_FAILED}."
+    if is_system_type:
+        return "SOMA: SYSTEM_TYPE, all d-chains satisfied."
+    if is_code:
+        return f"SOMA: CODE{pending}."
+    return f"SOMA: {status.upper() if status else 'not graded'}{pending}."
+
+
+def _soma_type_do(claim: str, concept_name: str) -> str:
+    """The instruction for an is_a claim naming a type SOMA does not know or that is not declared."""
+    if " is_a " not in claim:
+        return f"{_SOMA_IF_MEANT} it is inside the meaning you meant for {concept_name}: do what it says; otherwise leave it."
+    name = normalize_concept_name(re.split(r"[\s,(]", claim.split(" is_a ", 1)[1].strip(), 1)[0])
+    if "not DECLARED" in claim:
+        return (f"{_SOMA_IF_MEANT} {name} is inside the meaning you meant: declare {name} a type (it is defined; add "
+                f"System_Type to its is_a); otherwise drop the is_a {name} claim.")
+    return (f"{_SOMA_IF_MEANT} {name} is inside the meaning you meant: define {name} (add_concept {name} with is_a, "
+            f"part_of, produces and instantiates); otherwise drop the is_a {name} claim.")
+
+
+def _soma_params_text(params: list) -> str:
+    """SOMA's words for the params one type requires: each param with its kind."""
+    if len({k for _, k in params}) == 1:
+        return f"{', '.join(p for p, _ in params)} ({'each ' if len(params) > 1 else ''}{params[0][1]})"
+    return ", ".join(f"{p} ({k})" for p, k in params)
+
+
+def _soma_how(params: list) -> str:
+    """How add_concept gives each (param, kind): a value kind as a property, a concept kind as a relationship."""
+    props = [p + (f" ({_SOMA_PROPERTY_KINDS[k]})" if _SOMA_PROPERTY_KINDS[k] else "")
+             for p, k in params if k in _SOMA_PROPERTY_KINDS]
+    rels = [f"{p} to {'an existing' if k == 'concept_ref' else 'a ' + normalize_concept_name(k)} concept"
+            for p, k in params if k not in _SOMA_PROPERTY_KINDS]
+    return " and ".join(([f"properties {_soma_join(props)}"] if props else [])
+                        + ([f"relationships {_soma_join(rels)}"] if rels else []))
+
+
+def _soma_gap_units(concept_name: str, gaps: list) -> list:
+    """(text, instruction) per soup gap sentence, in verdict order; the requirement sentences one type states about one
+    concept become one unit that keeps every param and its kind."""
+    groups, order = {}, []
+    for gap in gaps:
+        m = _SOMA_REQUIRES.match(gap)
+        if m and m.group(3) != "undefined_type_ref":
+            key = (m.group(1), m.group(2))
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            if (m.group(3), m.group(4)) not in groups[key]:
+                groups[key].append((m.group(3), m.group(4)))
+        else:
+            order.append(gap)
+    units = []
+    for item in order:
+        if isinstance(item, tuple):
+            subject, type_name = item
+            params = groups[item]
+            text = (f"{subject} claims to be {type_name}. {type_name} requires {_soma_params_text(params)}. "
+                    f"{subject} does not have {'them' if len(params) > 1 else 'it'}, so {subject} is not validly "
+                    f"{type_name}: its execution failed.")
+            if _soma_key(subject) == _soma_key(concept_name):
+                do = (f"{_SOMA_IF_MEANT} it is inside the meaning you meant: add_concept {concept_name} with "
+                      f"{_soma_how(params)}, {'each ' if len(params) > 1 else ''}filled from what {concept_name} is; "
+                      f"otherwise drop the is_a {normalize_concept_name(type_name)} claim.")
+            else:
+                do = (f"{_SOMA_IF_MEANT} {normalize_concept_name(subject)} is inside the meaning you meant: add_concept "
+                      f"{normalize_concept_name(subject)} with {_soma_how(params)}; otherwise leave it.")
+            units.append((text, do))
+            continue
+        requires, missing = _SOMA_REQUIRES.match(item), _SOMA_ALL_MISSING.match(item)
+        if (requires or missing) and (requires or missing).group(3) == "undefined_type_ref":
+            do = (f"leave it: undefined_type_ref means {normalize_concept_name((requires or missing).group(2))} was not "
+                  f"loaded as a type for this write, so nothing can be given.")
+        elif missing:
+            subjects = _soma_join([normalize_concept_name(s.strip()) for s in missing.group(1).split(",")])
+            do = (f"{_SOMA_IF_MEANT} {subjects} {'are' if ' and ' in subjects else 'is'} inside the meaning you meant: "
+                  f"give {subjects} {_soma_how([(missing.group(3), missing.group(4))])}; otherwise leave it.")
+        else:
+            do = f"{_SOMA_IF_MEANT} it is inside the meaning you meant for {concept_name}: do what it says; otherwise leave it."
+        units.append((item, do))
+    return units
+
+
+def soma_result_lines(soma_result: str, concept_name: str, status: Optional[str]) -> tuple:
+    """SOMA's verdict on one write as a result shows it: numbered information lines, and one DO line per information
+    line naming it by the same token.
+
+    Args:
+        soma_result: The verdict SOMA returned for the write, without its DEATH block.
+        concept_name: The concept written, as CartON names it.
+        status: SOMA's grade for the concept from its ``status=`` line, or None when the verdict has none.
+
+    Returns:
+        tuple: (info, do), each a list of lines in verdict order. MEREO[n] is an is_a claim of this concept naming a
+        type SOMA does not know (when the grade is mereo_error); FILL[n] a declared system type's is_a fill; SOUP[n]
+        a soup gap (when the grade is soup, unvalidated or absent), the requirement sentences one type states about
+        one concept collapsed into one line that keeps every param and its kind. ``DO SOUP[n]: ...`` is the fill or
+        drop for SOUP[n].
+    """
+    info, tokens_by_instruction, counts, seen = [], {}, {}, set()
+
+    def add(tag, text, instruction):
+        if (tag, text) in seen:
+            return
+        seen.add((tag, text))
+        counts[tag] = counts.get(tag, 0) + 1
+        info.append(f"{tag}[{counts[tag]}]: {text}")
+        tokens_by_instruction.setdefault(instruction, []).append(f"{tag}[{counts[tag]}]")
+
+    if status == "mereo_error":
+        for claim in _verdict_block_items(soma_result, "mereo_errors="):
+            if _soma_key(claim.split(" is_a ", 1)[0]) == _soma_key(concept_name):
+                add("MEREO", claim, _soma_type_do(claim, concept_name))
+    for fill in soma_isa_fill_lines(soma_result, concept_name):
+        add("FILL", fill, _soma_type_do(fill, concept_name))
+    if status in (None, "soup", "unvalidated"):
+        for text, instruction in _soma_gap_units(concept_name, _verdict_block_items(soma_result, "soup_gaps=")):
+            add("SOUP", text, instruction)
+    do = [f"DO {', '.join(tokens)}: {instruction}" for instruction, tokens in tokens_by_instruction.items()]
+    return info, do
+
 
 # CARTON → CRYSTAL BALL fan-out (2026-07-02, canon/CORE-SENTENCE-SPECTRAL-SEQUENCE.md).
 # carton SAYS the core sentence, SOMA ENFORCES it (soma_validate above), CB ADDRESSES it
@@ -53,6 +384,81 @@ CARTON_CB_STORE = os.environ.get("CARTON_CB_STORE", "1") not in ("0", "false", "
 CARTON_CB_STORE_URL = os.environ.get("CARTON_CB_STORE_URL", "http://localhost:3000/api/cb/store")
 CARTON_CB_FLOW_URL = os.environ.get("CARTON_CB_FLOW_URL", "http://localhost:3000/api/cb/flow")
 CARTON_CB_KEY_FILE = os.environ.get("CARTON_CB_KEY_FILE", "/tmp/heaven_data/cb_api_key.txt")
+
+def _cb_trace(e) -> str:
+    """The traceback to append to a CB failure log, or '' when the trace carries nothing.
+
+    A CB failure is logged LOUD and that stays true — but loud is about SIGNAL, and a transport
+    error to a service that is simply not running has none beyond its own message: the urllib
+    stack is the same nine frames every time and says only that urlopen could not connect. Two
+    of those per carton write is what a seal or a commit prints hundreds of lines of, which is a
+    real cost, because it pushes every reader toward piping these CLIs through a trimmer — and a
+    pipe that trims is one keystroke from a pipe that discards.
+
+    Args:
+        e: The exception caught around the CB call.
+
+    Returns:
+        str: '' for a transport error (OSError covers urllib's URLError and ConnectionRefusedError
+            alike), else a newline plus the full traceback — so an UNEXPECTED failure, which is the
+            case the loudness exists for, is still reported in full.
+    """
+    return "" if isinstance(e, OSError) else f"\n{traceback.format_exc()}"
+
+
+_CB_QUIET_S = 600
+_cb_state = {"last_said": None, "unsaid": 0}
+
+
+def cb_failure_note(e, label, last_said, unsaid, now, quiet_s=_CB_QUIET_S):
+    """PURE: the warning one CB failure earns, and the state after it (card 767, issue 1114).
+
+    A transport error to a CB service that is not running is said ONCE per quiet window: the first
+    is said, every repeat within `quiet_s` seconds is counted instead, and the first after the window
+    is said again carrying that count. Any other failure is always said, with its traceback.
+
+    Args:
+        e: The exception caught around the CB call.
+        label: What failed, e.g. "CB store" or "CB flow-guidance".
+        last_said: When a transport failure was last said, epoch seconds, or None.
+        unsaid: How many transport failures went unsaid since then.
+        now: The current time, epoch seconds.
+        quiet_s: The window within which a repeat is counted, not said.
+
+    Returns:
+        tuple: (line or None, last_said, unsaid); None means stay quiet.
+    """
+    if not isinstance(e, OSError):
+        return f"{label} failed (carton write unaffected): {e}{_cb_trace(e)}", last_said, unsaid
+    if last_said is not None and now - last_said < quiet_s:
+        return None, last_said, unsaid + 1
+    more = f" ({unsaid} more since the last report)" if unsaid else ""
+    return (f"{label} failed (carton write unaffected): {e}{more}; repeats in this answer are counted, "
+            f"not printed", now, 0)
+
+
+def _cb_note(e, label):
+    """Log what cb_failure_note gives for this failure. The said-at time lives in this process and in
+    CARTON_CB_SAID_AT, which every child process of this CLI answer inherits."""
+    last = _cb_state["last_said"]
+    if last is None:
+        try:
+            last = float(os.environ["CARTON_CB_SAID_AT"])
+        except (KeyError, ValueError):
+            last = None
+    line, last, unsaid = cb_failure_note(e, label, last, _cb_state["unsaid"], time.time())
+    _cb_state.update(last_said=last, unsaid=unsaid)
+    if line:
+        logger.warning(line)
+        if isinstance(e, OSError):
+            os.environ["CARTON_CB_SAID_AT"] = str(last)
+
+
+def _cb_reached():
+    """CB answered: the outage is over, so the next one is said again."""
+    _cb_state.update(last_said=None, unsaid=0)
+    os.environ.pop("CARTON_CB_SAID_AT", None)
+
 
 def _cb_place(concept_name, relationship_dict, soma_region, want_guidance=False):
     """Best-effort fan-out to Crystal Ball: place the said core sentence as a coordinate.
@@ -92,9 +498,10 @@ def _cb_place(concept_name, relationship_dict, soma_region, want_guidance=False)
                 data = json.loads(resp.read().decode())
             store = (data.get("data") or {}).get("store") or {}
             view = data.get("view") or ""
+            _cb_reached()
             return store.get("x"), store.get("y"), str(store.get("encoded", "")), (view or None)
         except Exception as e:
-            logger.warning(f"CB flow-guidance failed (carton write unaffected): {e}\n{traceback.format_exc()}")
+            _cb_note(e, "CB flow-guidance")
             # fall through to the plain store so the coordinate still lands as a property
 
     try:
@@ -108,16 +515,25 @@ def _cb_place(concept_name, relationship_dict, soma_region, want_guidance=False)
                                       headers={"Content-Type": "application/json"})
         with _urllib_request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
+        _cb_reached()
         return data.get("x"), data.get("y"), str(data.get("encoded", "")), None
     except Exception as e:
-        logger.warning(f"CB store failed (carton write unaffected): {e}\n{traceback.format_exc()}")
+        _cb_note(e, "CB store")
         return None, None, "", None
 
 def _check_soma_available():
     try:
         # SOMA only exposes POST /event. A GET returns 404 — a 404 means the daemon
         # is up and responding. ConnectionRefusedError means the daemon is down.
-        req = _urllib_request.Request("http://localhost:8091/event", method="GET")
+        #
+        # ⚠ PROBE THE URL WE ACTUALLY POST TO (fixed 2026-08-11). This hardcoded
+        # localhost:8091 while validation POSTs to SOMA_URL, so the gate and the call
+        # could read DIFFERENT DAEMONS — measured both directions: in the SaaS box the
+        # gate found nothing on the carton container's own localhost and validation was
+        # SILENTLY SKIPPED (saved unvalidated, no verdict, no error, no stash marker);
+        # and the composite smoke went green against a throwaway :8098 only because an
+        # unrelated daemon answered :8091 for the gate.
+        req = _urllib_request.Request(SOMA_URL, method="GET")
         _urllib_request.urlopen(req, timeout=2)
         return True
     except _urllib_request.HTTPError:
@@ -134,12 +550,101 @@ def _check_soma_available():
             return True
         return False
 
+RESTART_SOMA_SCRIPT = (
+    "/home/GOD/gnosys-plugin-v2/base/soma-prolog/.claude/skills/restart-soma/scripts/restart-soma.sh"
+)
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+_SOMA_API_DEFAULT_PORT = 8091
+
+
+def soma_url_is_local(soma_url: str) -> bool:
+    """Whether a SOMA URL names a daemon on this host.
+
+    Args:
+        soma_url: The URL validation POSTs to.
+
+    Returns:
+        bool: True when its hostname is a loopback or any-address name.
+    """
+    return (_urlparse(soma_url).hostname or "") in _LOCAL_HOSTS
+
+
+def soma_argv_port(argv: list):
+    """The port a process serves SOMA on, read from its argv.
+
+    Args:
+        argv: The process's argv tokens.
+
+    Returns:
+        int | None: The --port value (8091, soma_prolog.api's default, when absent) for a python
+            process running soma_prolog.api; None for any other process.
+    """
+    if not any("python" in tok for tok in argv[:1]) or "soma_prolog.api" not in argv:
+        return None
+    for i, tok in enumerate(argv):
+        if tok == "--port" and i + 1 < len(argv) and argv[i + 1].isdigit():
+            return int(argv[i + 1])
+        if tok.startswith("--port=") and tok[len("--port="):].isdigit():
+            return int(tok[len("--port="):])
+    return _SOMA_API_DEFAULT_PORT
+
+
+def local_soma_pids(port: int) -> list:
+    """Pids of the python processes on this host serving soma_prolog.api on one port, from /proc.
+
+    Args:
+        port: The port the SOMA URL names.
+
+    Returns:
+        list: The pids as strings, excluding this process; empty when none serves that port.
+    """
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or entry == str(os.getpid()):
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                argv = fh.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if soma_argv_port(argv) == port:
+            pids.append(entry)
+    return pids
+
+
+def soma_down_warning(soma_url: str, soma_pids, restart_script: str = RESTART_SOMA_SCRIPT) -> str:
+    """The warning logged when SOMA refuses the availability probe.
+
+    Args:
+        soma_url: The URL the probe was refused at.
+        soma_pids: Pids of live soma_prolog.api processes on this host, or None when soma_url
+            names another host and this host's processes say nothing about it.
+        restart_script: The one sanctioned SOMA restart.
+
+    Returns:
+        str: The warning text for that case.
+    """
+    head = (f"SOMA DOES NOT ANSWER at {soma_url} (the connection was refused), so every concept "
+            f"this process writes is stored UNGRADED until it does.")
+    if soma_pids is None:
+        return (f"{head} {soma_url} names another host: this process cannot see or restart that "
+                f"daemon. Restart it on the host that runs it.")
+    if soma_pids:
+        return (f"{head} A soma_prolog.api process IS alive (pid {', '.join(soma_pids)}): it is "
+                f"booting or has lost its socket. Do NOT restart it now: {restart_script} kills the "
+                f"live process first, and every boot re-mints the registered types. Run "
+                f"sophia-status, and only if its SOMA block still reads DOWN after the script's "
+                f"180s readiness bound, run bash {restart_script} in the background.")
+    return (f"{head} No soma_prolog.api process is running, and nothing on this box restarts SOMA "
+            f"(issue 687). Run the one sanctioned restart NOW, in the background: bash "
+            f"{restart_script} ; then run sophia-status and confirm its SOMA block reads UP.")
+
+
 SOMA_AVAILABLE = _check_soma_available()
 if not SOMA_AVAILABLE:
-    logging.getLogger(__name__).error(
-        "SOMA DAEMON NOT RUNNING on port 8091. "
-        "Validation is DISABLED until it answers. Start it: python3 -m soma_prolog.api --port 8091"
-    )
+    logging.getLogger(__name__).error(soma_down_warning(
+        SOMA_URL,
+        local_soma_pids(_urlparse(SOMA_URL).port or 80) if soma_url_is_local(SOMA_URL) else None))
 
 
 def _soma_up() -> bool:
@@ -197,152 +702,136 @@ OBSERVATION_TAGS = {
     "emotional_state"
 }
 
-# Personal domain enum - which strata/area this relates to
+# PERSONAL DOMAIN ENUM — which stratum of the USER'S LIFE a concept is USED IN. This is a
+# different axis from `domain` (what a concept is ABOUT) and from `region` (what SOMA SAID
+# about it); the three must never substitute for each other.
+#
+# ⚠ THE COMMENTS BELOW WERE WRONG FROM ~2026-01-23 UNTIL 2026-08-26, AND THIS FILE IS WHERE
+# EVERY OTHER READER GOT THEM. They previously read: paiab "building AI/agents", sanctum
+# "philosophy/life architecture", cave "business/funnels". Those were written when the 5-value
+# enum was introduced — SIX MONTHS BEFORE Isaac ever stated what the values mean — so they were
+# a pre-definition inference sitting in the canonical source being read as authoritative.
+# `cave` was the worst of the three: "business/funnels" conflates the discipline with the
+# marketing funnel, and the record contains no instance of Isaac saying it.
+#
+# THE REAL DEFINITIONS — THE THREE DISCIPLINES. Isaac verbatim 2026-07-30 (journal
+# Scalable_Publishing_Publishing_Video_Studio_Framework_Definition_2026_07_30T04_22_02):
+# "part of the religion is AGENT ENGINEERING, RITUAL ENGINEERING, AND BUSINESS ENGINEERING.
+# Thats what it fucking is." — and, in the same entry, mapped onto THIS enum by name:
+# "AGENT ENGINEERING = PAIAB, RITUAL ENGINEERING = SANCTUM (...), BUSINESS ENGINEERING = CAVE;
+# they are the carton has_personal_domain enum (paiab/sanctum/cave)". They are the three strata
+# that have organized the entire system from the beginning, and are simultaneously this enum,
+# the community tier names, and the need-chain stations.
+#
+# ⚠ EACH OF THE FIRST THREE ALSO NAMES A PIECE OF SOFTWARE. CAVE the software is the Code Agent
+# Virtualization Environment; paia-builder and sanctum-builder are mini-games. The software
+# sense is NOT the life stratum, and letting it define the stratum is precisely how the wrong
+# comments above were produced.
+#
+# ⚠ STORED Title_Case, WRITTEN lowercase. CartON normalizes relationship targets, so the graph
+# holds Cave/Paiab/Sanctum/Misc/Personal. ANY comparison against this list MUST fold case —
+# 604 legal values are stored Title_Case and a literal `in` check refuses every one of them.
+# See validate_personal_domain_value below, which is the enforcing path.
 PERSONAL_DOMAINS = [
-    "paiab",      # building AI/agents
-    "sanctum",    # philosophy/life architecture
-    "cave",       # business/funnels
-    "misc",       # doesn't fit a strata yet
-    "personal"    # non-work life stuff
+    "paiab",      # AGENT ENGINEERING — building, training and deploying agents
+    "sanctum",    # RITUAL ENGINEERING — engineering the repeated practices that shape a day
+                  # (add_ritual(name, domain, frequency, duration) IS this discipline as code)
+    "cave",       # BUSINESS ENGINEERING — building the livelihood/monetization around the system
+    "misc",       # the CATEGORY TERM: real things outside the three disciplines (Isaac's example:
+                  # "STARSYSTEM the Game"). NOT a junk bucket — a genuine stratum of use.
+    "personal"    # a SUBSET of misc — "the important ones out all the stuff that accumulates"
 ]
 
-# UARL predicates - Universal Alignment Relationship Language
-#
-# ⚠️ CURRENT STATE: STATIC HARDCODED LIST (WRONG)
-#
-# WHAT THIS SHOULD BE:
-# Dynamic enum that auto-updates when new relationship types with valid origination stacks are created.
-#
-# HOW IT SHOULD WORK:
-# 1. Query Neo4j for concepts where: (concept)-[:IS_A]->(Relationship) AND (concept)-[:HAS_ORIGINATION_STACK]->()
-# 2. Those concepts are valid UARL predicates (strongly compressed relationship types)
-# 3. When used, they compress logic because they have witnessed origination chains
-#
-# ORIGINATION STACK VALIDATION (not yet implemented):
-# An origination stack proves a relationship is strongly compressed by showing:
-# - embodies: implicit structure recognized
-# - manifests: structure established in soup
-# - reifies: fully composed with all required parts
-# Stack witnesses that the relationship type is ontologically valid.
-#
-# RELATIONSHIP COMPRESSION:
-# - weak_compression: arbitrary string, no origination stack, requires evolution
-# - simple_strong: UARL predicate with origination stack
-# - composite_strong: UARL predicate built from other UARL predicates
-#
-# CONCEPT COMPRESSION (aggregated from relationships):
-# - Concept is STRONGLY COMPRESSED if ALL morphisms to it are strong
-# - If ANY morphism is weak → concept is HALLUCINATION (weak compression)
-# - Weak concepts get REQUIRES_EVOLUTION marker
-#
-# ONTOLOGY LAYER:
-# Strongly compressed concepts: (concept)-[:IS_A]->(Carton_Ontology_Entity)
-# Query param: graph_type="ontology"|"wiki" to filter by layer
-#
-# CURRENT KNOWN STRONG PREDICATES (have validation logic):
-# - is_a: check_is_a_cycle() validates
-# - part_of: check_part_of_cycle() validates
-# - instantiates: check_instantiates_completeness() validates
-#
-# TODO: Implement full UARL system
-# 1. Create Origination_Stack concept and validation
-# 2. Make UARL_PREDICATES dynamic (query graph)
-# 3. Implement concept compression aggregation
-# 4. Add Carton_Ontology_Entity layer
-# 5. Add graph_type query filtering
-#
-UARL_PREDICATES = {
-    "is_a",
-    "part_of",
-    "instantiates",
-    "embodies",
-    "manifests",
-    "reifies",
-    "programs",
-    "validates",
-    "invalidates"
+# The keys of an observation-shaped queue file that are NOT observation tags.
+# ONE home (issue #198): parse_queue_file_to_concepts (the daemon's live lane)
+# and observation_validation_errors below both consume this set — a second copy
+# would silently drift the two consumers apart.
+OBSERVATION_NON_TAG_KEYS = {
+    'confidence', 'hide_youknow', 'desc_update_mode', 'raw_concept',
+    'fixed', 'error_message', 'error_traceback',
 }
 
-def get_uarl_predicates(config: ConceptConfig) -> set:
+
+def observation_validation_errors(data: dict) -> list:
+    """PURE. The four-required-rels observation validation, LIVE (issue #198).
+
+    This is the faithful port of the validator that sat in _add_observation_worker
+    (the raise at the all_part_concepts loop) — DEAD CODE on the runtime path,
+    because that worker is only reachable from the dead process_queue_file branch
+    while the daemon routes every file through the UNWIND lane, which validated
+    nothing. The 2026-08-29 precedent-deconfab ruling on issue #198 resurrects it
+    as a LOUD DEAD-LETTER: the daemon calls this per queue file BEFORE parsing;
+    a non-empty return dead-letters the file with the reasons named, and the
+    drain continues.
+
+    Scope, kept identical to the dead validator:
+      - observation-shaped files ONLY (raw_concept / concept_name / concepts-list
+        / timeline_merge files return [] untouched);
+      - a part with an EMPTY relationships list is SKIPPED (not an error);
+      - a part with relationships must carry ALL FOUR: is_a, part_of,
+        has_personal_domain, has_actual_domain;
+      - every has_personal_domain value must be in PERSONAL_DOMAINS.
+
+    Returns a list of human-readable error strings naming concept + tag + gap —
+    [] when the file is valid or not an observation.
     """
-    Get dynamic UARL predicates by querying for reified relationship concepts.
-
-    A relationship concept is a valid UARL predicate if:
-    - It has a REIFIES relationship (strongly compressed)
-
-    Bootstrap predicates (primitives that don't need REIFIES):
-    - is_a, part_of, instantiates
-
-    Args:
-        config: ConceptConfig with Neo4j credentials
-
-    Returns:
-        Set of valid UARL predicate names
-
-    Note:
-        REIFIES creation workflow not yet implemented - returns bootstrap primitives only.
-        When formalization workflow is built, uncomment query logic below.
-        This prevents 100+ redundant Neo4j queries per observation (CPU spike).
-    """
-    # Bootstrap primitives (always valid)
-    return {"is_a", "part_of", "instantiates"}
-
-    # TODO: Uncomment when REIFIES creation workflow is implemented
-    # try:
-    #     from heaven_base.tool_utils.neo4j_utils import KnowledgeGraphBuilder
-    #
-    #     graph = KnowledgeGraphBuilder(
-    #         uri=config.neo4j_url,
-    #         user=config.neo4j_username,
-    #         password=config.neo4j_password
-    #     )
-    #
-    #     # Bootstrap primitives (always valid)
-    #     predicates = {"is_a", "part_of", "instantiates"}
-    #
-    #     # Query for reified concepts (have REIFIES relationship to Carton_Ontology_Entity)
-    #     reified_query = """
-    #     MATCH (c:Wiki)-[:REIFIES]->(onto:Wiki {n: "Carton_Ontology_Entity"})
-    #     RETURN DISTINCT c.n as predicate
-    #     """
-    #
-    #     result = graph.execute_query(reified_query)
-    #     graph.close()
-    #
-    #     if result:
-    #         for record in result:
-    #             predicates.add(record['predicate'])
-    #
-    #     return predicates
-    #
-    # except Exception as e:
-    #     # Fallback to bootstrap primitives if query fails
-    #     print(f"[UARL] Could not query dynamic predicates: {e}", file=sys.stderr)
-    #     return {"is_a", "part_of", "instantiates"}
+    if not isinstance(data, dict):
+        return []
+    if (data.get('raw_concept') or data.get('concept_name')
+            or (isinstance(data.get('concepts'), list) and data.get('concepts'))
+            or data.get('timeline_merge')):
+        return []
+    errors = []
+    required = ('is_a', 'part_of', 'has_personal_domain', 'has_actual_domain')
+    for tag, tag_concepts in data.items():
+        if tag in OBSERVATION_NON_TAG_KEYS or not isinstance(tag_concepts, list):
+            continue
+        for concept_data in tag_concepts:
+            if not isinstance(concept_data, dict):
+                continue
+            name = concept_data.get('name') or '(unnamed)'
+            user_relationships = concept_data.get('relationships') or []
+            if not isinstance(user_relationships, list) or not user_relationships:
+                continue  # the dead validator's own scope: empty rels skip
+            present = {rel.get('relationship') for rel in user_relationships
+                       if isinstance(rel, dict)}
+            missing = [r for r in required if r not in present]
+            if missing:
+                errors.append(
+                    f"Concept '{name}' (tag '{tag}') missing required "
+                    f"relationships: {', '.join(missing)}"
+                )
+            for rel in user_relationships:
+                if isinstance(rel, dict) and rel.get('relationship') == 'has_personal_domain':
+                    for pd_value in (rel.get('related') or []):
+                        if pd_value not in PERSONAL_DOMAINS:
+                            errors.append(
+                                f"Concept '{name}' (tag '{tag}') invalid "
+                                f"personal_domain '{pd_value}' — must be one of: "
+                                f"{', '.join(PERSONAL_DOMAINS)}"
+                            )
+    return errors
 
 
-def classify_compression_type(rel_type: str, config: ConceptConfig, is_composite: bool = False) -> str:
-    """
-    Classify relationship compression type.
-
-    - weak_compression: Relationship type not in UARL predicates (not reified)
-    - simple_strong: UARL predicate (reified), not composite
-    - composite_strong: UARL predicate (reified), composite
-
-    Args:
-        rel_type: Relationship type string
-        config: ConceptConfig for querying UARL predicates
-        is_composite: Whether relationship is built from other relationships
-
-    Returns:
-        Compression type: "weak_compression", "simple_strong", or "composite_strong"
-    """
-    uarl_predicates = get_uarl_predicates(config)
-
-    if rel_type not in uarl_predicates:
-        return "weak_compression"
-
-    return "composite_strong" if is_composite else "simple_strong"
+# UARL LIVES IN SOMA, NOT HERE (deleted 2026-08-21, Isaac's ruling).
+#
+# A hardcoded UARL_PREDICATES set, get_uarl_predicates() and classify_compression_type()
+# used to sit here, plus a design comment for an "origination stack" validator that was
+# never built. Isaac, verbatim: "the UARL_PREDICATES in carton is a leftover from when we
+# sketched out UARL *the very first time* LOL years ago! not real. should not be active in
+# any way... Strong vs Weak already happens in SOMA... Theres no way for carton to do these
+# operations at all."
+#
+# It was a nine-name Python set that never read uarl.owl, and it even expanded the acronym
+# differently from the real ontology ("Universal Alignment Relationship Language" here vs
+# "Universal Axiomatic Reality Language" in uarl.owl) — a divergent early sketch, and its
+# own header already said "CURRENT STATE: STATIC HARDCODED LIST (WRONG)".
+#
+# WHERE IT ACTUALLY LIVES: strong-vs-weak compression is SOMA's, decided by the recursive
+# walker find_weak_compression_target/2,/3 + check_convention(weak_compression_detector)
+# in soma_prolog/soma_partials.pl, against the StrongCompressionPattern /
+# WeakCompressionPattern classes in soma_prolog/uarl.owl. Carton's role is to CALL SOMA
+# and to be the store canon — it does not classify.
 
 # ============================================================================
 # File-based queue for observations
@@ -352,6 +841,27 @@ def get_observation_queue_dir():
     queue_dir = Path(heaven_data_dir) / 'carton_queue'
     queue_dir.mkdir(parents=True, exist_ok=True)
     return queue_dir
+
+
+def submit_queue_entry(entry: dict, suffix: str = "") -> str:
+    """Queue one entry and return its filename.
+
+    REMOTE when KUZU_QUERY_URL names a carton box: the entry is POSTed and the BOX writes
+    it, because the queue belongs to the machine whose worker drains it. Writing it here
+    would leave a file on the caller's own disk that nothing ever reads, and still report
+    success. LOCAL when the url is empty — the owner/self-hosted case, unchanged.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _dt
+
+    url = (os.getenv("KUZU_QUERY_URL") or "").strip()
+    if url:
+        from heaven_base.tool_utils.graph_store import KuzuHttpStore
+        return KuzuHttpStore(url)._post("/enqueue", {"entry": entry, "suffix": suffix})
+    name = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{str(_uuid.uuid4())[:8]}{suffix}.json"
+    with open(get_observation_queue_dir() / name, "w") as fh:
+        json.dump(entry, fh, indent=2)
+    return name
 
 
 # ============================================================================
@@ -401,12 +911,39 @@ def record_soma_rejection(concept_name: str, relationships, verdict_kind: str,
 # Threads don't work in MCP isolation - Neo4j writes now happen synchronously
 
 
+# ── Issue #200: metacharacter SANITIZATION inside the one normalization chokepoint ──
+# RULING (2026-08-28, reversible): SANITIZE, do not reject. Every writer inherits this
+# because every writer routes names through normalize_concept_name — the add_concept
+# queue path (observation_worker_daemon.py normalizes concept_name + every relationship
+# target) AND the auto-stub side door (the daemon's target MERGE) hit this same function.
+#
+# Two metachar classes, handled differently:
+#   QUOTE chars ─ ' " ` and the smart quotes — STRIPPED in place (intra-word punctuation:
+#                 "Isaac's_Idea" -> "Isaacs_Idea", not "Isaac_S_Idea").
+#   SEPARATOR chars ─ slashes (/ \), brackets ([ ] ( ) { } < >), newlines/CR/tab and all
+#                 other C0 control chars — each RUN replaced by ONE underscore, then the
+#                 edges stripped ("/path/to/x" -> "path_to_x").
+# Length is capped at MAX_CONCEPT_NAME_LENGTH (200) AFTER normalization (transcript-blob
+# names). Every sanitization and every truncation is LOGGED LOUDLY (logger.warning) with
+# before/after so nothing lands silently. Clean names never warn and are byte-identical
+# to the pre-#200 behavior.
+_NAME_QUOTE_CHARS = re.compile("['\"`‘’“”]+")
+_NAME_SEPARATOR_CHARS = re.compile(r"[/\\\[\]\(\)\{\}<>\x00-\x1f]+")
+MAX_CONCEPT_NAME_LENGTH = 200
+
+
 def normalize_concept_name(name: str) -> str:
     """
     Normalize concept name to Title_Case_With_Underscores format.
 
     This is the single source of truth for concept name normalization.
     Used for filesystem paths, Neo4j node names, and all concept references.
+
+    Sanitization (issue #200): quote characters are stripped; slashes, brackets,
+    newlines and other control characters are each replaced (per run) with one
+    underscore; the result is capped at MAX_CONCEPT_NAME_LENGTH (200) chars.
+    Every sanitization/truncation is logged at WARNING with before/after.
+    A name that sanitizes to nothing returns "" (callers already skip empties).
 
     Args:
         name: Raw concept name (can have spaces, any casing)
@@ -418,7 +955,18 @@ def normalize_concept_name(name: str) -> str:
         "my cool concept" -> "My_Cool_Concept"
         "NEURAL NETWORK" -> "Neural_Network"
         "hello_world" -> "Hello_World"
+        "path/to/thing" -> "Path_To_Thing"   (sanitized, logged)
     """
+    raw = name
+    # SANITIZE metacharacters (issue #200 — sanitize, never reject; see block comment above).
+    sanitized = _NAME_QUOTE_CHARS.sub("", raw)
+    sanitized = _NAME_SEPARATOR_CHARS.sub("_", sanitized)
+    if sanitized != raw:
+        sanitized = sanitized.strip("_ ")
+        logger.warning(
+            "normalize_concept_name SANITIZED metacharacters: %r -> %r", raw, sanitized
+        )
+    name = sanitized
     # Replace hyphens with underscores first (UUIDs, session IDs)
     name = name.replace("-", "_")
     # Replace underscores with spaces for title casing
@@ -426,7 +974,16 @@ def normalize_concept_name(name: str) -> str:
     # Apply title case (capitalizes each word)
     title_cased = name_with_spaces.title()
     # Replace spaces with underscores
-    return title_cased.replace(" ", "_")
+    result = title_cased.replace(" ", "_")
+    # LENGTH CAP (issue #200): transcript-blob names must not land as nodes.
+    if len(result) > MAX_CONCEPT_NAME_LENGTH:
+        truncated = result[:MAX_CONCEPT_NAME_LENGTH].rstrip("_ ")
+        logger.warning(
+            "normalize_concept_name TRUNCATED %d-char name to %d chars: %r -> %r",
+            len(result), len(truncated), raw, truncated,
+        )
+        result = truncated
+    return result
 
 
 def run_git_command(cmd: list[str], cwd: str) -> Dict[str, str]:
@@ -612,7 +1169,14 @@ def _auto_link_core(description: str, base_path: str, current_concept: str, conc
     cache_key = int(time.time() // 300)
     if cache_key not in _automaton_cache:
         _automaton_cache.clear()  # Evict old automatons to prevent memory accumulation
-        print(f"[auto_link] Building Aho-Corasick automaton for {cache_key} concepts...", file=sys.stderr)
+        # LABEL BOTH VALUES HONESTLY. This line used to read "for {cache_key} concepts" — printing
+        # the TIME BUCKET (int(time.time() // 300), a ~5.96-million-and-climbing epoch quotient) with
+        # the word "concepts" after it. It reads as a concept count, it is not one, and it has now
+        # independently misled TWO readers into reporting a ~6M-term automaton rebuild per batch
+        # (2026-08-25: me, and a subagent, neither of whom had read line 596). The real population
+        # is len(existing_concepts); the bucket is just the rebuild-at-most-once-per-300s key.
+        print(f"[auto_link] Building Aho-Corasick automaton over {len(existing_concepts)} concepts "
+              f"(cache bucket {cache_key}, rebuilds at most once per 300s)...", file=sys.stderr)
         
         A = ahocorasick.Automaton()
         
@@ -1165,34 +1729,24 @@ def create_concept_in_neo4j(config: ConceptConfig, concept_name: str, descriptio
         }
 
         # Create relationships
-        weak_rel_types = []
         for rel_type, related_concepts in relationships.items():
-            # Classify compression type
-            compression_type = classify_compression_type(rel_type, config, is_composite=False)
-
-            # Track weak relationship types (concepts that IS_A Relationship but lack REIFIES)
-            if compression_type == "weak_compression":
-                weak_rel_types.append(rel_type)
-
             for related_concept in related_concepts:
                 # Normalize target concept name to match filesystem convention
                 normalized_target = normalize_concept_name(related_concept)
 
-                # Create forward relationship with compression_type metadata
+                # Create forward relationship
                 rel_query = f"""
                 MATCH (c1:Wiki {{n: $from_concept}})
                 MERGE (c2:Wiki {{n: $to_concept, c: $to_canonical}})
                 MERGE (c1)-[r:{rel_type.upper()}]->(c2)
                 SET r.ts = datetime($timestamp)
-                SET r.compression_type = $compression_type
                 """
 
                 rel_params = {
                     'from_concept': concept_name,
                     'to_concept': normalized_target,
                     'to_canonical': normalized_target.lower(),
-                    'timestamp': datetime.now().isoformat(),
-                    'compression_type': compression_type
+                    'timestamp': datetime.now().isoformat()
                 }
 
                 graph.execute_query(rel_query, rel_params)
@@ -1200,129 +1754,26 @@ def create_concept_in_neo4j(config: ConceptConfig, concept_name: str, descriptio
                 # Create inverse relationship if defined
                 if rel_type in relationship_inverses:
                     inverse_rel_type = relationship_inverses[rel_type]
-                    # Inverse relationship gets same compression type as forward
-                    inverse_compression_type = classify_compression_type(inverse_rel_type, config, is_composite=False)
 
                     inverse_query = f"""
                     MATCH (c1:Wiki {{n: $from_concept}})
                     MATCH (c2:Wiki {{n: $to_concept}})
                     MERGE (c2)-[r:{inverse_rel_type.upper()}]->(c1)
                     SET r.ts = datetime($timestamp)
-                    SET r.compression_type = $compression_type
                     """
 
                     inverse_params = {
                         'from_concept': concept_name,
                         'to_concept': normalized_target,
-                        'timestamp': datetime.now().isoformat(),
-                        'compression_type': inverse_compression_type
+                        'timestamp': datetime.now().isoformat()
                     }
 
                     graph.execute_query(inverse_query, inverse_params)
 
-        # Mark weak relationship type concepts with REQUIRES_EVOLUTION
-        for rel_type in weak_rel_types:
-            rel_evolution_query = """
-            MERGE (rel_concept:Wiki {n: $rel_type, c: $canonical})
-            MERGE (evolution:Wiki {n: "Requires_Evolution", c: "requires_evolution"})
-            MERGE (rel_concept)-[r:REQUIRES_EVOLUTION]->(evolution)
-            SET r.ts = datetime($timestamp)
-            SET r.reason = "Relationship type lacks REIFIES (not ontology-valid)"
-            """
-
-            rel_evolution_params = {
-                'rel_type': rel_type,
-                'canonical': rel_type.lower(),
-                'timestamp': datetime.now().isoformat()
-            }
-
-            graph.execute_query(rel_evolution_query, rel_evolution_params)
-
-        # ALSO mark the concept using weak relationships with REQUIRES_EVOLUTION
-        if weak_rel_types:
-            concept_evolution_query = """
-            MATCH (c:Wiki {n: $concept_name})
-            MERGE (evolution:Wiki {n: "Requires_Evolution", c: "requires_evolution"})
-            MERGE (c)-[r:REQUIRES_EVOLUTION]->(evolution)
-            SET r.ts = datetime($timestamp)
-            SET r.reason = $reason
-            """
-
-            concept_evolution_params = {
-                'concept_name': concept_name,
-                'timestamp': datetime.now().isoformat(),
-                'reason': f"Uses weak relationship types: {', '.join(weak_rel_types)}"
-            }
-
-            graph.execute_query(concept_evolution_query, concept_evolution_params)
-
-        # REIFIES validation and auto-promotion
-        # If concept has REIFIES relationship, validate and auto-add PROGRAMS + ontology promotion
-        if 'reifies' in relationships:
-            print(f"[REIFIES] Validating {concept_name} for ontology promotion...", file=sys.stderr)
-
-            # Query all relationships used by this concept
-            all_rels_query = """
-            MATCH (c:Wiki {n: $concept_name})-[r]->()
-            RETURN DISTINCT type(r) as rel_type
-            """
-
-            all_rels_result = graph.execute_query(all_rels_query, {'concept_name': concept_name})
-            used_rel_types = [record['rel_type'].lower() for record in all_rels_result] if all_rels_result else []
-
-            # Check if ALL relationship types used are in UARL predicates (strong compression)
-            uarl_predicates = get_uarl_predicates(config)
-            uarl_predicates_lower = {p.lower() for p in uarl_predicates}
-
-            weak_rels_used = [rt for rt in used_rel_types if rt not in uarl_predicates_lower]
-
-            if weak_rels_used:
-                print(f"[REIFIES] REJECTED: {concept_name} uses weak relationship types: {weak_rels_used}", file=sys.stderr)
-                # Concept has REIFIES but uses weak relationships - invalid origination stack
-                # Remove the REIFIES relationship
-                remove_reifies_query = """
-                MATCH (c:Wiki {n: $concept_name})-[r:REIFIES]->()
-                DELETE r
-                """
-                graph.execute_query(remove_reifies_query, {'concept_name': concept_name})
-
-            else:
-                print(f"[REIFIES] VALID: {concept_name} has strong compression - auto-promoting...", file=sys.stderr)
-
-                # All relationships are strong - origination stack valid
-                # Auto-add PROGRAMS relationship
-                programs_query = """
-                MATCH (c:Wiki {n: $concept_name})
-                MERGE (ontology_entity:Wiki {n: "Carton_Ontology_Entity", c: "carton_ontology_entity"})
-                MERGE (c)-[r:PROGRAMS]->(ontology_entity)
-                SET r.ts = datetime($timestamp)
-                """
-
-                graph.execute_query(programs_query, {
-                    'concept_name': concept_name,
-                    'timestamp': datetime.now().isoformat()
-                })
-
-                # Auto-add IS_A Carton_Ontology_Entity
-                ontology_promotion_query = """
-                MATCH (c:Wiki {n: $concept_name})
-                MATCH (ontology_entity:Wiki {n: "Carton_Ontology_Entity"})
-                MERGE (c)-[r:IS_A]->(ontology_entity)
-                SET r.ts = datetime($timestamp)
-                """
-
-                graph.execute_query(ontology_promotion_query, {
-                    'concept_name': concept_name,
-                    'timestamp': datetime.now().isoformat()
-                })
-
-                print(f"[REIFIES] {concept_name} promoted to ontology (PROGRAMS + IS_A Carton_Ontology_Entity)", file=sys.stderr)
-
         if should_close:
             graph.close()
 
-        weak_msg = f" [marked {len(weak_rel_types)} weak relationship types]" if weak_rel_types else ""
-        return f"Neo4j: Created concept '{concept_name}' with {sum(len(items) for items in relationships.values())} relationships{weak_msg}"
+        return f"Neo4j: Created concept '{concept_name}' with {sum(len(items) for items in relationships.values())} relationships"
         
     except ImportError:
         traceback.print_exc()
@@ -1903,21 +2354,9 @@ def add_observation(
     import uuid
 
     try:
-        # Get queue directory
-        queue_dir = get_observation_queue_dir()
-
-        # Generate unique filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        queue_file = queue_dir / f"{timestamp}_{unique_id}.json"
-
-        # Write observation data to file
-        with open(queue_file, 'w') as f:
-            json.dump(observation_data, f, indent=2)
-
-        print(f"[Observation Queue] Wrote {queue_file.name}", file=sys.stderr)
-
-        return f"✅ Observation queued: {queue_file.name}"
+        name = submit_queue_entry(observation_data)
+        print(f"[Observation Queue] Wrote {name}", file=sys.stderr)
+        return f"✅ Observation queued: {name}"
 
     except Exception as e:
         traceback.print_exc()
@@ -2156,6 +2595,31 @@ def _compute_d2_coverage(description: str, relationship_dict: Dict[str, List[str
     return (coverage, unmatched)
 
 
+def validate_personal_domain_value(value: Any, source: str) -> None:
+    """Enum-check ONE personal_domain value, CASE-INSENSITIVELY. Pure; raises on invalid.
+
+    CASE-INSENSITIVE IS LOAD-BEARING, NOT A CONVENIENCE. PERSONAL_DOMAINS is written in
+    lowercase ('cave'), but CartON NORMALIZES every relationship target to
+    Title_Case_With_Underscores, so the graph actually holds `Cave`/`Paiab`/`Sanctum`/`Misc`/
+    `Personal`. A caller that reads a personal_domain back out of the graph and passes it
+    straight back in is therefore handing us the Title_Case form — which a literal
+    `not in PERSONAL_DOMAINS` REJECTS even though it is the correct, already-stored value.
+    Measured 2026-08-26: 604 LEGAL values are stored Title_Case, so a case-sensitive gate here
+    would refuse every one of them (and a migration job that "corrected" them would flatten all
+    604 to misc — that exact trap was caught by an agent before it wrote, and is why this is a
+    named helper with the reasoning attached rather than an inline `in` check).
+
+    `sm_gate.py:853` already lowercases before comparing; this matches that existing pattern
+    rather than inventing a second convention for the same enum.
+    """
+    if str(value).lower() not in PERSONAL_DOMAINS:
+        raise Exception(
+            f"Invalid personal_domain '{value}' (supplied via {source}). Must be one of: "
+            f"{', '.join(PERSONAL_DOMAINS)} (case-insensitive — Title_Case is accepted, "
+            f"since that is how CartON stores it)"
+        )
+
+
 def merge_optional_domain_fields(
     relationships: List[Dict[str, Any]],
     domain: Optional[str],
@@ -2173,9 +2637,14 @@ def merge_optional_domain_fields(
     individually audited and updated, which has not been done. This function only gives
     callers the ABILITY to pass them correctly; it enforces nothing.
 
-    personal_domain, if given, IS enum-validated regardless of the others being optional —
-    the enum-check is not optional, only the field's presence is (raises Exception if
-    invalid, matching this file's existing validation-failure convention).
+    personal_domain IS enum-validated regardless of the others being optional — the
+    enum-check is not optional, only the field's presence is (raises Exception if invalid,
+    matching this file's existing validation-failure convention). BOTH DOORS ARE CHECKED:
+    the `personal_domain` param AND any `has_personal_domain` entry supplied through the raw
+    `relationships` list, because those are two ways of stating the same fact and only the
+    first was ever gated (see the comment at the check itself for the 640 illegal edges that
+    came through the second). Validation is CASE-INSENSITIVE — `Cave` is as valid as `cave`,
+    since Title_Case is the form CartON actually stores; see validate_personal_domain_value.
 
     Operates on the RELATIONSHIPS LIST (the [{"relationship":..., "related":...}, ...]
     shape), NOT relationship_dict — relationship_dict is a derived, SOMA/D2-validation-
@@ -2188,10 +2657,19 @@ def merge_optional_domain_fields(
     "related" list if it is (so a caller passing has_domain both ways does not end up with
     a duplicate target).
     """
-    if personal_domain is not None and personal_domain not in PERSONAL_DOMAINS:
-        raise Exception(
-            f"Invalid personal_domain '{personal_domain}'. Must be one of: {', '.join(PERSONAL_DOMAINS)}"
-        )
+    if personal_domain is not None:
+        validate_personal_domain_value(personal_domain, "the personal_domain param")
+    # THE HOLE THIS CLOSES (measured 2026-08-26): the check above only ever saw the
+    # personal_domain PARAM. A caller supplying the same fact through the raw `relationships`
+    # list — {"relationship": "has_personal_domain", "related": ["Frameworks"]} — walked
+    # straight past it into the merge below and onto the graph. That is how 640 illegal
+    # has_personal_domain edges across 7 non-enum values (Frameworks 606, _Unnamed 19,
+    # Discord 5, Potential_Offers 3, Starsystem 3, Gnosys 3, Testing 1) got in while the enum
+    # was "documented and enforced". A gate on one of two doors is not a gate.
+    for rel in (relationships or []):
+        if rel.get("relationship") == "has_personal_domain":
+            for pd_value in (rel.get("related") or []):
+                validate_personal_domain_value(pd_value, "the relationships list")
     merged = [{"relationship": rel["relationship"], "related": list(rel["related"])} for rel in (relationships or [])]
     by_type = {rel["relationship"]: rel for rel in merged}
     for rel_type, values in (
@@ -2233,6 +2711,9 @@ def add_concept_tool_func(
     subdomain: Optional[str] = None,
     personal_domain: Optional[str] = None,
     produces: Optional[List[str]] = None,
+    domain_about: Optional[str] = None,
+    domain_part_of: Optional[str] = None,
+    subdomain_about: Optional[str] = None,
 ) -> str:
     """
     Create a new concept with its component files.
@@ -2258,6 +2739,12 @@ def add_concept_tool_func(
             the field's presence is.
         produces: OPTIONAL, same status as domain — merged into the produces relationship
             (deduped against any produces already supplied via `relationships`).
+        domain_about: OPTIONAL. What the write's one domain that is not yet a domain node is about; that
+            domain is written first, is_a Domain with has_about, part_of domain_part_of (card 726).
+        domain_part_of: OPTIONAL. The domain node that new domain is part of.
+        subdomain_about: OPTIONAL. What the write's one subdomain that is not yet a domain node is about;
+            it is written first, is_a Domain with has_about, part_of the write's domains. A name written
+            without its about lands as said and SOMA grades it; nothing is refused.
         desc_update_mode: How to update description if concept exists
             - "append": Add new description after existing (default)
             - "prepend": Add new description before existing
@@ -2304,14 +2791,36 @@ def add_concept_tool_func(
     if not relationships or len(relationships) == 0:
         raise Exception("ERROR: There is no reason you cannot put a WIP is_a, part_of, or has_type. Relationships cannot be empty or none.")
 
-    # NODE-QUOTA gate (hosted carton boxes — carton-saas-DESIGN §4; the whole
-    # capability lives in carton_quota.py). A NO-OP unless CARTON_MAX_NODES is
-    # set (local/self-hosted default: unlimited, zero queries). At/over quota:
-    # edits to EXISTING concepts still pass; NEW nodes raise QuotaExceeded.
-    # Sits HERE — on the live path, before the queue write below — so a
-    # rejection provably never reaches the graph.
-    from carton_mcp.carton_quota import check_quota
-    check_quota(concept_name, shared_connection=shared_connection)
+    # CIRCUIT BREAKER (sancrev issue 62 — Isaac's ruling, verbatim: "The circuit
+    # breaker just has to be on add_concept it has to like actually tell them when
+    # it errors to stop calling and report this to the user. then heaven agents
+    # will use block reports."). One guarded call at this chokepoint (the
+    # carton_kv precedent; the whole capability lives in carton_breaker.py).
+    # When neo4j is unreachable this RETURNS the STOP-AND-REPORT actuator message
+    # INSTEAD of silently queueing a write that would dead-letter (the issue-61
+    # backlog mechanism); after N consecutive failures the breaker OPENs (shared
+    # state FILE across every calling process) and calls fail fast without
+    # touching the database for an exponentially growing cooldown. Healthy path:
+    # one cheap RETURN-1 probe per CARTON_BREAKER_PROBE_TTL_S window. Sits BEFORE
+    # the quota gate — quota's count query needs the same database.
+    from carton_mcp.carton_breaker import check_breaker
+    _breaker_msg = check_breaker(shared_connection=shared_connection)
+    if _breaker_msg:
+        return _breaker_msg
+
+    # THE WEBBING AGENT'S WRITE GUARD: no write onto or declaring a system type, no merged label named; the
+    # refusal returns before SOMA or the queue sees the write. The whole rule lives in webbing_write_guard.py.
+    from carton_mcp.webbing_write_guard import WEBBING_SOURCE
+    if source == WEBBING_SOURCE:
+        from carton_mcp.webbing_write_guard import is_declared_system_type, merged_labels_named, webbing_write_refusal
+        _webbing_refusal = webbing_write_refusal(source, concept_name, relationships,
+                                                 is_declared_system_type(concept_name, shared_connection),
+                                                 merged_labels_named(concept_name, relationships, shared_connection))
+        if _webbing_refusal:
+            return _webbing_refusal
+
+    # No metering here — it runs at the box's query endpoint, not in the library a
+    # tenant installs.
 
     # OPTIONAL domain/subdomain/personal_domain/produces passthrough (Isaac 2026-07-04).
     # Mirrors the add_concept MCP tool's has_domain/has_subdomain/has_personal_domain/
@@ -2323,6 +2832,20 @@ def add_concept_tool_func(
     # down (queue_data["relationships"] = relationships, the actual graph persistence —
     # merging only into relationship_dict would validate correctly but never land).
     relationships = merge_optional_domain_fields(relationships, domain, subdomain, personal_domain, produces)
+
+    # Only Health, Wealth, Social and Spiritual are is_a Hwss_Domain; any other domain is_a Domain.
+    from carton_mcp.carton_merged_labels import confine_hwss_domain
+    relationships, _hwss_confined = confine_hwss_domain(concept_name, relationships, normalize_concept_name)
+    if _hwss_confined:
+        logger.info(f"{concept_name}: is_a Hwss_Domain written as is_a Domain (only the four roots are Hwss_Domain)")
+    # A domain or subdomain the write names that is not yet a domain node is written first, from the params supplied.
+    from carton_mcp.carton_domain_axis import domain_node_reader, land_domain_axis
+    _axis_lines = land_domain_axis(
+        relationships,
+        lambda name, about, rels: add_concept_tool_func(
+            name, about, rels, shared_connection=shared_connection, source=source, hide_youknow=hide_youknow,
+            properties={"has_about": about}),
+        domain_node_reader(shared_connection), domain_about, domain_part_of, subdomain_about, normalize_concept_name)
 
     # Convert relationships list to dict for YOUKNOW
     relationship_dict = {}
@@ -2365,11 +2888,14 @@ def add_concept_tool_func(
     #    <all_core_requirements_met | failure_error(...) block>\n
     #    [soup_gaps=N\n  - <gap sentence>\n  - ...]"
     #
-    youknow_msg = ""
     soup_items = []
     _yk_healed_concepts = []  # SOMA does not heal — keep empty so healing loop no-ops
     yk_data = {}  # SOMA returns no inferred fills — keep empty so legacy block no-ops
     soma_result = ""
+    _soma_death = ""
+    _soma_concept_status = None
+    _soma_consulted = False
+    _soma_error = ""
     # PRE-GATE INIT (pre-existing bug fix, surfaced by the CB-store step-2 acceptance):
     # queue_data references _fillable_requests, but it was ONLY assigned inside the
     # `if SOMA_AVAILABLE and not hide_youknow:` block below — so hide_youknow=True (or
@@ -2387,6 +2913,7 @@ def add_concept_tool_func(
                 tv_lookup[str(pair["value"])] = str(pair["type"])
 
     if _soma_up() and not hide_youknow:
+        _soma_consulted = True
         try:
             # SOMA preferred observation shape per soma-http-event-shape rule:
             #   {source, name, description, relationships: [{relationship,
@@ -2404,6 +2931,45 @@ def add_concept_tool_func(
                     "related": related,
                 })
 
+            # PROPERTY->TRIPLE BRIDGE (Content Skyladder step-2, 2026-08-01). A vaulted
+            # type's REQUIRED `str` field (e.g. Framework.obstacle ->
+            # required_restriction(framework, has_obstacle, string_value, code)) is stored
+            # on the carton node as a scratch-lane PROPERTY (`has_obstacle: "..."`), NOT as
+            # a relationship — because the daemon MERGEs a :Wiki NODE for every relationship
+            # target regardless of type (observation_worker_daemon.py ~:498), so a `str`
+            # field cannot be a relationship without polluting the graph with a value-named
+            # node. But SOMA reads TRIPLES, not carton node properties, so such a concept
+            # grades SOUP forever and its projection/content d-chains never fire. Bridge it:
+            # feed the concept's `has_`-prefixed STRING properties to the SOMA validation
+            # payload ONLY as string_value triples (the neo4j write below is UNTOUCHED —
+            # properties stay properties, zero node pollution). This lets a GAS-certified
+            # framework climb SOUP->CODE so the content skyladder rung fires. NARROW by
+            # design: only `has_`-prefixed string properties bridge (scratch-lane keys like
+            # status/order/blessed/approved do not start with `has_`), and only when that
+            # key is not already a relationship (so a real edge is never shadowed).
+            _bridge_props = {}
+            for _bk, _bv in (properties or {}).items():
+                if (isinstance(_bk, str) and _bk.startswith("has_")
+                        and isinstance(_bv, str) and _bv and _bk not in relationship_dict):
+                    _bridge_props[_bk] = _bv
+            try:
+                from carton_mcp.carton_utils import CartOnUtils as _BridgeUtils
+                _brow = _BridgeUtils(shared_connection=shared_connection).query_wiki_graph(
+                    "MATCH (c:Wiki {n: $n}) RETURN properties(c) AS p", {"n": concept_name})
+                _bdata = (_brow.get("data") or []) if isinstance(_brow, dict) else []
+                for _bk, _bv in ((_bdata[0].get("p") if _bdata else {}) or {}).items():
+                    if (isinstance(_bk, str) and _bk.startswith("has_")
+                            and isinstance(_bv, str) and _bv
+                            and _bk not in relationship_dict and _bk not in _bridge_props):
+                        _bridge_props[_bk] = _bv
+            except Exception:
+                pass  # a properties read failure must never break the SOMA validation
+            for _bk, _bv in _bridge_props.items():
+                soma_relationships.append({
+                    "relationship": str(_bk),
+                    "related": [{"value": str(_bv), "type": "string_value"}],
+                })
+
             soma_obs = [{
                 "source": source,
                 "name": concept_name,
@@ -2413,6 +2979,9 @@ def add_concept_tool_func(
 
             soma_data = soma_validate(source=source, observations=soma_obs)
             soma_result = soma_data.get("result", "") if isinstance(soma_data, dict) else ""
+            # The DEATH block rides apart from the verdict every parser below reads, and is put
+            # back on the result this function returns; the presenters lift it to the top.
+            _soma_death, soma_result = split_soma_death_block(soma_result)
 
             # AUTHORIZATION-TYPED REQUESTS (Isaac 2026-06-28). SOMA surfaces every gap whose fill
             # authority is NOT observing_agent — those (human_domain_expert / human_architect /
@@ -2473,7 +3042,6 @@ def add_concept_tool_func(
             # Per-concept SOMA status for THIS concept (doc 27): one of
             # "soup" / "code" / "unvalidated". Authoritative — overrides the
             # is_soup-from-soup_gaps inference below when present.
-            _soma_concept_status = None
             # Compare the status= concept name UNDERSCORE-INSENSITIVELY. SOMA and
             # CartON canonicalize names DIFFERENTLY: SOMA's build_obs_list_string does
             # camelCase->snake ("TreeShell_Node" -> "tree_shell_node"), while CartON's
@@ -2495,14 +3063,9 @@ def add_concept_tool_func(
                         if nm.strip().lower().replace("_", "") == _cn_key:
                             _soma_concept_status = lvl.strip().lower()
                             break
-
-            if soup_items:
-                soup_msg = "; ".join(soup_items[:5])
-                youknow_msg = f" [SOUP: {soup_msg}]"
         except Exception as e:
             logger.warning(f"SOMA validation error: {e}\n{traceback.format_exc()}")
-            if not hide_youknow:
-                youknow_msg = f" [SOMA error: {str(e)}]"
+            _soma_error = str(e)
 
     # TYPE-2 CONTRADICTION = REJECTED COMPLETELY, EVEN BY CARTON (Isaac 2026-06-22). This
     # is the ONE case where saying is NOT free. Unlike a Type-1 undefined-is_a (saved as
@@ -2525,24 +3088,19 @@ def add_concept_tool_func(
         # P0 Rejection_Ledger: the Type-2 reject is an oracle-labeled hard negative —
         # capture it before it evaporates (this return is the ONLY record otherwise).
         record_soma_rejection(concept_name, relationships, "contradiction", _contra_reason)
-        return (
-            f"❌ {concept_name} REJECTED — geometric contradiction"
-            f"{(' (' + _contra_reason + ')') if _contra_reason else ''}. "
-            f"This claim cannot be: it would decohere the geometry even as soup, so CartON "
-            f"did NOT store it. Fix the contradicting is_a claims and re-add."
-        )
+        _critical = soma_critical_lines(soma_result)
+        return "\n".join(
+            [f"❌ {concept_name} REJECTED: geometric contradiction; CartON did not store it. {SOMA_INSTRUCTIONS_POINTER}"]
+            + ([_soma_death] if _soma_death else [])
+            + [f"CONTRADICTION: {_contra_reason or 'its is_a claims reach two disjoint branches'}. The claim would "
+               f"decohere the geometry even as soup."]
+            + ([_critical] if _critical else [])
+            + [SOMA_HELP_POINTER,
+               f"DO CONTRADICTION: remove the contradicting is_a claim, the one that reaches one of the two disjoint "
+               f"branches, then add {concept_name} again."])
 
-    # MEREO_ERROR = a SOMA FILL SIGNAL, never a CartON rejection (Isaac 2026-06-22).
-    # CartON is a SOUP store of EVERYTHING that gets mentioned. A mereo_error means the
-    # thing is not yet mereo-DEFINED in SOMA (you mentioned something whose is_a /
-    # referenced type has not been given its [is_a],[part_of],[produces],[instantiates]).
-    # That is a thing the LLM must FILL — NOT grounds for refusing to store the node.
-    # Rejecting-because-undefined is the ordinary must-declare-your-contents program we
-    # are explicitly NOT building. So CartON SAVES the node (a valid soup entry) and
-    # RELAYS SOMA's fill instruction; the save falls through to the queue write below.
-    # (SOMA's OWN quadstore still mirrors code-or-higher only — that is correct and
-    # separate; CartON, the soup store, keeps everything said. Once you add the four
-    # lists the thing becomes defined in SOMA and is admissible wherever mentioned.)
+    # MEREO_ERROR: the concept is not validly the type it claims, its execution failed; CartON
+    # stores the write so it can be seen, and SOMA does not admit it (Isaac 2026-09-29).
     if locals().get("_soma_concept_status") == "mereo_error":
         _mereo_reason = ""
         if "mereo_errors=" in soma_result:
@@ -2556,21 +3114,12 @@ def add_concept_tool_func(
                     if stripped.startswith("- ") and concept_name.lower() in stripped.lower():
                         _mereo_reason = stripped[2:].strip()
                         break
-                    elif stripped.startswith(("soup_gaps=", "info=", "status=",
+                    elif stripped.startswith(("soup_gaps=", "info=", "status=", SOMA_ISA_FILLS_HEADER,
                                               "release_effects=", "deduction_chains_fired=")):
                         break
-        logger.info(f"MEREO (saved as soup; fill needed): {concept_name}: {_mereo_reason}")
-        # P0 Rejection_Ledger: the mereo_error verdict is an oracle-labeled hard negative
-        # (SOMA judged this claim-structure not-yet-admissible) even though carton SAVES the
-        # node as soup — the verdict itself was dropped before this patch.
+        logger.info(f"MEREO: {concept_name} is {_SOMA_FAILED}; CartON keeps the write so it can be seen; "
+                    f"{_SOMA_IF_MEANT} it is inside the meaning the writer meant: {_mereo_reason}")
         record_soma_rejection(concept_name, relationships, "mereo_error", _mereo_reason)
-        youknow_msg = (
-            f" [MEREO — saved as soup. SOMA needs this mereo-defined: provide "
-            f"[is_a],[part_of],[produces],[instantiates] for the undefined type"
-            f"{(' (' + _mereo_reason + ')') if _mereo_reason else ''} so SOMA can admit it. "
-            f"CartON has stored it; mention stays valid.]"
-        )
-        # fall through to the queue write — CartON saves it.
 
     # HAS_VALIDATOR: check parent template requirements before queuing
     # If any part_of parent has REQUIRES_RELATIONSHIP entries, child must have those rel types
@@ -2602,7 +3151,7 @@ def add_concept_tool_func(
     # D2 (Isaac 2026-07-03): D2 NEVER touches, truncates, or rejects the caller's
     # description — it is stored VERBATIM, always, no matter what D2 finds. D2's
     # only job is to run a read-only coverage check AFTER the fact and surface an
-    # INFORMATIONAL [D2: ...] tag in the response (see the youknow_msg append near
+    # INFORMATIONAL D2 line in the result (built with the other result lines near
     # the return) — a warning, never a gate. This replaces a prior version of this
     # comment that claimed the rollup REPLACED the stored description (it never
     # did; _caller_raw_description below has always been the verbatim string that
@@ -2610,11 +3159,8 @@ def add_concept_tool_func(
     _caller_raw_description = description or ""
     _d2_coverage, _d2_unmatched = _compute_d2_coverage(_caller_raw_description, relationship_dict)
 
-    # Write to queue for async processing by daemon
-    queue_dir = get_observation_queue_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    unique_id = str(uuid.uuid4())[:8]
-    queue_file = queue_dir / f"{timestamp}_{unique_id}_concept.json"
+    # The queue write happens below, via submit_queue_entry — which posts to the box
+    # when this process is a client rather than the owner.
 
     # Parse THREE-LEVEL status from SOMA result.
     #
@@ -2786,39 +3332,13 @@ def add_concept_tool_func(
     # SOMA call failed). The old inference labels CODE concepts as SOUP when
     # they have optional_code_arg missing_slots, because compose_all_gap_sentences
     # dumped those under soup_gaps=. With status= the answer is authoritative.
-    if locals().get("_soma_concept_status") is not None:
-        _status = _soma_concept_status
-        if _status == "soup":
-            _is_soup, _is_code, _is_system_type = True, False, False
-        elif _status == "mereo_error":
-            # Not yet mereo-defined in SOMA → CartON keeps it as a SOUP entry (a thing
-            # to fill), never rejected. The youknow_msg relay (above) carries the fill.
-            _is_soup, _is_code, _is_system_type = True, False, False
-        elif _status in ("code", "ont"):
-            # Code-stage args complete. Whether it's still CODE vs SYSTEM_TYPE
-            # depends on d-chains. SYSTEM_TYPE requires zero unmet d-chains.
-            # ONT (strong compression, full core sentence + closed targets +
-            # Cat gate) is a STRICT superset of code, so it maps the same way
-            # for backward compat — never SOUP. (The richer ont vs code/
-            # system_type distinction can surface separately later.)
-            if _unmet_count == 0:
-                _is_soup, _is_code, _is_system_type = False, False, True
-            else:
-                _is_soup, _is_code, _is_system_type = False, True, False
-        else:
-            # unvalidated / unknown — preserve legacy inference as fallback.
-            _is_soup = _has_soup
-            _is_code = (not _has_soup) and _all_core_met and (_unmet_count > 0)
-            _is_system_type = (not _has_soup) and _all_core_met and (_unmet_count == 0)
-    else:
-        _is_soup = _has_soup
-        _is_code = (not _has_soup) and _all_core_met and (_unmet_count > 0)
-        _is_system_type = (not _has_soup) and _all_core_met and (_unmet_count == 0)
+    _is_soup, _is_code, _is_system_type = soma_grade_flags(_soma_concept_status, _unmet_count, _has_soup, _all_core_met)
 
-    if _is_system_type:
-        youknow_msg = " [SYSTEM_TYPE: all d-chains satisfied]"
-    elif _is_code:
-        youknow_msg = f" [CODE: {_unmet_count} d-chain(s) pending]"
+    # The SOMA line, SOMA's numbered information lines, and the DO line for each.
+    _grade = (soma_grade_line(_soma_concept_status, _unmet_count, (_is_soup, _is_code, _is_system_type), _soma_error)
+              if _soma_consulted else "")
+    _soma_info, _do_lines = (soma_result_lines(soma_result, concept_name, _soma_concept_status)
+                             if _soma_consulted else ([], []))
 
     # SOMA does not currently emit a projection target (gen_target) — projection
     # is a d-chain, not a SOMA response field. Leave gen_target=None for now;
@@ -2931,8 +3451,7 @@ def add_concept_tool_func(
         "properties": _merged_properties,
     }
 
-    with open(queue_file, 'w') as f:
-        json.dump(queue_data, f, indent=2)
+    queue_filename = submit_queue_entry(queue_data, "_concept")
 
     # Prolog fact injection happens INSIDE PrologRuntime.validate() — not here.
     # CartON does not manipulate Prolog directly. Prolog is the outer runtime.
@@ -2976,33 +3495,33 @@ def add_concept_tool_func(
         # except Exception as e:
             # logger.warning(f"[ONTOLOGY] OWL self-healing failed for {concept_name}: {e}")
 
-    # D2 tag (Isaac 2026-07-03): informational only, never a gate — the description
-    # above was already queued verbatim regardless of this coverage result.
+    # The first line says what was written and that the DO lines at the end are the instructions; the DEATH block
+    # follows it; the information is in the middle; the SOMA help line and the DO lines close the result.
+    _lines = [f"✅ {concept_name}: CartON Files queued, Neo4j queued. {SOMA_INSTRUCTIONS_POINTER}"]
+    if _soma_death:
+        _lines.append(_soma_death)
+    if _grade:
+        _lines.append(_grade)
+    _lines += _soma_info + _axis_lines
+    # D2 never gates the write: it says how many declared relationships the description names.
     if _d2_coverage is not None:
-        if _d2_unmatched:
-            _unmatched_preview = ", ".join(f'"{u}"' for u in _d2_unmatched[:5])
-            youknow_msg += (
-                f" [D2: {_d2_coverage}% of declared relationships traced in the "
-                f"description; not mentioned: {_unmatched_preview}]"
-            )
-        else:
-            youknow_msg += f" [D2: {_d2_coverage}% — every declared relationship is traced in the description]"
+        _lines.append(f"D2: {_d2_coverage}% of the declared relationships are traced in the description; not "
+                      f"mentioned: {', '.join(dict.fromkeys(_d2_unmatched))}." if _d2_unmatched else
+                      f"D2: {_d2_coverage}%, every declared relationship is traced in the description.")
 
-    # CB tag (Isaac 2026-07-03): CARTON_CB_STORE places EVERY concept on the plane by
-    # default (line ~51) but the coordinate was previously only surfaced when the
-    # caller passed cb_guidance=True — so every add_concept silently placed a point
-    # and never said so. Always surface the coordinate/region; cb_guidance still
-    # gates the larger four-layer PROMPTER block below (a bigger, opt-in payload).
+    # CARTON_CB_STORE places every concept on the Crystal Ball plane: the region and coordinate are always shown,
+    # the larger PROMPTER block only when cb_guidance asks for it.
     _cb_coord = _cb_props.get("cb_encoded")
     if _cb_coord:
-        youknow_msg += f" [CB: region={soma_region} coord={_cb_coord}]"
-
-    # Concise output - always include youknow_msg (has SOUP and errors). When
-    # cb_guidance was requested and CB returned its four-layer PROMPTER block,
-    # fold it in (the CB FLOW/GRIESS/MINESPACE/SOMA guidance for this concept).
+        _lines.append(f"CB: region={soma_region} coord={_cb_coord}.")
     if _cb_guidance_block:
-        youknow_msg += f"\n\n{_cb_guidance_block}"
-    return f"✅ {concept_name}{youknow_msg}"
+        _lines.append(f"\n{_cb_guidance_block}")
+    _critical = soma_critical_lines(soma_result)
+    if _critical:
+        _lines.append(_critical)
+    if _soma_consulted:
+        _lines.append(SOMA_HELP_POINTER)
+    return "\n".join(_lines + _do_lines)
 
 
 # # Dead code removed - daemon handles: auto-linking, file writes, Neo4j writes

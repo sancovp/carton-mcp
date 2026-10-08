@@ -18,7 +18,17 @@ deferred). Proves:
   (5) FAILS SOFT: an unknown actor + empty injected ghost still returns a non-empty prompt (default markers),
       never raising.
 
-Self-cleaning ('Zztest_Gsp_' prefix + derived Sm_Chain_/Sm_/Step_/Execution_State names). Run:
+⚠ THIS RUNS AGAINST WHATEVER `NEO4J_URI` NAMES, AND ITS DEFAULT IS PRODUCTION —
+`bolt://host.docker.internal:7687` is the identical default the live daemon uses
+(observation_worker_daemon.py:1302). Run bare, it writes to the real graph. Deliberate (live-graph
+E2E), which is why everything it creates must be cleanable.
+
+Self-cleaning ('Zztest_Gsp_' prefix + derived Sm_Chain_/Sm_/Step_/Execution_State names). That is
+TRUE ONLY BECAUSE the type node below is bound rather than inlined: until 2026-08-22 the LEGACY_SM
+write inlined its `:Wiki` target and minted a fresh `State_Machine` node per run, which carries no
+`Zztest_Gsp_` prefix and so was invisible to `_cleanup` — it leaked permanently. Keep it bound.
+
+Run:
   NEO4J_URI=... NEO4J_USER=... NEO4J_PASSWORD=... python3 tests/test_generate_system_prompt_e2e.py
 """
 import os
@@ -72,7 +82,16 @@ def main():
     # (no Core) that must be excluded from the globally-available listing.
     run("MERGE (a:Wiki {n:$n})", {"n": ACTOR})
     run("MERGE (s:Wiki {n:$n}) SET s.d='a test skill', s.has_when='when you need the Gsp test thing'", {"n": SKILL})
-    run(f"MERGE (m:Wiki {{n:$n}}) MERGE (m)-[:IS_A]->(:Wiki {{n:'{sm_gate.T_STATE_MACHINE}'}})", {"n": LEGACY_SM})
+    # THE TYPE NODE IS BOUND, NEVER INLINE. An anonymous inline `:Wiki {n:'X'}` as the TARGET of a
+    # relationship MERGE matches the WHOLE PATH, so for a new source it creates the entire pattern
+    # INCLUDING A FRESH TYPE NODE — one leaked State_Machine copy per run, invisible to `_cleanup`
+    # because it carries no `Zztest_Gsp_` prefix. MERGEing the type in the loop above does not save
+    # you; the inline form never looks at it. `WITH ... LIMIT 1` collapses the match because the
+    # name is still shattered (Merge_Amplification_On_Shattered_Graph).
+    # See .claude/rules/wiki-type-shattering-repair.md.
+    run(f"MERGE (t_sm:Wiki {{n:'{sm_gate.T_STATE_MACHINE}'}}) "
+        f"WITH t_sm LIMIT 1 "
+        f"MERGE (m:Wiki {{n:$n}}) MERGE (m)-[:IS_A]->(t_sm)", {"n": LEGACY_SM})
 
     results = {}
     try:

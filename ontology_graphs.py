@@ -66,8 +66,17 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize(name: str) -> str:
-    """Normalize concept name to Title_Case_With_Underscores (matches CartON storage)."""
-    return name.replace("-", "_").replace("_", " ").title().replace(" ", "_")
+    """Normalize a concept name — DELEGATES to the canonical normalizer.
+
+    This used to re-implement add_concept_tool.normalize_concept_name's body verbatim, which
+    is the DRY failure that matters most here: the copy said "matches CartON storage" while
+    being free to drift from the thing it claimed to match. A name that normalizes two ways
+    is TWO NODES, so the storage-name rule must have exactly one implementation.
+    (Import is function-local: this module is imported by the daemon at paths where a
+    module-level import of add_concept_tool would pull the heavy write stack in eagerly.)
+    """
+    from carton_mcp.add_concept_tool import normalize_concept_name
+    return normalize_concept_name(name)
 
 
 def _concept_exists(concept_name: str, shared_connection) -> bool:
@@ -266,7 +275,7 @@ def get_expanded_metagraph(
             MATCH (proj:Wiki {n: $proj})-[:HAS_PART|HAS_FEATURE]->(f:Wiki)
             WHERE f.n STARTS WITH 'Giint_Feature_' OR f.n STARTS WITH 'GIINT_Feature_'
                OR (f)-[:IS_A]->(:Wiki {n: 'Giint_Feature'})
-            RETURN DISTINCT f.n as feature ORDER BY f.n
+            RETURN DISTINCT f.n as feature ORDER BY feature
             """
             feat_result = graph.execute_query(feat_q, {"proj": project_name})
 
@@ -280,7 +289,7 @@ def get_expanded_metagraph(
                     MATCH (f:Wiki {n: $feat})-[:HAS_PART|HAS_COMPONENT]->(c:Wiki)
                     WHERE c.n STARTS WITH 'Giint_Component_' OR c.n STARTS WITH 'GIINT_Component_'
                        OR (c)-[:IS_A]->(:Wiki {n: 'Giint_Component'})
-                    RETURN DISTINCT c.n as component ORDER BY c.n
+                    RETURN DISTINCT c.n as component ORDER BY component
                     """
                     comp_result = graph.execute_query(comp_q, {"feat": feat_name})
 
@@ -294,7 +303,7 @@ def get_expanded_metagraph(
                             MATCH (c:Wiki {n: $comp})-[:HAS_PART|HAS_DELIVERABLE]->(d:Wiki)
                             WHERE d.n STARTS WITH 'Giint_Deliverable_' OR d.n STARTS WITH 'GIINT_Deliverable_'
                                OR (d)-[:IS_A]->(:Wiki {n: 'Giint_Deliverable'})
-                            RETURN DISTINCT d.n as deliverable ORDER BY d.n
+                            RETURN DISTINCT d.n as deliverable ORDER BY deliverable
                             """
                             del_result = graph.execute_query(del_q, {"comp": comp_name})
 
@@ -308,7 +317,7 @@ def get_expanded_metagraph(
                                     MATCH (d:Wiki {n: $del})-[:HAS_PART|HAS_TASK]->(t:Wiki)
                                     WHERE t.n STARTS WITH 'Giint_Task_' OR t.n STARTS WITH 'GIINT_Task_'
                                        OR (t)-[:IS_A]->(:Wiki {n: 'Giint_Task'})
-                                    RETURN DISTINCT t.n as task ORDER BY t.n
+                                    RETURN DISTINCT t.n as task ORDER BY task
                                     """
                                     task_result = graph.execute_query(task_q, {"del": del_name})
 

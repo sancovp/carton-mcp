@@ -12,6 +12,7 @@ dependencies = [
     # conflicts with one of them. stdio works on 2.9; NETWORK mode
     # (CARTON_TRANSPORT=http) needs >=2.11 for the static-token verifier —
     # network_gateway raises an actionable error below that. Box images pin exact.
+    "answer-refs>=0.1.0",
     "fastmcp>=2.9.0,<3",
     "pydantic==2.10.6",
     "heaven-framework>=0.1.14",

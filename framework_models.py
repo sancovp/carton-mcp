@@ -38,7 +38,7 @@ Merged document shape sources (the conversation-ingestion legacy, Jan 2025):
 - FRAMEWORK_ORGANIZATION_METHODOLOGY.md Layer x State x Type x Phase hierarchy
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -143,10 +143,39 @@ class FrameworkCandidate(BaseModel):
 
 
 class Conversation(BaseModel):
-    """A conversation container node (HS: Conversation_{id})."""
+    """A conversation container node (HS: Conversation_{id}).
+
+    MEREOLOGY ADDED 2026-08-24 (Isaac). Until now this model was name + summary — a LABEL, not a
+    container. vault() therefore derived exactly one restriction (conversation_arg_name), so SOMA
+    had no basis to demand, check, or fire on a conversation HAVING anything. The data was webbed
+    correctly by carton_precompact the whole time; the TYPE simply never said so, which is why the
+    webbing was unenforced and why nothing could search it.
+
+    All parts below are OPTIONAL, and that is Isaac's ruling verbatim, not a hedge: journal entries
+    "are OPTIONAL part of conversations when they occur as tool calls" — a conversation containing
+    zero journal calls is perfectly valid. Optional fields become dchain-stage (non-blocking)
+    restrictions, so adding them is purely additive: it cannot push any of the 1,192 existing
+    conversations into soup, while still giving the d-chains something real to reason over.
+
+    journal_entries is the COARSE half of the journal join (membership: the conversation activates
+    WITH its journal). The EXACT half is ToolCall.produces in carton_mcp.timeline_models — the entry
+    positioned at the precise tool call that wrote it.
+    """
 
     name: str
     summary: Optional[str] = None
+    session_id: Optional[str] = None
+    iterations: Optional[List[str]] = None
+    journal_entries: Optional[List[str]] = None
+    # THE HIERARCHICAL SUMMARY LAYER (added 2026-08-24, Isaac). The summarizer produces these
+    # PER CONVERSATION -- L1 iteration summaries, L2 phases, L3 subphases, L5 executive -- and
+    # they are what get_history_info exposes and what a rehydration actually reads for the
+    # chronological trajectory. A Conversation that does not declare them is missing the part
+    # of itself that is most worth pulling.
+    iteration_summaries: Optional[List[str]] = None
+    phases: Optional[List[str]] = None
+    subphases: Optional[List[str]] = None
+    executive_summary: Optional[str] = None
 
 
 class ConversationPhase(BaseModel):

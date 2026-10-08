@@ -11,25 +11,65 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _normalize_name(name):
+    """Issue #201: the shared-layer name normalizer (lazy import — this module and
+    add_concept_tool import each other function-locally by established pattern).
+
+    WHY THIS EXISTS HERE: add_concept NORMALIZES every concept name and relationship
+    target (normalize_concept_name), while this module's write-path matchers matched
+    EXACTLY — so an edit cycle (remove exact old edge + add normalized new edge) could
+    split one concept into a hyphen/underscore/case twin pair. The LIVE divergence
+    mechanism of issue #201. Write-path matchers in this module now resolve names
+    EXACT-FIRST (the name the caller literally gave always wins, per the CRUD law
+    "delete must resolve its target exactly"), then FALL BACK to the normalized form
+    (aligning with add_concept) when the exact name matches nothing.
+
+    The read-only members of the {n:$...} exact-match family deliberately stay exact —
+    a read on a wrong name returns empty, which is honest. Sweep record (2026-08-28):
+      WRITE, normalized here:  set_concept_properties · remove_concept_relationship
+      WRITE, left exact + flagged: edit_carton_obj (fails LOUD "not found" — no silent
+        divergence) and register_kv_schemas (MATCH-gated, never stubs) — both are
+        edit-carton-kv-capability members with their own coherence edit-set (dev-flow);
+        normalizing them belongs to that flow, not this pass.
+      READ, stay exact: check_kv_refs · validate_carton_obj · expand_carton_refs ·
+        query_concepts_by_properties · every CartOnUtils read facade.
+    """
+    from .add_concept_tool import normalize_concept_name
+    return normalize_concept_name(name)
+
+
+# The labels the carton read facade accepts in a query (CartOnUtils._validate_query_safety). ONE neo4j
+# holds CartON (:Wiki) and the context-alignment code graph (:File :Function :Class :Method :Attribute
+# :Repository — measured with db.labels() 2026-09-06, issue 483), so a read that joins code to concepts
+# is one query through this facade and arrives stripped like every other read; a query naming none of
+# these labels is refused before it runs. Every doc-mirror reader goes through the facade, and the
+# webbing gate's cited-path check reads the code graph, which is why the code labels are here.
+READ_LABELS = (":Wiki", ":File", ":Function", ":Class", ":Method", ":Attribute", ":Repository")
+
+_CARTON_LINK = re.compile(r'\[([^\[\]]+)\]\(\.\./([^/\n]+?)/\2_itself\.md\)')   # the name may hold ()
+
+
 def strip_wiki_links(text):
     """CANONICAL CartON wiki-link stripper (onion: lives in the LIBRARY so EVERY caller — MCP tools,
     Python imports, skills, CLIs — gets clean output; the single source of truth). CartON's auto-linker
     rewrites concept mentions in descriptions into `[word](../Word/Word_itself.md)` and stores them RAW
-    in n.d; these must NEVER render. Converts complete links to their text and removes orphan/TRUNCATED
-    `_itself.md` artifacts (truncation happens when a Cypher does substring(d,0,N), cutting a link with
-    no closing `)` — handled here so it can never leak)."""
+    in n.d; these must NEVER render. Converts the linker's own shape to its words whatever the name
+    holds (`[doc(m)](../Doc(M)/Doc(M)_itself.md)` -> `doc(m)`), then any other complete link to its text,
+    and removes orphan/TRUNCATED `_itself.md` targets with the space before each (truncation happens when
+    a Cypher does substring(d,0,N), cutting a link with no closing `)`). Every other character is
+    returned as stored: `vault()` keeps its parentheses and a run of spaces stays a run (card 812)."""
     if not isinstance(text, str):
         return text
     prev = None
     while prev != text:                                            # complete link -> its text (nested-safe)
         prev = text
+        text = _CARTON_LINK.sub(r'\1', text)
         text = re.sub(r'\[([^\[\]]+)\]\([^)]+\)', r'\1', text)
-    text = re.sub(r'\[([^\[\]]+)\]\(\.{0,2}/[^)]*$', r'\1', text)   # truncated/dangling link at end -> text
-    text = re.sub(r'\([^)]*_itself\.md\)', '', text)               # orphan complete _itself.md target
-    text = re.sub(r'\(\.{0,2}/[^)]*$', '', text)                   # truncated orphan target at end
-    text = re.sub(r'[^\s()\[\]]*_itself\.md\)?', '', text)         # any residual _itself.md fragment
-    text = re.sub(r'\(\s*\)', '', text)                            # leftover empty parens
-    text = re.sub(r'  +', ' ', text)
+    text = re.sub(r'\[([^\[\]]+)\]\(\.{0,2}/?[^)]*$', r'\1', text)  # truncated/dangling link at end -> text
+    # (the slash is optional: a substring cut can land INSIDE the target, `[Name](..` — issue 483)
+    text = re.sub(r' ?\(\s*[^()]*_itself\.md\s*\)', '', text)       # orphan complete _itself.md target
+    text = re.sub(r' ?\(\.{0,2}/[^)]*$', '', text)                  # truncated orphan target at end
+    text = re.sub(r' ?[^\s()\[\]]*_itself\.md\)?', '', text)       # any residual _itself.md fragment
     return text
 
 
@@ -43,6 +83,36 @@ def deep_strip_wiki_links(obj):
     if isinstance(obj, dict):
         return {k: deep_strip_wiki_links(v) for k, v in obj.items()}
     return obj
+
+
+VERBATIM_TYPES = ("Desc_Content",)
+
+
+def linker_eligible(alias="c"):
+    """The predicate the auto-linker selects nodes by (card 813).
+
+    Args:
+        alias: The Cypher variable naming the node.
+
+    Returns:
+        str: A WHERE predicate over the parameters $cutoff and $verbatim_types: the node is unlinked,
+            untouched since $cutoff or never stamped, and is_a none of $verbatim_types."""
+    return (f"({alias}.linked = false OR {alias}.linked IS NULL) "
+            f"AND ({alias}.last_modified IS NULL OR {alias}.last_modified < datetime($cutoff)) "
+            f"AND NOT EXISTS {{ MATCH ({alias})-[:IS_A]->(vt:Wiki) WHERE vt.n IN $verbatim_types }}")
+
+
+def verbatim_text(text, linked):
+    """The text a content node was written with (card 813).
+
+    Args:
+        text: The node's description as stored.
+        linked: The node's linked property.
+
+    Returns:
+        str: The stored text, or its words when linked is true, because the auto-linker rewrote the
+            node before it skipped the verbatim types."""
+    return strip_wiki_links(text) if linked else text
 
 
 def edit_carton_obj(concept_name, kvobj_name, key_path, op, value=None, shared_connection=None):
@@ -143,11 +213,8 @@ def edit_carton_obj(concept_name, kvobj_name, key_path, op, value=None, shared_c
         "removed_fences": removed_fences,
         "timestamp": _dt.now().isoformat(),
     }
-    queue_dir = get_observation_queue_dir()
-    fname = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{str(_uuid.uuid4())[:8]}_concept.json"
-    qpath = queue_dir / fname
-    with open(qpath, "w") as f:
-        _json.dump(queue_entry, f, indent=2)
+    from .add_concept_tool import submit_queue_entry
+    fname = submit_queue_entry(queue_entry, "_concept")
 
     return {"success": True, "op": op, "concept": concept_name, "kvobj": kvobj_name,
             "key_path": key_path, "value": result_value, "queued": fname}
@@ -341,6 +408,15 @@ def _scratch_property_classes():
 # Module-level alias for the default set (so importers can see the doctrine's defaults).
 SCRATCH_PROPERTY_CLASSES = _DEFAULT_SCRATCH_PROPERTY_CLASSES
 
+# The ONE switch for the property trail's SOMA POST: off while Gnosys_System.soma_validator is
+# off (Isaac 2026-10-01 disabled SOMA in carton); its restore step is recorded on that node.
+PROPERTY_TRAIL_TO_SOMA = False
+
+
+def soma_trail_on():
+    """Whether a property write may POST its trail to SOMA, read at call time."""
+    return bool(PROPERTY_TRAIL_TO_SOMA)
+
 
 def _soma_property_value_type(value):
     """Pick the SOMA programming-type string for a property value's python type.
@@ -363,6 +439,7 @@ def _emit_property_trail(concept_name, changed_props, connection):
     observation recording the changed properties, and try to POST it.
 
     Returns a STATUS STRING (not a bare bool, so the caller can build a correct report line):
+      - "soma-off"         : the trail switch is off (soma_trail_on) → no query, no POST.
       - "scratch-lane"     : node has NO is_a types, OR any is_a type is in the scratch set
                              → no trail emitted (this is the scratch lane).
       - "emitted"          : the SOMA POST got a real HTTP response (any 2xx).
@@ -376,6 +453,9 @@ def _emit_property_trail(concept_name, changed_props, connection):
     """
     import json as _json
     import urllib.request as _urllib_request
+
+    if not soma_trail_on():
+        return "soma-off"
 
     # 1) Query the node's is_a types (same connection/driver the rest of the file uses).
     try:
@@ -489,9 +569,24 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
     refused = [k for k in properties if k in RESERVED_PROPERTY_KEYS]
     candidates = {k: v for k, v in properties.items() if k not in RESERVED_PROPERTY_KEYS}
 
-    # Concept must EXIST (MATCH, never create).
+    # Concept must EXIST (MATCH, never create). Issue #201: resolve the name
+    # EXACT-FIRST (the literal name always wins), then fall back to the
+    # normalized form — aligning this write-path matcher with add_concept's
+    # normalization so the same name string addresses the same node on both
+    # the add and property surfaces (see _normalize_name's docstring).
+    resolved_name = concept_name
     exists = graph.execute_query(
         "MATCH (c:Wiki {n: $n}) RETURN c.n AS n LIMIT 1", {"n": concept_name})
+    if not exists:
+        _norm = _normalize_name(concept_name)
+        if _norm != concept_name:
+            exists = graph.execute_query(
+                "MATCH (c:Wiki {n: $n}) RETURN c.n AS n LIMIT 1", {"n": _norm})
+            if exists:
+                resolved_name = _norm
+                logger.info(
+                    "set_concept_properties resolved %r via normalization -> %r",
+                    concept_name, _norm)
     if not exists:
         return {"success": False, "concept": concept_name,
                 "updated_keys": [], "refused_keys": refused, "removed_keys": [],
@@ -500,14 +595,15 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
     if mode == "remove":
         removed = list(candidates.keys())
         if not removed:
-            return {"success": True, "concept": concept_name, "updated_keys": [],
+            return {"success": True, "concept": resolved_name, "updated_keys": [],
                     "refused_keys": refused, "removed_keys": [],
                     "error": None if not refused else "only reserved keys given; nothing removed"}
-        # REMOVE c.`key` clauses — keys are backtick-quoted (never user-interpolated as values).
-        remove_clauses = ", ".join(f"c.`{k}`" for k in removed)
-        graph.execute_query(
-            f"MATCH (c:Wiki {{n: $n}}) REMOVE {remove_clauses}", {"n": concept_name})
-        return {"success": True, "concept": concept_name, "updated_keys": [],
+        # Asked of the connection rather than spelled as Cypher here: a property key is an
+        # arbitrary user string standing where Cypher wants an IDENTIFIER, and that is the one
+        # carton shape a schema-full backend cannot take verbatim. The neo4j backend issues the
+        # same backtick-quoted REMOVE this line used to. Addressed at resolved_name (#201).
+        graph.remove_properties(resolved_name, removed)
+        return {"success": True, "concept": resolved_name, "updated_keys": [],
                 "refused_keys": refused, "removed_keys": removed, "error": None}
 
     # mode == "merge": validate value types BEFORE writing (refuse the whole call on a bad value).
@@ -518,13 +614,15 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
                     "refused_keys": refused, "removed_keys": [], "error": err}
 
     if not candidates:
-        return {"success": True, "concept": concept_name, "updated_keys": [],
+        return {"success": True, "concept": resolved_name, "updated_keys": [],
                 "refused_keys": refused, "removed_keys": [],
                 "error": None if not refused else "only reserved keys given; nothing set"}
 
-    # SET c += $props — parameterized map, no value interpolation.
-    graph.execute_query(
-        "MATCH (c:Wiki {n: $n}) SET c += $props", {"n": concept_name, "props": candidates})
+    # Asked of the connection (the neo4j backend issues the same parameterized `SET c += $props`).
+    # On a schema-full backend the scratch-lane keys have no columns and land in the overflow
+    # blob instead — which is exactly why this is the connection's business and not a Cypher
+    # string written here. Addressed at resolved_name (#201).
+    graph.set_properties(resolved_name, candidates)
 
     # ADDITIVE: emit a thin SOMA observation trail for ontology-bearing nodes (Option-4
     # hybrid). The direct write above ALREADY succeeded; the trail is best-effort and is
@@ -532,12 +630,12 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
     # property write). Trail status is reported but does not change updated_keys/success.
     trail_status = "scratch-lane"
     try:
-        trail_status = _emit_property_trail(concept_name, candidates, graph)
+        trail_status = _emit_property_trail(resolved_name, candidates, graph)
     except Exception as e:  # belt-and-suspenders: the trail can never kill the main path
-        logger.warning(f"property-trail: unexpected error for {concept_name!r}: {e}")
+        logger.warning(f"property-trail: unexpected error for {resolved_name!r}: {e}")
         trail_status = "soma-unreachable"
 
-    return {"success": True, "concept": concept_name,
+    return {"success": True, "concept": resolved_name,
             "updated_keys": list(candidates.keys()),
             "refused_keys": refused, "removed_keys": [], "error": None,
             "trail": trail_status}
@@ -571,14 +669,12 @@ def query_concepts_by_properties(where, limit=25, shared_connection=None):
     if lim <= 0:
         lim = 25
 
-    # Property keys are backtick-quoted identifiers; values are $params (never interpolated).
-    where_clauses = " AND ".join(f"c.`{k}` = $w_{i}" for i, k in enumerate(where))
-    params = {f"w_{i}": v for i, (k, v) in enumerate(where.items())}
-    params["lim"] = lim
-    return_props = ", ".join(f"c.`{k}` AS `{k}`" for k in where)
-    cypher = (f"MATCH (c:Wiki) WHERE {where_clauses} "
-              f"RETURN c.n AS n, {return_props} LIMIT $lim")
-    rows = graph.execute_query(cypher, params)
+    # Asked of the connection. On neo4j this is the same backtick-quoted, fully parameterized
+    # WHERE/RETURN this function used to build. On a schema-full backend the scratch-lane keys
+    # have no columns to filter on, so that half is matched against the overflow blob instead —
+    # a real difference in cost, documented at the backend rather than hidden behind a shared
+    # Cypher string that only happens to work on one engine.
+    rows = graph.find_by_properties(where, lim)
     results = [dict(r) for r in (rows or [])]
     return {"success": True, "results": results, "error": None}
 
@@ -591,7 +687,18 @@ def remove_concept_relationship(source, rel_type, target, shared_connection=None
     relationship type (rel types CANNOT be parameters, so the name is strictly sanitized).
     source/target are passed as $params.
 
-    Returns {success, source, rel_type, target, deleted_count, error}.
+    Issue #201 (the LIVE divergence mechanism): add_concept NORMALIZES every name
+    (normalize_concept_name) while this matcher matched EXACTLY, so an edit cycle
+    (remove old edge + re-add) addressed DIFFERENT nodes and split one concept into
+    a hyphen/underscore/case twin pair. Matching is now EXACT-FIRST (the literal
+    names always win — delete resolves its target exactly), and when the exact pair
+    deletes nothing AND the normalized pair differs, the delete is retried with the
+    normalized source/target — the same node add_concept would have addressed.
+    The result reports matched_via ("exact" | "normalized") and, when normalized,
+    the normalized_source/normalized_target actually used.
+
+    Returns {success, source, rel_type, target, deleted_count, matched_via, error,
+    [normalized_source, normalized_target]}.
     """
     from .add_concept_tool import _get_module_connection
 
@@ -609,8 +716,97 @@ def remove_concept_relationship(source, rel_type, target, shared_connection=None
               f"DELETE r RETURN count(r) AS deleted")
     rows = graph.execute_query(cypher, {"s": source, "t": target})
     deleted = (rows[0]["deleted"] if rows and "deleted" in rows[0] else 0)
-    return {"success": True, "source": source, "rel_type": rel_type, "target": target,
-            "deleted_count": deleted, "error": None}
+    result = {"success": True, "source": source, "rel_type": rel_type, "target": target,
+              "deleted_count": deleted, "matched_via": "exact", "error": None}
+    if deleted == 0:
+        # #201 normalized fallback — align the remove matcher with add_concept's
+        # normalization so remove+add cycles address ONE node, not a twin pair.
+        norm_s, norm_t = _normalize_name(source), _normalize_name(target)
+        if (norm_s, norm_t) != (source, target):
+            rows = graph.execute_query(cypher, {"s": norm_s, "t": norm_t})
+            deleted = (rows[0]["deleted"] if rows and "deleted" in rows[0] else 0)
+            if deleted:
+                logger.info(
+                    "remove_concept_relationship matched via normalization: "
+                    "(%r)-[:%s]->(%r) -> (%r)-[:%s]->(%r)",
+                    source, rel_type, target, norm_s, rel_type, norm_t)
+                result.update({"deleted_count": deleted, "matched_via": "normalized",
+                               "normalized_source": norm_s, "normalized_target": norm_t})
+    return result
+
+
+CACHE_TTL_DAYS_ENV = "CARTON_CACHE_TTL_DAYS"
+CACHE_TTL_DAYS_DEFAULT = 5
+
+
+def _cache_ttl_days() -> float:
+    """How long a spilled result is kept. Junk is REFUSED, never silently defaulted.
+
+    A TTL that quietly becomes 5 because someone typed `CARTON_CACHE_TTL_DAYS=5d` is a setting that
+    looks applied and is not — the same failure `_env_float` guards against in graph_store.
+    """
+    raw = (os.getenv(CACHE_TTL_DAYS_ENV) or "").strip()
+    if not raw:
+        return float(CACHE_TTL_DAYS_DEFAULT)
+    try:
+        days = float(raw)
+    except ValueError:
+        raise ValueError(f"{CACHE_TTL_DAYS_ENV}={raw!r} is not a number of days")
+    if days <= 0:
+        raise ValueError(f"{CACHE_TTL_DAYS_ENV}={raw!r} must be positive")
+    return days
+
+
+def _reap_spilled_results(cache_dir, now: Optional[float] = None) -> int:
+    """Delete spilled `*_network_*.json` results older than the TTL. Returns how many went.
+
+    WHY THIS EXISTS. `_clip_large_result` writes the full result of an oversized
+    `get_concept_network` to a TIMESTAMPED file and hands the caller the path so it can read the
+    remainder in that same turn. Nothing ever reads one back — that write is the only mention of
+    the directory in the codebase — and because each call writes a NEW name rather than
+    overwriting, the directory only grows. Measured 2026-08-17 before this existed: 7.1 GB across
+    405 files covering 114 distinct subjects, one subject spilled 89 times, largest file 72 MB.
+    The name says cache; the behaviour was an unbounded write-only spill.
+
+    THE TTL IS THE RIGHT SHAPE RATHER THAN OVERWRITE-PER-CONCEPT because the useful lifetime of a
+    spill is the turn that produced it: the caller is handed the path in the same response. Days,
+    not minutes, only so a slow or resumed turn can still open its own file.
+
+    IT MUST NEVER BREAK ITS CALLER. This runs on the query path, so every failure mode — an
+    unreadable directory, a file vanishing under us (two processes reaping at once), a permission
+    error — is swallowed per-file and logged. A cleanup that turns a working query into an
+    exception would be worse than the disk it saves.
+    """
+    import time
+
+    try:
+        ttl_days = _cache_ttl_days()
+    except ValueError:
+        logger.warning("%s is invalid; skipping reap this call", CACHE_TTL_DAYS_ENV)
+        return 0
+
+    cutoff = (now if now is not None else time.time()) - ttl_days * 86400
+    removed = 0
+    try:
+        entries = list(Path(cache_dir).glob("*_network_*.json"))
+    except OSError as exc:
+        logger.warning("carton_cache reap could not list %s: %s", cache_dir, exc)
+        return 0
+
+    for path in entries:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue          # another reaper got it; not an error
+        except OSError as exc:
+            logger.warning("carton_cache reap could not remove %s: %s", path, exc, exc_info=True)
+
+    if removed:
+        logger.info("carton_cache reap removed %d spilled result(s) older than %g days",
+                    removed, ttl_days)
+    return removed
 
 
 class CartOnUtils:
@@ -1142,7 +1338,8 @@ class CartOnUtils:
                             "MATCH (parent:Wiki {n: 'Skillgraph'}) "
                             "MERGE (parent)-[:HAS_INSTANCES]->(sg) "
                             "MERGE (sg)-[:PART_OF]->(parent) "
-                            "MERGE (sg)-[:IS_A]->(:Wiki {n: 'Skillgraph_Entry'})",
+                            "MERGE (sge:Wiki {n: 'Skillgraph_Entry'}) "
+                            "MERGE (sg)-[:IS_A]->(sge)",
                             {"sg_name": sg_concept_name}
                         )
                         stats["neo4j_fixed"] += 1
@@ -1258,7 +1455,12 @@ class CartOnUtils:
             # Build query with filters for obsolete concepts
             base_filters = [
                 "NOT c.n =~ '.*_v[0-9]+$'",  # Exclude sunk versions (_v1, _v2, etc.)
-                "NOT EXISTS((c)-[:EVOLVED_TO]->())"  # Exclude old renamed concepts
+                # A BARE PATTERN PREDICATE, not `EXISTS(pattern)`. The function-call form is a
+                # PARSER error on kuzu, which broke the auto-linker's cache refresh outright —
+                # found when the box first ran on kuzu, in the worker's own log. This form is
+                # plain Cypher that both engines accept (and it is what neo4j 5 prefers anyway,
+                # having deprecated the function form). Measured on both.
+                "NOT (c)-[:EVOLVED_TO]->()"  # Exclude old renamed concepts
             ]
 
             if exclude_concept:
@@ -1274,18 +1476,20 @@ class CartOnUtils:
                 graph.close()
 
     def _validate_query_safety(self, cypher_query: str) -> dict:
-        """Validate query is safe (read-only, :Wiki namespace)"""
+        """Validate query is safe: read-only, and naming at least one label in READ_LABELS (the :Wiki
+        namespace or the context-alignment code graph that shares this neo4j — issue 483)."""
         import re
         query_upper = cypher_query.upper().strip()
-        
+
         # Word-boundary match to avoid false positives (e.g. 'as created' matching 'CREATE')
         write_pattern = re.compile(r'\b(CREATE|MERGE|DELETE|DETACH)\b')
         if write_pattern.search(query_upper):
             return {"success": False, "error": "Write operations (CREATE/MERGE) not allowed. Use add_concept tool instead."}
-        
-        if ':Wiki' not in cypher_query:
-            return {"success": False, "error": "Query must target :Wiki namespace (e.g., MATCH (c:Wiki))"}
-        
+
+        if not any(label in cypher_query for label in READ_LABELS):
+            return {"success": False, "error": "Query must name a readable label, one of "
+                                               + " ".join(READ_LABELS) + " (e.g., MATCH (c:Wiki))"}
+
         return {"success": True}
 
     def _get_neo4j_config(self):
@@ -1369,14 +1573,27 @@ class CartOnUtils:
             serialized[key] = self._serialize_neo4j_value(record[key])
         return serialized
     
-    def _execute_neo4j_query(self, cypher_query: str, parameters: dict):
-        """Execute query against Neo4j"""
+    def _execute_neo4j_query(self, cypher_query: str, parameters: dict, strip: bool = True):
+        """Execute query against the graph.
+
+        WHY THIS NO LONGER TOUCHES `.driver` (2026-08-12). It used to open
+        `graph.driver.session()` itself — bypassing the very method on the class it was holding —
+        which made it invisible to any backend switch and broke outright on an embedded backend,
+        where there is no driver at all. It now asks the connection, so `GRAPH_BACKEND` reaches it
+        like everything else.
+
+        THE SERIALIZATION IS UNCHANGED, and the reason it can be is exact: `_serialize_record`
+        only ever uses `record.keys()` and `record[key]`, and a plain dict answers both the same
+        way a neo4j Record does. `execute_query` returns `[dict(record)]` with the VALUES
+        untouched, so a `RETURN c` still arrives here as a live Node and is serialized exactly as
+        before — while an embedded backend's rows, which are already plain python, fall through
+        `_serialize_neo4j_value`'s dict/list branches untouched.
+        """
         graph, should_close = self._get_connection()
 
         try:
-            with graph.driver.session() as session:
-                result = session.run(cypher_query, parameters or {})
-                serialized_results = [self._serialize_record(record) for record in result]
+            rows = graph.execute_query(cypher_query, parameters or {})
+            serialized_results = [self._serialize_record(record) for record in rows]
         finally:
             if should_close:
                 graph.close()
@@ -1384,7 +1601,8 @@ class CartOnUtils:
         # CANONICAL strip at the library's shared read primitive (onion arch): every read facade
         # (query_wiki_graph, get_concept_network, collections, history, …) returns CLEAN data — CartON
         # wiki-links (`[w](../W/W_itself.md)`) can NEVER render from any caller (MCP tool, import, CLI).
-        return deep_strip_wiki_links(serialized_results)
+        # strip False is query_verbatim alone, the reader of a content node kept as written (card 813).
+        return deep_strip_wiki_links(serialized_results) if strip else serialized_results
 
     def _handle_query_errors(self, e: Exception) -> dict:
         """Handle query execution errors"""
@@ -1414,7 +1632,25 @@ class CartOnUtils:
                 "data": result,
                 "naming_convention": "Title_Case_With_Underscores. Paths: /home/GOD/foo-bar → Home_God_Foo_Bar. Concepts: My_Concept_Name"
             }
-            
+
+        except Exception as e:
+            return self._handle_query_errors(e)
+
+    def query_verbatim(self, cypher_query: str, parameters: dict = None) -> dict:
+        """The read query_wiki_graph does, with every value as stored (card 813).
+
+        Args:
+            cypher_query: A read-only Cypher on the :Wiki namespace.
+            parameters: Its parameters.
+
+        Returns:
+            dict: success and data, or the error dict naming why the read was refused."""
+        try:
+            validation = self._validate_query_safety(cypher_query)
+            if not validation["success"]:
+                return validation
+            return {"success": True,
+                    "data": self._execute_neo4j_query(cypher_query, parameters or {}, strip=False)}
         except Exception as e:
             return self._handle_query_errors(e)
 
@@ -1442,23 +1678,57 @@ class CartOnUtils:
 
         return f"""
         MATCH (source:Wiki {{n: $concept_name}})
-        CALL {{
-            WITH source
-            MATCH (source)-[r{rel_filter}*1..{depth}]-(connected:Wiki)
-            WHERE NOT connected.n =~ '.*_v[0-9]+$'
-              AND NOT connected.n =~ '.*_Observation$'
-              AND NOT connected.n =~ '^UserThought_.*'
-              AND NOT connected.n =~ '^AgentMessage_.*'
-              AND NOT connected.n =~ '^Sync_.*'
-              AND NOT connected.n =~ '.*_Update_History$'
-              AND NOT connected.n = 'Requires_Evolution'
-            RETURN r, connected
-        }}
+        MATCH (source)-[r{rel_filter}*1..{depth}]-(connected:Wiki)
+        WHERE NOT connected.n =~ '.*_v[0-9]+$'
+          AND NOT connected.n =~ '.*_Observation$'
+          AND NOT connected.n =~ '^UserThought_.*'
+          AND NOT connected.n =~ '^AgentMessage_.*'
+          AND NOT connected.n =~ '^Sync_.*'
+          AND NOT connected.n =~ '.*_Update_History$'
+          AND NOT connected.n = 'Requires_Evolution'
         RETURN source.n as start_concept,
-               [rel in r | type(rel)] as relationship_path,
+               r as relationship_path,
                connected.n as connected_concept,
                connected.d as connected_description
         """
+
+    @staticmethod
+    def _relationship_type_path(value) -> list:
+        """The ordered relationship TYPES of one var-length match, from either backend's shape.
+
+        WHY THIS IS PYTHON AND NOT CYPHER (measured 2026-08-12). The query used to compute this
+        itself with `[rel in r | type(rel)]`, which kuzu rejects outright — "Variable rel is not
+        in scope", because it has no list comprehension over a recursive-rel value. Unlike the
+        other dialect deltas in this port there is NO form valid on both engines: neo4j has no
+        equivalent of kuzu's recursive-rel accessors and kuzu has no comprehension. So the query
+        now returns `r` RAW — which both engines do support — and the types are extracted here,
+        the same move already used for the timeline-stub typing. One query string, correct
+        everywhere, and no Cypher rewriting.
+
+        THE TWO SHAPES, both measured rather than assumed:
+          neo4j → a LIST of relationships, each already through `_serialize_relationship`:
+                  `[{'type': 'Relationship', 'relationship_type': 'IS_A', 'properties': {…}}, …]`
+          kuzu  → ONE recursive-rel DICT, plain python straight through `_serialize_dict`:
+                  `{'_nodes': [...], '_rels': [{'_label': 'IS_A', '_src': …}, …]}`
+
+        THE RETURN CONTRACT IS AN ORDERED LIST OF TYPE STRINGS and must stay that way:
+        `milo/tool_rag.py:221` indexes it (`path[0] == rel_type`) to decide whether a connected
+        concept is reached by the relationship it asked for. Order is the hop order.
+        """
+        if not value:
+            return []
+        rels = value.get('_rels', []) if isinstance(value, dict) else value
+        if not isinstance(rels, (list, tuple)):
+            return []
+        types = []
+        for rel in rels:
+            if not isinstance(rel, dict):
+                continue
+            # `relationship_type` is the serialized-neo4j key; `_label` is kuzu's own.
+            rel_type = rel.get('relationship_type') or rel.get('_label')
+            if rel_type:
+                types.append(rel_type)
+        return types
 
     def _clip_large_result(self, result: list, concept_name: str, max_items: int = 100) -> dict:
         """Clip large results and cache to file"""
@@ -1474,6 +1744,7 @@ class CartOnUtils:
 
         cache_dir = Path(os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')) / 'carton_cache'
         cache_dir.mkdir(parents=True, exist_ok=True)
+        _reap_spilled_results(cache_dir)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         cache_file = cache_dir / f"{concept_name}_network_{timestamp}.json"
@@ -1527,9 +1798,11 @@ class CartOnUtils:
                         "connected_description": record.get("connected_description"),
                         "relationship_paths": []
                     }
-                # Add this path to the aggregated paths
+                # Add this path to the aggregated paths. The query hands back the raw
+                # relationship value (see `_build_network_query`); the TYPES are derived here
+                # because no comprehension over one exists in both dialects.
                 unique_concepts[connected_name]["relationship_paths"].append(
-                    record.get("relationship_path")
+                    self._relationship_type_path(record.get("relationship_path"))
                 )
 
             # Convert to list
@@ -1985,74 +2258,57 @@ class CartOnUtils:
             logger.error(f"Error during retroactive auto-linking: {str(e)}")
             return {"success": False, "error": f"Failed to apply retroactive auto-linking: {str(e)}"}
 
-    def get_collection_concepts(self, collection_name: str, max_depth: int = 10) -> dict:
-        """Recursively traverse HAS_PART relationships to get all concepts in a collection
+    def get_collection_concepts(self, collection_name: str, max_depth: int = 1,
+                                boundary_types: Optional[List[str]] = None,
+                                hub_cap: int = 30) -> dict:
+        """BOUNDED HAS_PART traversal of a collection (issue #203) — thin executor.
+
+        Delegates to `carton_bounded_walk` (the pure half, one-capability-one-module):
+        `build_walk_plan` builds the ONE Cypher execution (max_depth is now LIVE — it was a
+        dead param before #203, accepted/logged/never interpolated), this method runs it
+        through `_execute_neo4j_query`, and `build_activation_result` classifies the rows.
+
+        Stop logic (see carton_bounded_walk's module docstring for the binding rulings):
+        a member whose direct IS_A hits `boundary_types` (default: docmirror-collect's list),
+        or an UNTYPED member (no IS_A/INSTANTIATES — a tag hub) whose HAS_PART*1..4 subtree
+        exceeds `hub_cap` (default 30), is included as a leaf but never descended below;
+        every stop is reported in the return (truncation_report + stopped, which LEAD the
+        payload). Zero stops => the return shape is byte-identical to the pre-#203 one
+        (the DMN conversation-ladder regression requirement).
 
         Args:
             collection_name: Name of the collection concept to traverse
-            max_depth: Maximum recursion depth to prevent infinite loops
+            max_depth: Maximum walk depth (LIVE; default 1 = the collection's own members only)
+            boundary_types: IS_A type names that stop descent (None = the default list)
+            hub_cap: HAS_PART*1..4 path-count cap for UNTYPED members
 
         Returns:
-            Dict with success status and list of member concepts with descriptions
+            Dict with success status, truncation report (when non-zero), stopped members
+            with reasons, and the member concepts with descriptions.
         """
-        logger.info(f"Getting concepts for collection '{collection_name}' (max_depth={max_depth})")
+        from .carton_bounded_walk import build_walk_plan, build_activation_result
+
+        logger.info(f"Getting concepts for collection '{collection_name}' "
+                    f"(max_depth={max_depth}, hub_cap={hub_cap})")
 
         try:
-            # Query to recursively traverse HAS_PART relationships
-            # Don't filter by description - we want to see ALL members including missing ones
-            cypher_query = """
-            MATCH path = (collection:Wiki {n: $collection_name})-[:HAS_PART*1..10]->(member:Wiki)
-            RETURN DISTINCT member.n as name, member.d as description
-            ORDER BY member.n
-            """
+            plan = build_walk_plan(collection_name, max_depth=max_depth,
+                                   boundary_types=boundary_types, hub_cap=hub_cap)
+            # (The plan's Cypher ORDERs BY the alias `name`, not `member.n` — required on an
+            # embedded backend where only projected names stay in scope after RETURN; the
+            # 2026-08-12 lesson the old inline query carried, preserved in carton_bounded_walk.)
 
-            result = self._execute_neo4j_query(cypher_query, {"collection_name": collection_name})
+            # ONE Cypher execution (issue #203 ruling G8 — no N+1 on a 640k graph)
+            rows = self._execute_neo4j_query(plan["cypher"], plan["parameters"])
 
-            if not result:
-                return {
-                    "success": True,
-                    "collection_name": collection_name,
-                    "concepts": [],
-                    "total_count": 0,
-                    "warning": None,
-                    "message": f"Collection '{collection_name}' is empty or does not exist"
-                }
+            result = build_activation_result(collection_name, rows,
+                                             max_depth=plan["max_depth"],
+                                             hub_cap=plan["hub_cap"])
 
-            # Separate concepts into defined and missing
-            concepts = []
-            missing_concept_names = []
-
-            for record in result:
-                concept_name = record["name"]
-                description = record.get("description")
-
-                if description is None or description == "":
-                    # Missing concept - track name
-                    missing_concept_names.append(concept_name)
-                    concepts.append({
-                        "name": concept_name,
-                        "description": "[MISSING CONCEPT - NOT YET DEFINED]"
-                    })
-                else:
-                    concepts.append({
-                        "name": concept_name,
-                        "description": description
-                    })
-
-            # Format warning message if there are missing concepts
-            warning_message = None
-            if missing_concept_names:
-                warning_message = f"⚠️ Warnings: [{', '.join(missing_concept_names)}] are in {collection_name} but are not defined, themselves."
-
-            logger.info(f"Found {len(concepts)} concepts in collection '{collection_name}' ({len(missing_concept_names)} missing)")
-
-            return {
-                "success": True,
-                "collection_name": collection_name,
-                "concepts": concepts,
-                "total_count": len(concepts),
-                "warning": warning_message
-            }
+            stopped = result.get("stopped") or []
+            logger.info(f"Found {result.get('total_count', 0)} concepts in collection "
+                        f"'{collection_name}' ({len(stopped)} stopped the walk)")
+            return result
 
         except Exception as e:
             logger.error(f"Error getting collection concepts: {str(e)}")
@@ -2077,8 +2333,13 @@ class CartOnUtils:
               AND NOT collection.n =~ '.*_Observation$'
             RETURN DISTINCT collection.n as name, collection.d as description,
                    count(member) as concept_count
-            ORDER BY collection.n
+            ORDER BY name
             """
+            # ORDER BY the ALIAS, never `collection.n`: after a RETURN DISTINCT projection an
+            # embedded backend keeps only the projected aliases in scope, so the pattern variable
+            # is gone by then ("Variable collection is not in scope") and the whole listing
+            # returns nothing. Ordering by the alias is valid on BOTH engines and identical on
+            # neo4j. Same defect, same fix as the collection walk in `get_collection_concepts`.
 
             result = self._execute_neo4j_query(cypher_query, {})
 

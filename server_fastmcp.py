@@ -19,7 +19,7 @@ from mcp.types import TextContent
 
 # Import CartOn utilities
 from carton_mcp.carton_utils import (
-    CartOnUtils, strip_wiki_links,
+    CartOnUtils, strip_wiki_links, deep_strip_wiki_links,
     edit_carton_obj as _edit_carton_obj_lib,
     validate_carton_obj as _validate_carton_obj_lib,
     set_concept_properties as _set_concept_properties_lib,
@@ -27,6 +27,13 @@ from carton_mcp.carton_utils import (
     remove_concept_relationship as _remove_concept_relationship_lib,
     RESERVED_PROPERTY_KEYS as _RESERVED_PROPERTY_KEYS,
 )
+# The dead-letter READER (issue #275). Absolute form deliberately, matching the daemon's
+# import of the same module: the import-consistency guard in test_carton_deadletter.py
+# matches on that module path, and that guard exists because a symbol was once called from
+# the daemon without being imported while every other gate stayed green and it crashlooped.
+from carton_mcp.carton_deadletter import dead_letter_report
+# Worker lifecycle control (issue #276) — same absolute form, same reason.
+from carton_mcp.carton_worker_control import restart_worker, running_worker_pids, spawn_worker
 from .add_concept_tool import add_concept_tool_func, add_observation, rename_concept_func, get_observation_queue_dir, PERSONAL_DOMAINS
 from .carton_split_content import split_content_concept as _split_content_concept_lib
 from .concept_config import ConceptConfig
@@ -89,36 +96,71 @@ def _fmt(data) -> str:
         return f"{truncated}\n\n... Full results ({len(result)} chars) at: {overflow_file}"
     return result
 
+from .carton_render import render_answer
+
+
 def _fmt_inner(data) -> str:
-    """Inner formatter — no truncation, no overflow. Deduplicates descriptions."""
-    if isinstance(data, str):
-        return _dedup_desc(_strip_md(data))
-    if isinstance(data, dict):
-        if "result" in data:
-            return _fmt_inner(data["result"])
-        parts = []
-        for k, v in data.items():
-            if v is not None and v != [] and v != {}:
-                parts.append(f"{k}: {_fmt_inner(v)}")
-        return "\n".join(parts) if parts else "(empty)"
-    if isinstance(data, list):
-        if not data:
-            return "(none)"
-        return ", ".join(_fmt_inner(x) for x in data)
-    return str(data)
+    """Inner formatter, no overflow: carton_render.render_answer (card 766), every string through the
+    canonical stripper and the paragraph dedup."""
+    return render_answer(data, clean=lambda s: _dedup_desc(_strip_md(s)))
 
 # Create FastMCP server (the SDK class — UNTOUCHED; this is the stdio local
-# server exactly as before). Network auth wraps the ASGI app in main()'s
-# network branch instead — see network_gateway.py: the no-SSE law +
-# fail-closed CARTON_API_KEY + a pure-ASGI bearer gate. Nothing blocking at
+# server exactly as before). There is no network branch any more: the bearer-gated
+# HTTP gateway that used to serve a carton MCP inside a hosted box is REMOVED, because
+# an MCP server is driven by an agent and a box contains none — see carton_transport.py,
+# which keeps the one thing that outlived it, the no-SSE law. Nothing blocking at
 # import (the transport rule's startup-timeout lesson).
-from .network_gateway import (
-    STDIO as _GW_STDIO,
-    resolve_transport as _gw_resolve_transport,
-    run_network as _gw_run_network,
-)
+from .carton_transport import resolve_transport as _resolve_transport
 
 mcp = FastMCP("carton")
+
+
+# ── THE RETURN CHOKEPOINT (issue 483; Isaac 2026-09-06: CARTON SHOULD NOT EVER AGAIN HAVE ANY FUNCTIONS
+# IN THE SDK THAT RENDER THE MARKDOWN LINKS) ─────────────────────────────────────────────────────────────
+# Every tool registered on this server passes through mcp.tool, so this is the one place a return value
+# can be made plain for ALL of them at once: whatever a tool returns — a str, a dict, a list, a
+# TextContent — goes through the canonical stripper before FastMCP serializes it. _fmt already strips
+# the data it formats; this covers the text a tool builds outside _fmt (error strings, reminders,
+# prompt bodies), so no tool can leak the auto-linker's `[w](../W/W_itself.md)` form by construction.
+# Registration semantics are untouched: the wrapper keeps the tool's signature and annotations (wraps),
+# and an async tool gets an async wrapper so FastMCP's is_async, fixed at registration, stays truthful.
+import inspect as _inspect
+
+
+def _plain_return(value):
+    """The tool's return value with every string stripped of wiki-link markup, same shape back."""
+    if isinstance(value, TextContent):
+        return TextContent(type=value.type, text=deep_strip_wiki_links(value.text))
+    if isinstance(value, list):
+        return [_plain_return(v) for v in value]
+    if isinstance(value, (str, dict)):
+        return deep_strip_wiki_links(value)
+    return value
+
+
+_register_tool = mcp.tool
+
+
+def _tool_stripped(*dargs, **dkwargs):
+    """mcp.tool with the return chokepoint: registers the tool exactly as FastMCP would, with its
+    return value routed through _plain_return."""
+    decorator = _register_tool(*dargs, **dkwargs)
+
+    def _apply(fn):
+        if _inspect.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def _wrapped_async(*args, **kwargs):
+                return _plain_return(await fn(*args, **kwargs))
+            return decorator(_wrapped_async)
+
+        @wraps(fn)
+        def _wrapped(*args, **kwargs):
+            return _plain_return(fn(*args, **kwargs))
+        return decorator(_wrapped)
+    return _apply
+
+
+mcp.tool = _tool_stripped
 
 # Initialize shared Neo4j connection (lives for MCP lifetime)
 def _create_shared_neo4j():
@@ -182,8 +224,43 @@ def _sm_actor() -> str:
     except Exception:
         return handle
 
+def _graph_conn():
+    """The import-time singleton if it exists, else the library's LAZY RETRYING connection.
+
+    `_neo4j_conn` is built ONCE at import and `_create_shared_neo4j` swallows its failure into a
+    logger.warning and returns None (doc(m): "Failure is non-fatal"). So a single blip at server
+    start leaves it None FOR THE LIFE OF THE PROCESS, and every call site reading that global
+    DIRECTLY stays broken forever — while every call site going through the library keeps working,
+    because the library does exactly this fallback (`shared_connection or _get_module_connection()`,
+    carton_utils.py:81/469/560/596) and `_get_module_connection` RETRIES while None
+    (add_concept_tool.py:253).
+
+    The asymmetry is OBSERVED, not theoretical: on 2026-08-22 add_to_collection returned
+    "No Neo4j connection available" seconds after query_wiki_graph answered normally on the same
+    running server. This reuses the library's own pattern rather than inventing one.
+    """
+    if _neo4j_conn:
+        return _neo4j_conn
+    try:
+        from .add_concept_tool import _get_module_connection
+        return _get_module_connection()
+    except Exception as e:
+        # LOG WITH THE TRACEBACK, never swallow. Returning None here decides whether a tool
+        # refuses loudly or the SM gate silently fails open, so the CAUSE CHAIN has to survive —
+        # a bare message tells you the fallback failed but not whether it was a missing import,
+        # bad credentials, or an unreachable host, which are three different fixes.
+        logger.exception(f"_graph_conn: module-connection fallback failed: {e}")
+        return None
+
+
 def _sm_run(query, params=None):
-    rows = _neo4j_conn.execute_query(query, params or {}) if _neo4j_conn else []
+    # FAILS OPEN on a genuinely absent graph (returns []) — deliberate and UNCHANGED: the SM gate
+    # is off by default and callers early-return when off, so raising here would break every tool
+    # call whenever the DB is down. What is fixed is that it no longer fails open merely because
+    # the import-time connection blipped — previously that made the gate silently report "no active
+    # step" for EVERY actor, which is a control surface failing open with no signal at all.
+    graph = _graph_conn()
+    rows = graph.execute_query(query, params or {}) if graph else []
     return [dict(r) if not isinstance(r, dict) else r for r in (rows or [])]
 
 def _sm_gate_check(tool_name: str, arg_repr: str):
@@ -259,22 +336,33 @@ def _deferred_enforcement():
 # threading.Thread(target=_deferred_enforcement, daemon=True).start()
 
 """
-UARL ONTOLOGY SYSTEM STATUS:
+UARL LIVES IN SOMA, NOT IN CARTON (corrected 2026-08-21, Isaac's ruling).
 
-Foundation implemented:
-- Soup layer: Concepts with arbitrary descriptions, weak/strong compression tracking
-- Ontology promotion: REIFIES → PROGRAMS → IS_A Carton_Ontology_Entity validation
-- Dynamic UARL predicates: Bootstrap (is_a, part_of, instantiates) + reified concepts
-- Compression marking: Weak relationship types and concepts using them marked REQUIRES_EVOLUTION
+This block used to describe a UARL ontology system as carton's own: soup-layer
+compression tracking, a REIFIES -> PROGRAMS -> IS_A Carton_Ontology_Entity promotion,
+dynamic UARL predicates, and REQUIRES_EVOLUTION compression marking. None of that is
+carton's job and the code implementing it has been deleted from add_concept_tool.py.
+Isaac, verbatim: "UARL work should only ever be SOMA, it involves carton because carton
+calls SOMA and carton has the store canon, but thats it really." and "Theres no way for
+carton to do these operations at all."
 
-Not yet implemented:
-- Ontology axiom extraction: Converting origination stacks (triples) into formal axioms
-- Semantic pattern matching: Validating origination stack semantic narrative against UARL template
-- Description composition: Generating ontology-level descriptions from composed triples instead of arbitrary text
-- Complete origination stack semantics: Metastack template pattern, embodies/manifests tracking
+WHAT IS TRUE NOW:
+  - SOMA is the validator. Carton POSTs every add_concept to it and records the verdict
+    on the region gradient (MEREO_ERROR / SOUP -> CODE -> SYSTEM_TYPE -> ONT).
+  - Strong-vs-weak compression is SOMA's, computed by the recursive walker
+    find_weak_compression_target/2,/3 plus check_convention(weak_compression_detector)
+    in soma_prolog/soma_partials.pl, against StrongCompressionPattern /
+    WeakCompressionPattern in soma_prolog/uarl.owl.
+  - Carton's role is the STORE CANON: it holds the record, and SOMA's quadstore is a
+    reflection of it (see carton-is-the-total-store-soma-is-its-reflection).
 
-Current state: Can type concepts into soup layer and manually trigger REIFIES for validation,
-but ontology layer doesn't extract real formal knowledge yet. Infrastructure is ready for future axiom extraction.
+RESIDUE, named honestly rather than cleaned silently: Carton_Ontology_Entity still
+exists as a node with roughly 1,800 incoming edges written before this deletion, and
+retype_buckets.py still MERGEs it. Those edges carry no PROGRAMS (the promoter never
+fired), so whether that node still means anything to SOMA is an open question, not a
+settled one. The get_requires_evolution_list reader in carton_management still works and
+is now fed only by sink_concept_globally's validation-failure path, which is a different
+mechanism and was deliberately left in place.
 """
 
 
@@ -337,65 +425,25 @@ class ConceptRelationship(BaseModel):
     relationship: str
     related: List[str]
 
-def _format_concept_result(concept_name: str, raw_result: str) -> str:
-    """Format concept creation result for LLM readability"""
-    # import re  # moved to top
-    # MEREO ERROR reject (add_concept_tool #9 carton-defers-to-SOMA gate): the concept's
-    # own is_a points to an unknown/undefined type, so SOMA admits it to no region and
-    # CartON declines to ingest it (no queue file, no Neo4j node). The reject string
-    # already carries the reason — surface it VERBATIM. Without this branch the reject
-    # falls through to the bare "❌ ❌" else-path below and the ⛔ reason is DROPPED
-    # entirely (a silent reject the agent cannot act on — the exact opposite of the
-    # gate's purpose, which is to reject so the agent learns WHY and re-says it correctly).
-    _rr = raw_result.lstrip()
-    if _rr.startswith("⛔") or "REJECTED (MEREO ERROR" in raw_result:
-        return (
-            "🗺️‍⟷‍📦 **CartON** (Cartographic Ontology Net)\n\n"
-            f"**Concept**: `{concept_name}`\n"
-            "📁 **Files**: ❌\n"
-            "📊 **Neo4j**: ❌\n"
-            f"⛔ {_rr.lstrip('⛔').strip()}"
-        )
-    # Async queue flow: "queued" means daemon will create files + neo4j
-    if "queued" in raw_result.lower() or "created successfully" in raw_result or raw_result.startswith("✅"):
-        files_created = "⏳ queued"
-        neo4j_created = "⏳ queued"
-    else:
-        files_created = "❌"
-        neo4j_created = "❌"
+def _format_concept_result(concept_name: str, raw_result: str, note: str = "") -> str:
+    """The add_concept result an LLM reads.
 
-    # Override if we see explicit success/failure markers
-    if "Neo4j: Created concept" in raw_result:
-        neo4j_created = "✅"
-    if "files created" in raw_result.lower():
-        files_created = "✅"
+    Args:
+        concept_name: The concept the result is about.
+        raw_result: The text add_concept_tool_func returned, shown whole.
+        note: Lines about the call itself, placed after the result's first line so the SOMA
+            instruction lines stay last.
 
-    # Surface the SOMA VERDICT VERBATIM, UNCONDITIONALLY (Isaac 2026-07-03: "CartON should not
-    # fucking care. CartON needs to display THE SOMA STRING. PERIOD."). The prior approach
-    # regex-matched five hardcoded bracket-tag shapes ([SOUP:]/[CODE:]/[SYSTEM_TYPE:]/
-    # [SOMA ERROR:]/[SOMA error:]) and silently DROPPED anything that didn't match — which is
-    # exactly what happened to the mereo_error case: add_concept_tool.py emits a DIFFERENT tag
-    # shape for it ("[MEREO — saved as soup...]", add_concept_tool.py ~2295-2300) that matched
-    # NONE of the five patterns, so every mereo_error verdict — the single most common one,
-    # since it fires whenever is_a points at a type SOMA hasn't seen before — was computed
-    # correctly by SOMA and then silently swallowed here, never reaching the caller. CartON
-    # must never parse/understand SOMA's output shape to decide whether to show it; it must
-    # show ALL of it, always, so no future verdict shape can be silently dropped again.
-    # add_concept_tool_func's raw_result is exactly f"✅ {concept_name}{youknow_msg}" (the ⛔
-    # reject string is handled by the branch above, before this code runs) — so youknow_msg is
-    # simply everything after that fixed prefix.
-    _success_prefix = f"✅ {concept_name}"
-    if raw_result.startswith(_success_prefix):
-        _youknow_msg = raw_result[len(_success_prefix):]
-    else:
-        _youknow_msg = raw_result
-    youknow_line = f"\n{_youknow_msg.strip()}" if _youknow_msg.strip() else ""
-
-    return f"""🗺️‍⟷‍📦 **CartON** (Cartographic Ontology Net)
-
-**Concept**: `{concept_name}`
-📁 **Files**: {files_created}
-📊 **Neo4j**: {neo4j_created}{youknow_line}"""
+    Returns:
+        The result's first line, then the note, then SOMA's DEATH block when the result carries one, then the rest
+        of the result, so the DO lines stay last.
+    """
+    from carton_mcp.add_concept_tool import split_soma_death_block
+    death, rest = split_soma_death_block(raw_result)
+    first, _, tail = rest.strip().partition("\n")
+    parts = [first] + ([note.strip()] if note.strip() else []) + ([death] if death else []) + (
+        [tail.lstrip("\n")] if tail.strip() else [])
+    return "\n".join(parts)
 
 
 def _check_name_expectations(concept_name: str) -> str | None:
@@ -496,6 +544,9 @@ def add_concept(
     old_str_for_edit_case: Optional[str] = None,
     properties: Optional[dict] = None,
     soma_run_id: Optional[str] = None,
+    domain_about: Optional[str] = None,
+    domain_part_of: Optional[str] = None,
+    subdomain_about: Optional[str] = None,
 ) -> str:
     """Add a new concept to the knowledge graph
 
@@ -512,6 +563,13 @@ def add_concept(
             "Soma", "Carton_Schema", "Crystal_Ball"). Becomes a has_domain relationship.
         subdomain: REQUIRED, same enforcement as domain. Narrower than domain (e.g. "Mereo_Validation" under
             domain "Soma"). Becomes a has_subdomain relationship.
+        domain_about: OPTIONAL. When domain is not yet a domain node: what it is about. It is written first, is_a
+            Domain with has_about, part_of domain_part_of (card 726). Without it the domain lands as said and SOMA
+            grades it: a domain without has_about is not validly a Domain.
+        domain_part_of: OPTIONAL. The domain node that new domain is part of, reaching Health, Wealth, Social or
+            Spiritual.
+        subdomain_about: OPTIONAL. When subdomain is not yet a domain node: what it is about. It is written first, is_a
+            Domain with has_about, part_of domain.
         personal_domain: REQUIRED, same enforcement as domain. Which strata of Isaac's life/work this concept
             belongs to — ENUM, must be one of: paiab, sanctum, cave, misc, personal. Becomes a
             has_personal_domain relationship (same predicate name add_observation_batch already uses).
@@ -585,22 +643,29 @@ def add_concept(
                 else:
                     relationships_dict.append(srel)
 
-        raw_result = add_concept_tool_func(concept_name, description, relationships_dict, desc_update_mode=desc_update_mode, hide_youknow=hide_youknow, shared_connection=_neo4j_conn, source=source, typed_values=typed_values, old_str_for_edit_case=old_str_for_edit_case, properties=properties)
-        out = _format_concept_result(concept_name, raw_result)
+        raw_result = add_concept_tool_func(concept_name, description, relationships_dict, desc_update_mode=desc_update_mode, hide_youknow=hide_youknow, shared_connection=_neo4j_conn, source=source, typed_values=typed_values, old_str_for_edit_case=old_str_for_edit_case, properties=properties, domain_about=domain_about, domain_part_of=domain_part_of, subdomain_about=subdomain_about)
+        note = ""
         # soma_run_id: this add ACCEPTS a parked SOMA compose-suggestion. The add itself IS the fill
         # (the relationship written above composes the slot); we just mark the parked review item
         # resolved (mark-only, no re-compose). Reject = simply not adding, so there is no reject path here.
         if soma_run_id:
             rec = _mark_compose_suggestion_lib(soma_run_id, "accepted")
             if rec.get("status") == "not_found":
-                out += f"\n⚠️ soma_run_id '{soma_run_id}' had no parked compose-suggestion to resolve"
+                note = f"⚠️ soma_run_id '{soma_run_id}' had no parked compose-suggestion to resolve"
             else:
-                # P1 provenance substrate: the accept IS a fill, sourced from the reviewing agent.
-                if _neo4j_conn is not None and rec.get("concept") and rec.get("prop"):
+                # The accept IS a fill, sourced from the reviewing agent. With no graph connection
+                # the note says the provenance was not recorded.
+                _fill_graph = _graph_conn() if (rec.get("concept") and rec.get("prop")) else None
+                if _fill_graph is not None:
                     _record_fill_provenance_lib(rec["concept"], rec["prop"], source, "agent_review",
-                                                _neo4j_conn.execute_query)
-                out += f"\n✅ accepted compose-suggestion {soma_run_id} (this add IS the fill)"
-        return out
+                                                _fill_graph.execute_query)
+                    note = f"✅ accepted compose-suggestion {soma_run_id} (this add IS the fill)"
+                elif rec.get("concept") and rec.get("prop"):
+                    note = (f"⚠️ accepted compose-suggestion {soma_run_id}, but provenance was NOT "
+                            f"recorded (no graph connection) — the fill is unattributed")
+                else:
+                    note = f"✅ accepted compose-suggestion {soma_run_id} (this add IS the fill)"
+        return _format_concept_result(concept_name, raw_result, note)
     except Exception as e:
         # Stash full payload so next call only needs missing fields
         _concept_stash[stash_key] = {
@@ -695,7 +760,10 @@ def validate_carton_obj(concept_name: str, kvobj_name: str) -> str:
         A VALID/INVALID report listing any bad keys (schema violations) and unresolved refs
         (with did-you-mean suggestions).
     """
-    res = _validate_carton_obj_lib(concept_name, kvobj_name, _neo4j_conn)
+    # via _graph_conn: validate_carton_obj takes `graph` as a REQUIRED positional and has no
+    # `or _get_module_connection()` fallback of its own, so handing it the raw import-time global
+    # makes this tool permanently unusable after one startup blip. See _graph_conn.
+    res = _validate_carton_obj_lib(concept_name, kvobj_name, _graph_conn())
     if not res.get("success"):
         return f"❌ {res.get('error', 'validate_carton_obj failed')}"
     head = "✅ VALID" if res["valid"] else "❌ INVALID"
@@ -809,7 +877,9 @@ def set_properties(concept_name: str, properties: dict, mode: str = "merge") -> 
     Property doctrine (Option-4 hybrid): scratch classes (Blog_Request, Chain_Step, etc.)
     and untyped nodes get a DIRECT property write only; ontology-bearing classes ALSO emit a
     thin SOMA observation trail. The trail NEVER blocks or fails the direct write (SOMA down
-    → the property is still set; the report shows trail: scratch-lane | emitted | soma-unreachable).
+    → the property is still set; the report shows trail: soma-off | scratch-lane | emitted |
+    soma-unreachable). soma-off means carton_utils.PROPERTY_TRAIL_TO_SOMA is off, which it is
+    while Gnosys_System.soma_validator is off: no SOMA POST is made.
 
     Returns: a report of which keys were updated/removed and which were refused.
     """
@@ -959,6 +1029,15 @@ def add_document_concept(
     # So this tool reports "✅ queued" immediately and then silently fails in the daemon — the caller
     # never sees the real failure unless they separately run carton_management(check_failed_observations=True).
     try:
+        # #206 canonical-path gate — SYNCHRONOUS at the front door, before anything
+        # is queued, precisely because the queue path above is fire-and-forget and
+        # its failures are silent: the caller must see this refusal.
+        from carton_mcp.carton_pathguard import check_write, CartonPathRefused
+        try:
+            check_write(canonical_path, "create")
+        except CartonPathRefused as e:
+            return f"❌ REFUSED (not queued): {e}"
+
         # Build relationships list
         rels = []
 
@@ -1005,6 +1084,43 @@ def add_document_concept(
 
 
 
+def _normalize_observation_domain_edges(observation_data: dict) -> None:
+    """BOTH-EDGES NORMALIZATION (issue #198 data half, 2026-08-28), in place.
+
+    add_observation_batch concepts arrive carrying has_actual_domain only, which is how
+    the has_actual_domain-only population accumulated (1694 measured 2026-08-26; the
+    re-measured 280 copied additively 2026-08-28). Mirror every has_actual_domain target
+    onto has_domain, PRESERVING has_actual_domain — the write-side twin of the additive
+    copy migration, so new writes stop landing on the wrong predicate.
+
+    MERGES into an existing has_domain dict instead of appending a second one: two dicts
+    of one rel-name silently collapse to the later at the daemon (issue #204 caught
+    observe_from_identity_pov doing exactly that with part_of).
+    """
+    for tag, concepts in observation_data.items():
+        if tag in ("confidence", "hide_youknow") or not isinstance(concepts, list):
+            continue
+        for concept in concepts:
+            if not isinstance(concept, dict):
+                continue
+            rels = concept.get("relationships") or []
+            targets = [t for r in rels if isinstance(r, dict)
+                       and r.get("relationship") == "has_actual_domain"
+                       for t in (r.get("related") or [])]
+            if not targets:
+                continue
+            existing = next((r for r in rels if isinstance(r, dict)
+                             and r.get("relationship") == "has_domain"), None)
+            if existing is None:
+                rels.append({"relationship": "has_domain", "related": list(targets)})
+                concept["relationships"] = rels
+            else:
+                merged = existing.get("related") or []
+                merged.extend(t for t in targets if t not in merged)
+                existing["related"] = merged
+
+
+
 @mcp.tool()
 def add_observation_batch(observation_data: dict, hide_youknow: bool = False) -> str:
     """Create observation capturing complete cognitive state
@@ -1039,6 +1155,7 @@ def add_observation_batch(observation_data: dict, hide_youknow: bool = False) ->
                 observation_data["confidence"] = stashed_obs["confidence"]
 
         observation_data["hide_youknow"] = hide_youknow
+        _normalize_observation_domain_edges(observation_data)  # issue #198: both-edges, preserving has_actual_domain
         result = add_observation(observation_data)
         if geometry_warning:
             warning_text = geometry_warning.replace("❌ GEOMETRY ERROR:", "").strip()
@@ -1106,15 +1223,22 @@ def observe_from_identity_pov(observation_data: dict, agent_identity: str = None
                     concept['relationships'] = []
 
                 new_rels = []
+                actual_domain_targets = []
                 for rel in concept['relationships']:
                     rel_type = rel.get('relationship')
-                    
+
                     if rel_type == 'has_actual_domain':
-                        # Transform to has_domain (proper ontological relationship)
-                        new_rels.append({
-                            'relationship': 'has_domain',
-                            'related': rel['related']
-                        })
+                        # BOTH EDGES (issue #198, the ruled branch-plan shape):
+                        # PRESERVE has_actual_domain — the four-required-rels
+                        # observation validation (live on the daemon's UNWIND lane
+                        # since 2026-08-29) requires it — AND mirror its targets
+                        # onto has_domain (the proper ontological relationship).
+                        # The mirror MERGES into any existing has_domain dict after
+                        # the loop rather than appending a second dict of the same
+                        # rel-name: two dicts of one name collapse to the later at
+                        # the daemon's observation parse (the #204 mechanism).
+                        new_rels.append(rel)
+                        actual_domain_targets.extend(rel.get('related') or [])
                     elif rel_type == 'has_personal_domain':
                         # Keep personal domain as-is (enum: paiab, sanctum, cave, etc.)
                         new_rels.append(rel)
@@ -1130,11 +1254,37 @@ def observe_from_identity_pov(observation_data: dict, agent_identity: str = None
                     else:
                         new_rels.append(rel)
 
-                # Add PART_OF relationship to the agent's identity collection
-                new_rels.append({
-                    'relationship': 'part_of',
-                    'related': [collection_name]
-                })
+                # has_domain mirror lands here, merged (see the #198 comment above)
+                if actual_domain_targets:
+                    existing_hd = next(
+                        (r for r in new_rels if r.get('relationship') == 'has_domain'), None)
+                    if existing_hd is None:
+                        new_rels.append({
+                            'relationship': 'has_domain',
+                            'related': list(dict.fromkeys(actual_domain_targets))
+                        })
+                    else:
+                        merged = list(existing_hd.get('related') or [])
+                        for t in actual_domain_targets:
+                            if t not in merged:
+                                merged.append(t)
+                        existing_hd['related'] = merged
+
+                # Add the agent's identity collection to part_of — MERGED into an
+                # existing part_of dict when the concept carries one (issue #204:
+                # appending a SECOND dict of one rel-name triggers the documented
+                # relationship-dict-collapse at the daemon's observation parse —
+                # the later dict silently drops the earlier, so every identity-POV
+                # observation with its own part_of lost it to the collection edge).
+                existing_po = next(
+                    (r for r in new_rels if r.get('relationship') == 'part_of'), None)
+                if existing_po is None:
+                    new_rels.append({
+                        'relationship': 'part_of',
+                        'related': [collection_name]
+                    })
+                elif collection_name not in (existing_po.get('related') or []):
+                    existing_po['related'] = list(existing_po.get('related') or []) + [collection_name]
 
                 concept['relationships'] = new_rels
 
@@ -1249,50 +1399,24 @@ def carton_management(
 
     if restart_bg_server:
         try:
-            # Kill existing daemon
-            result = subprocess.run(
-                ['pkill', '-f', 'observation_worker_daemon.py'],
-                capture_output=True,
-                text=True
-            )
-
-            # Start new daemon
-            github_pat = os.getenv('GITHUB_PAT')
-            repo_url = os.getenv('REPO_URL')
-            neo4j_uri = os.getenv('NEO4J_URI', 'bolt://host.docker.internal:7687')
-            neo4j_user = os.getenv('NEO4J_USER', 'neo4j')
-            neo4j_password = os.getenv('NEO4J_PASSWORD', 'password')
-            heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-            openai_api_key = os.getenv('OPENAI_API_KEY')
-
-            env = os.environ.copy()
-            env_update = {
-                'GITHUB_PAT': github_pat,
-                'REPO_URL': repo_url,
-                'NEO4J_URI': neo4j_uri,
-                'NEO4J_USER': neo4j_user,
-                'NEO4J_PASSWORD': neo4j_password,
-                'HEAVEN_DATA_DIR': heaven_data_dir,
-                'OPENAI_API_KEY': openai_api_key
-            }
-            # Filter out None values to avoid subprocess error
-            env.update({k: v for k, v in env_update.items() if v is not None})
-
-            daemon_path = Path(__file__).parent / 'observation_worker_daemon.py'
-            log_path = '/tmp/carton_worker.log'
-
-            process = subprocess.Popen(
-                ['python3', str(daemon_path)],
-                env=env,
-                stdout=open(log_path, 'w'),
-                stderr=subprocess.STDOUT,
-                start_new_session=True
-            )
-
-            result_parts.append(f"✅ Daemon restarted: PID {process.pid}")
-
+            # THIN WRAPPER over carton_worker_control.restart_worker (issue #276). The
+            # matching, the killing, the waiting and the verdict all live in the library;
+            # this site picks the daemon path and reports what came back.
+            #
+            # WHAT IT REPLACES, and why it mattered: `pkill -f observation_worker_daemon.py`
+            # plus a Popen whose pid was reported unconditionally. That pattern cannot match
+            # a worker launched as `python3 -m carton_mcp.observation_worker_daemon` — the
+            # supervisord form, and the form found running on this box — so the kill was a
+            # silent no-op, the replacement exited on the pid-file lock still held by the
+            # survivor, and the verb answered `✅ Daemon restarted: PID N` for a restart that
+            # never happened. Every dev-flow in this repo ending "…then restart the daemon"
+            # was defeated by it, and an agent that installs a fix, sees the tick and proceeds
+            # is testing OLD CODE while believing it is testing new code.
+            _restarted, message = restart_worker(
+                Path(__file__).parent / 'observation_worker_daemon.py')
+            result_parts.append(message)
         except Exception as e:
-            traceback.print_exc()
+            logger.exception("daemon restart failed")
             result_parts.append(f"❌ Daemon restart failed: {e}")
 
     if get_git_repo_url:
@@ -1452,19 +1576,20 @@ CartON Usage Guide:
         try:
             heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
             failed_dir = Path(heaven_data_dir) / 'carton_queue' / 'failed'
-
-            if not failed_dir.exists():
-                result_parts.append("✅ No failed observations (failed directory doesn't exist)")
-            else:
-                failed_count = len(list(failed_dir.glob('*.json')))
-
-                if not failed_count:
-                    result_parts.append("✅ No failed observations")
-                else:
-                    result_parts.append(f"❌ {failed_count} failed observations in: {failed_dir}")
-
+            # THIN WRAPPER over carton_deadletter.dead_letter_report (issue #275). No
+            # summarising logic lives here: the reader owns the counting, the grouping and
+            # the wording, and it neither raises nor needs an exists() check — a missing or
+            # empty directory reports EMPTY, which is why the old three-branch shape is gone.
+            #
+            # WHAT CHANGED IS WHAT THE VERB ANSWERS. It used to return a bare count, and a
+            # bare count is how the pile reached 2000 payloads with nobody able to name a
+            # single entry in it: a transient rejection and a permanently-broken payload
+            # render identically as "+1". The report names the reasons, groups them, and puts
+            # the UNEXPLAINED total in its headline, because that is the part nothing can act
+            # on. The directory is appended so a reader can go and look at the files.
+            result_parts.append(f"{dead_letter_report(failed_dir)}\n  dir: {failed_dir}")
         except Exception as e:
-            traceback.print_exc()
+            logger.exception("check_failed_observations failed")
             result_parts.append(f"❌ Error checking failed observations: {str(e)}")
 
     if retry_failed_observations:
@@ -1647,14 +1772,22 @@ def query_wiki_graph(cypher_query: str, parameters: dict = None) -> str:
     - Properties: n (name), d (description), c (canonical), t (timestamp)
     - Relationships: Various types like is_a, part_of, depends_on, relates_to, etc.
 
-    UARL Two-Phase System:
-    - Soup layer: All concepts (informal, arbitrary descriptions)
-    - Ontology layer: Concepts with REIFIES (formal, strongly typed, complete knowledge)
+    The region gradient (SOMA's verdict, recorded by carton):
+    - MEREO_ERROR / SOUP -> CODE -> SYSTEM_TYPE -> ONT, stored on the `soma_region`
+      property. SOMA is the validator; carton POSTs each add_concept and records what
+      comes back.
+    - A DECLARED TYPE is `is_a System_Type` -- that triple is what makes a name usable
+      as an is_a target at all (soma_partials.pl is_known_type_uncached also accepts
+      primitives, seed types and OWL classes).
+    - ⚠ `soma_region` is SPARSE: 19,808 of 640,590 nodes carry it (3.1%, measured
+      2026-08-25). A node only gets a verdict when it is written through add_concept,
+      and relationship-target auto-stubs never are. So filtering on soma_region shows
+      you the graded slice, NOT the graph -- never read its absence as "soup".
 
     Query Patterns:
     - All concepts: MATCH (c:Wiki) RETURN c.n, c.d
-    - Ontology only: MATCH (c:Wiki)-[:IS_A]->(:Wiki {n: "Carton_Ontology_Entity"}) RETURN c.n, c.d
-    - Soup only: MATCH (c:Wiki) WHERE NOT (c)-[:IS_A]->(:Wiki {n: "Carton_Ontology_Entity"}) RETURN c.n, c.d
+    - Declared types: MATCH (c:Wiki)-[:IS_A]->(:Wiki {n: "System_Type"}) RETURN c.n, c.d
+    - By region: MATCH (c:Wiki) WHERE c.soma_region = "code" RETURN c.n, c.d
     - Find concepts: MATCH (c:Wiki) WHERE c.n CONTAINS "MCP" RETURN c.n, c.d
     - Get relationships: MATCH (c:Wiki)-[r]->(related:Wiki) WHERE c.n = "HEAVEN_System" RETURN type(r), related.n
     - Count concepts: MATCH (c:Wiki) RETURN count(c)
@@ -1782,12 +1915,9 @@ def get_concept_network(
         return f"❌ Error: {e}"
 
 @mcp.tool()
-def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool = False, depth: int = 0) -> TextContent:
-    """Get complete concept information including description and all relationships
-
-    Retrieves the full concept data in one call - both the concept description
-    and all its relationships. This is the standard way to research a concept
-    for blog writing, analysis, or understanding its place in the knowledge graph.
+def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool = False, depth: int = 0,
+                details: bool = False) -> TextContent:
+    """Get a concept: its name, description, properties, relationships and SOMA's live grade.
 
     Args:
         concept_name: Name of the concept to retrieve (exact match on n property)
@@ -1803,9 +1933,13 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
                       Render-only: the stored description is never changed.
         depth: Ref-expansion depth. 0 (default) = raw tokens (unchanged). 1 = one hop,
                       2 = recurse two levels, etc.
+        details: If True, also show SOMA's raw verdict for the concept's relationships: the
+                      event name, the d-chains fired and unmet, and every verdict block. Default False.
 
     Returns:
-        JSON string with complete concept data: name, description, and relationships
+        Text: Name, Description with its coverage score, Props, Rels, then SOMA's grade line and
+        numbered information, the raw verdict when details is True, the SOMA help line, and the
+        DO lines last.
     """
     # SM-GATE (increment 2): if SM-gating is ON and this actor is locked at a step, this call must
     # be a legal move (match the step's required_pattern) or it raises GateRefusal (the regex IS the
@@ -1836,9 +1970,16 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
         MATCH (c:Wiki) WHERE c.n = $concept_name AND c.d IS NOT NULL
         OPTIONAL MATCH (c)-[r]->(related:Wiki)
         RETURN c.n as name, c.d as description, c.score as score,
-               properties(c) as props,
+               c as props,
                collect({type: type(r), target: related.n}) as relationships
         """
+        # `c` rather than `properties(c)`: kuzu's `properties` takes (LIST, STRING), not a NODE,
+        # so the original is a BINDER error there — and returning the node itself is a form BOTH
+        # engines accept that yields the same thing. On neo4j `_serialize_node` is literally
+        # `dict(node)`, which is what `properties()` returned; on kuzu the row is already a plain
+        # dict of the node's columns. (kuzu additionally carries `_id`/`_label` keys, which the
+        # renderer ignores.) `type(r)` needs no change here — the store translates it to kuzu's
+        # `label(r)`, since neo4j's `type()` accepts only a relationship and cannot collide.
         result = utils.query_wiki_graph(cypher_query, {"concept_name": concept_name})
 
         if result.get("success") and result.get("data"):
@@ -1854,7 +1995,9 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
             if expand_refs and depth > 0:
                 try:
                     from carton_mcp.carton_utils import expand_carton_refs
-                    desc = expand_carton_refs(desc, _neo4j_conn, depth)
+                    # via _graph_conn — expand_carton_refs takes `graph` as a required positional
+                    # with no fallback of its own (carton_utils.py:261). See _graph_conn.
+                    desc = expand_carton_refs(desc, _graph_conn(), depth)
                 except Exception as _e:
                     desc = desc + f"\n[ref-expansion failed: {_e}]"
             
@@ -1873,14 +2016,11 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
                 else:
                     normal_rels.append(f"{rel_type.lower()} {target}")
             
-            # Build output string
             score = concept_data.get("score")
             score_str = f" [{score}% description coverage]" if score is not None else ""
             lines = [f"Name: {name}", f"Description{score_str}: {desc}"]
 
-            # Props block: render the node's NON-reserved neo4j properties (the structured
-            # property surface), only when non-empty. Reserved/managed fields (n, d, t, c,
-            # score, source, linked, …) are excluded — they are not user data.
+            # Props block: the node's non-reserved neo4j properties, when it has any.
             props = concept_data.get("props") or {}
             user_props = {k: v for k, v in props.items() if k not in _RESERVED_PROPERTY_KEYS}
             if user_props:
@@ -1905,14 +2045,13 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
             
             lines.append("]")
 
-            # SOMA live status check via daemon (port 8091).
-            # Replaces the YOUKNOW status check. Builds a SOMA observation from
-            # the concept's outgoing relationships (defaults to string_value type
-            # because get_concept has no way to know declared programming types)
-            # and POSTs to /event. SOMA's report string is surfaced as CODE
-            # (no soup gaps, no failure_error) or SOUP/failure preview.
+            # The live SOMA verdict for the concept's outgoing relationships, each target sent as string_value
+            # because get_concept has no declared programming types: the SOMA line, the numbered information and
+            # the DO lines last; details adds the raw verdict (event name, d-chains fired) above the DO lines.
             try:
-                from carton_mcp.add_concept_tool import soma_validate, SOMA_AVAILABLE
+                from carton_mcp.add_concept_tool import (
+                    soma_validate, SOMA_AVAILABLE, SOMA_HELP_POINTER, SOMA_INSTRUCTIONS_POINTER,
+                    soma_concept_status, soma_grade_flags, soma_grade_line, soma_result_lines)
                 if SOMA_AVAILABLE:
                     rel_by_type = {}
                     for rel in normal_rels:
@@ -1936,31 +2075,20 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
                         soma_data = soma_validate(source="get_concept", observations=soma_obs)
                         if soma_data and isinstance(soma_data, dict):
                             result_str = soma_data.get("result", "")
-                            # THREE-LEVEL status (mirrors add_concept_tool.py parsing):
-                            #   SOUP        — soup_gaps or failure_error present (structure incomplete)
-                            #   CODE        — all_core_requirements_met but unmet > 0 (d-chains pending)
-                            #   SYSTEM_TYPE — all_core_requirements_met AND unmet == 0 (fully admissible)
-                            has_soup = "soup_gaps=" in result_str
-                            has_failure = "failure_error" in result_str
-                            all_core_met = ("all_core_requirements_met" in result_str) and not has_failure
+                            status = soma_concept_status(result_str, name)
                             _unmet_match = re.search(r'\bunmet=(\d+)', result_str)
-                            try:
-                                unmet_n = int(_unmet_match.group(1)) if _unmet_match else 0
-                            except (ValueError, TypeError):
-                                unmet_n = 0
-
-                            if not has_soup and all_core_met and unmet_n == 0:
-                                lines.append("")
-                                lines.append("SOMA: SYSTEM_TYPE ✅✅ (structure valid, all d-chains proved)")
-                            elif not has_soup and all_core_met and unmet_n > 0:
-                                lines.append("")
-                                lines.append(f"SOMA: CODE ✅ (structure valid, {unmet_n} d-chain(s) still unmet)")
-                            elif has_soup or has_failure:
-                                lines.append("")
-                                lines.append(f"SOMA: SOUP\n{result_str[:400]}")
-                            else:
-                                lines.append("")
-                                lines.append(f"SOMA: {result_str[:200]}")
+                            unmet = int(_unmet_match.group(1)) if _unmet_match else 0
+                            flags = soma_grade_flags(status, unmet, "soup_gaps=" in result_str,
+                                                     "all_core_requirements_met" in result_str
+                                                     and "failure_error" not in result_str)
+                            info, dos = soma_result_lines(result_str, name, status)
+                            lines += ["", soma_grade_line(status, unmet, flags)] + info
+                            if details:
+                                lines += ["", "SOMA verdict:", result_str]
+                            lines.append(SOMA_HELP_POINTER)
+                            lines += dos
+                            if dos:
+                                lines[0] += f". {SOMA_INSTRUCTIONS_POINTER}"
             except ImportError:
                 pass
             except Exception as soma_err:
@@ -3498,20 +3626,36 @@ def create_collection(
         return f"❌ Error creating collection: {str(e)}"
 
 @mcp.tool()
-def activate_collection(collection_name: str) -> str:
-    """Activate a Carton_Collection by retrieving all member concepts
+def activate_collection(collection_name: str, depth: int = 1, hub_cap: int = 30,
+                        boundary_types: Optional[List[str]] = None) -> str:
+    """Activate a Carton_Collection by retrieving all member concepts — BOUNDED walk (issue #203).
 
-    Recursively traverses HAS_PART relationships to get full collection content.
-    Use this to load all concepts from a collection for context engineering.
+    Traverses HAS_PART relationships to get the collection content, with stop logic so one
+    hub member can no longer import its entire subtree: a member whose direct IS_A is a
+    collection/axis type (default list = docmirror-collect's: Carton_Collection,
+    Local_Collection, Identity_Collection, Global_Collection, Hypercluster, Doc_Mirror_Repo,
+    Hwss_Domain), or an UNTYPED member (no IS_A/INSTANTIATES —
+    a tag hub) whose HAS_PART*1..4 subtree exceeds hub_cap, is INCLUDED as a leaf but never
+    descended below. Every truncation (type-boundary, hub-cap, depth) is REPORTED: the
+    truncation_report + stopped list lead the payload, before concepts. Typed members
+    (e.g. the DMN conversation ladder: Conversation_<ts> / Iteration_<ts> nodes) are never
+    hub-capped, so ladder activations return unchanged.
 
     Args:
         collection_name: Name of the collection to activate
+        depth: Maximum walk depth (default 1 — only the concepts IN the collection)
+        hub_cap: HAS_PART*1..4 path-count cap for UNTYPED members (default 30 —
+            write-side parity with docmirror-collect)
+        boundary_types: Override the IS_A boundary type list (None = the default list)
 
     Returns:
-        JSON string with all member concepts in the collection with their descriptions
+        Formatted string: truncation report first (only when non-zero), then the stopped
+        members with reasons, then all member concepts with their descriptions
     """
     try:
-        result = utils.get_collection_concepts(collection_name)
+        result = utils.get_collection_concepts(collection_name, max_depth=depth,
+                                               boundary_types=boundary_types,
+                                               hub_cap=hub_cap)
 
         if result.get("success"):
             return _fmt(result)
@@ -3521,6 +3665,57 @@ def activate_collection(collection_name: str) -> str:
     except Exception as e:
         traceback.print_exc()
         return f"❌ Error: {e}"
+
+# DISABLED 2026-09-14 on Isaac's instruction: this tool is NOT REAL and should not exist yet. It was never actually made as a decided capability, and it was being offered to the agent as THE navigation surface of the graph, which is not a thing anyone agreed it is. Commented out rather than deleted so the code is recoverable if it is ever genuinely designed. The pure half (carton_disclose.py) and its unit gate (test_carton_disclose.py) are left on disk untouched and are now unreferenced by the server.
+# @mcp.tool()
+# def progressively_disclose(level: Optional[str] = None, limit: int = 50) -> str:
+    # """Show the DIAGRAM of the graph's categories/levels, or the members at one chosen level.
+
+    # Two modes and no third. With NO level: the diagram of the eight levels of the graph with a
+    # live member count for each. With a level: the members at that starting level.
+
+    # The levels are not invented here — they are `carton_bounded_walk.DEFAULT_BOUNDARY_TYPES`,
+    # the eight axis types the bounded walk refuses to descend through, which is carton stating in
+    # code which nodes are LEVELS rather than leaves: Carton_Collection, Local_Collection,
+    # Identity_Collection, Global_Collection, Hypercluster, Doc_Mirror_Repo, Doc_Mirror_Domain,
+    # Doc_Mirror_Subdomain.
+
+    # This is THE navigation surface: use it instead of writing freehand Cypher to find your way
+    # around the graph.
+
+    # Args:
+        # level: One of the eight levels (case-insensitive; '-' and ' ' read as '_'). Omit it to
+            # get the diagram. An unrecognised level is REFUSED by name, never answered with an
+            # empty list, because a silent empty is indistinguishable from an empty level.
+        # limit: Max members to list for a chosen level, 1..500 (default 50). A full page says so.
+
+    # Returns:
+        # The rendered diagram, or the rendered member listing, or a ❌ line naming the refusal.
+    # """
+    # # Imported here, not at the module header: lines 57-125 are inside carton_read_facade's
+    # # sealed ranges, and a top-level import would shift every one of them into a re-seal of an
+    # # unrelated boundary. Python caches the module, so this costs nothing after the first call.
+    # from . import carton_disclose
+
+    # try:
+        # if level is None:
+            # plan = carton_disclose.build_levels_plan()
+            # rows = carton_disclose.rows_or_raise(
+                # utils.query_wiki_graph(plan["cypher"], plan["parameters"]))
+            # return carton_disclose.render_diagram(rows)
+
+        # plan = carton_disclose.build_level_plan(level, limit=limit)
+        # rows = carton_disclose.rows_or_raise(
+            # utils.query_wiki_graph(plan["cypher"], plan["parameters"]))
+        # return carton_disclose.render_members(plan["level"], rows, limit=plan["limit"])
+
+    # except (ValueError, carton_disclose.DiscloseStoreError) as e:
+        # # A refused level and an unanswerable store are both NAMED, never rendered as an empty
+        # # graph — the whole reason rows_or_raise raises instead of returning [].
+        # return f"❌ {e}"
+    # except Exception as e:
+        # traceback.print_exc()
+        # return f"❌ Error: {e}"
 
 @mcp.tool()
 def add_to_collection(
@@ -3551,21 +3746,48 @@ def add_to_collection(
         RETURN count(concept) as added_count
         """
 
-        # Use shared connection directly — this is a write operation,
-        # query_wiki_graph blocks MERGE via _validate_query_safety
-        if _neo4j_conn:
-            result = _neo4j_conn.execute_query(
-                cypher_query,
-                {
-                    "collection_name": collection_name,
-                    "concept_names": concept_names
-                }
-            )
-            # execute_query returns list of records
-            added_count = len(concept_names)
-            return f"✅ Added {added_count} concepts to collection '{collection_name}'"
-        else:
-            return f"❌ No Neo4j connection available"
+        # Write directly (this is a write; query_wiki_graph blocks MERGE via _validate_query_safety)
+        # but resolve the connection through _graph_conn so a blip at import does not disable this
+        # tool for the life of the process — see _graph_conn.
+        graph = _graph_conn()
+        if not graph:
+            return "❌ No Neo4j connection available"
+
+        result = graph.execute_query(
+            cypher_query,
+            {
+                "collection_name": collection_name,
+                "concept_names": concept_names
+            }
+        )
+
+        # REPORT WHAT THE GRAPH DID, NEVER WHAT WAS ASKED FOR. This used to be
+        # `added_count = len(concept_names)`, which ignored `result` entirely — so a name that
+        # does not exist silently drops out of the UNWIND+MATCH and the tool STILL answered
+        # "✅ Added N concepts". A membership write that reports success for concepts it never
+        # added is worse than one that fails, because the collection then looks complete.
+        added = None
+        for row in (result or []):
+            rec = dict(row) if not isinstance(row, dict) else row
+            added = rec.get("added_count")
+            break
+
+        requested = len(concept_names)
+        if added is None:
+            return (f"❌ Wrote to '{collection_name}' but the query returned no count — "
+                    f"membership is UNCONFIRMED for {requested} concept(s); verify before trusting it.")
+        if added < requested:
+            missing = graph.execute_query(
+                "UNWIND $names AS n WITH n WHERE NOT EXISTS { MATCH (c:Wiki {n: n}) } RETURN collect(n) AS missing",
+                {"names": concept_names})
+            names = []
+            for row in (missing or []):
+                rec = dict(row) if not isinstance(row, dict) else row
+                names = rec.get("missing") or []
+                break
+            return (f"⚠️ Added {added} of {requested} to '{collection_name}'. "
+                    f"These do not exist in the graph and were NOT added: {names or '(could not resolve)'}")
+        return f"✅ Added {added} concepts to collection '{collection_name}'"
 
     except Exception as e:
         traceback.print_exc()
@@ -3629,59 +3851,26 @@ def substrate_projector(
 
 
 def _ensure_daemon_running():
-    """Start the observation worker daemon if not already running."""
-    import subprocess
-    from pathlib import Path
+    """Start the observation worker daemon if not already running.
 
-    # Check if daemon already running
-    result = subprocess.run(
-        ['pgrep', '-f', 'observation_worker_daemon.py'],
-        capture_output=True
-    )
-    if result.returncode == 0:
-        return  # Already running
-
-    # Start daemon with env vars
-    github_pat = os.getenv('GITHUB_PAT')
-    repo_url = os.getenv('REPO_URL')
-    neo4j_uri = os.getenv('NEO4J_URI', 'bolt://host.docker.internal:7687')
-    neo4j_user = os.getenv('NEO4J_USER', 'neo4j')
-    neo4j_password = os.getenv('NEO4J_PASSWORD', 'password')
-    heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-
-    env = os.environ.copy()
-    env_update = {
-        'GITHUB_PAT': github_pat,
-        'REPO_URL': repo_url,
-        'NEO4J_URI': neo4j_uri,
-        'NEO4J_USER': neo4j_user,
-        'NEO4J_PASSWORD': neo4j_password,
-        'HEAVEN_DATA_DIR': heaven_data_dir,
-        'OPENAI_API_KEY': openai_api_key
-    }
-    env.update({k: v for k, v in env_update.items() if v is not None})
-
-    daemon_path = Path(__file__).parent / 'observation_worker_daemon.py'
-    log_path = '/tmp/carton_worker.log'
-
-    subprocess.Popen(
-        ['python3', str(daemon_path)],
-        env=env,
-        stdout=open(log_path, 'w'),
-        stderr=subprocess.STDOUT,
-        start_new_session=True
-    )
+    THIN over carton_worker_control (issue #276), and this half of the defect was the
+    quieter one. The old check was `pgrep -f observation_worker_daemon.py`, which is blind
+    to a worker launched as `python3 -m carton_mcp.observation_worker_daemon`. Against a
+    supervisord-started worker it therefore concluded "nothing is running" on EVERY MCP
+    connect and spawned a second one, which then exited on the pid-file lock — so the
+    system looked self-healing while doing nothing, on every single start.
+    """
+    if running_worker_pids():
+        return
+    spawn_worker(Path(__file__).parent / 'observation_worker_daemon.py')
 
 
 def main():
     """Entry point for carton-mcp console script"""
     _ensure_daemon_running()
-    transport = _gw_resolve_transport()  # refuses 'sse'; errors on unknowns
-    if transport == _GW_STDIO:
-        mcp.run(transport=transport)
-    else:
-        _gw_run_network(mcp)  # bearer-gated streamable HTTP under uvicorn
+    # Refuses 'sse' and the removed network transports; the only value it returns is stdio.
+    # It is still CALLED rather than assumed, because that call is where those refusals live.
+    mcp.run(transport=_resolve_transport())
 
 if __name__ == "__main__":
     main()

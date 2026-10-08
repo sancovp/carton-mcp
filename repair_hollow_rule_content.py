@@ -80,7 +80,7 @@ def get_hollow_rules(driver):
     q = """
     MATCH (r:Wiki)-[:IS_A]->(:Wiki {n:'Claude_Code_Rule'})
     MATCH (r)-[:HAS_CONTENT]->(c:Wiki) WHERE c.n='_Unnamed' OR c.n ENDS WITH '_Unnamed'
-    RETURN DISTINCT r.n AS rule ORDER BY r.n
+    RETURN DISTINCT r.n AS rule ORDER BY rule
     """
     with driver.session() as s:
         return [rec["rule"] for rec in s.run(q)]

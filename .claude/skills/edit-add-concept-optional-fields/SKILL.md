@@ -1,9 +1,11 @@
 ---
 name: edit-add-concept-optional-fields
-description: "WHAT: the dev-flow for the OPTIONAL domain/subdomain/personal_domain/produces params on add_concept_tool_func — the internal chokepoint function every CartON concept-creation caller (Dragonbones, sm_gate.py, split_content_concept, the migration scripts) passes through, whether or not they use the add_concept MCP tool. WHEN: when editing add_concept_tool_func's domain/subdomain/personal_domain/produces params, merge_optional_domain_fields, or PERSONAL_DOMAINS in add_concept_tool.py (any of)."
+description: "WHAT: the dev flow for add_concept_tool_func's optional domain, subdomain, personal_domain, produces. WHEN: editing those params or PERSONAL_DOMAINS."
 ---
 
 # edit-add-concept-optional-fields — dev-flow for the optional provenance-field passthrough
+
+**In full:** WHAT: the dev-flow for the OPTIONAL domain/subdomain/personal_domain/produces params on add_concept_tool_func — the internal chokepoint function every CartON concept-creation caller (Dragonbones, sm_gate.py, split_content_concept, the migration scripts) passes through, whether or not they use the add_concept MCP tool. WHEN: when editing add_concept_tool_func's domain/subdomain/personal_domain/produces params, merge_optional_domain_fields, or PERSONAL_DOMAINS in add_concept_tool.py (any of).
 
 Task 58 (Isaac 2026-07-04, verbatim): *"it can move into add concept tool func but as optionals
 because it cant change anything about how other code uses carton as lib unless we wanna go thru

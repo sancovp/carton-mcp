@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from collections import defaultdict
 
-def normalize_concept_name(name: str) -> str:
-    """Normalize concept name to Title_Case_With_Underscores format."""
-    return name.replace(' ', '_').title()
+# THE CANONICAL NORMALIZER, imported — never re-implemented. This file's own copy dropped the
+# hyphen handling entirely, so a hyphenated name (UUIDs, session ids) normalized differently
+# here than through add_concept — and a name that normalizes two ways is TWO NODES.
+from carton_mcp.add_concept_tool import normalize_concept_name  # noqa: F401  (re-export)
 
 
 def migrate_inverse_relationships():

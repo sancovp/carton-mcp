@@ -18,6 +18,7 @@ Environment Variables:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -27,7 +28,14 @@ from pathlib import Path
 from typing import Dict, Any
 
 # Import worker function (absolute import for standalone script execution)
-from carton_mcp.add_concept_tool import _add_observation_worker, get_observation_queue_dir, auto_link_description, normalize_concept_name
+from carton_mcp.add_concept_tool import _add_observation_worker, get_observation_queue_dir, auto_link_description, normalize_concept_name, observation_validation_errors
+from carton_mcp.carton_pathguard import check_write, CartonPathRefused
+from carton_mcp.carton_deadletter import (
+    PROCESSED, REQUEUE, backoff_delays, batch_disposition, batch_failure_reason, dead_letter,
+    dead_letter_report, retry_attempts, run_with_retry)
+# The pid-lock acquisition (issue #276 item 4). Absolute form deliberately, matching the
+# imports above: the import-consistency guards in the test suites match on that module path.
+from carton_mcp.carton_worker_control import WORKER_PID_FILE, acquire_pid_lock
 
 # Batch size for UNWIND operations - M4 can handle 20k but we use 2k for safety
 UNWIND_BATCH_SIZE = 2000
@@ -66,12 +74,21 @@ def create_wiki_files_for_concepts(concepts_data: list) -> dict:
         # Normalize name for filesystem
         normalized_name = normalize_concept_name(name)
 
-        # Create concept directory
+        # Concept directory + _itself.md file (this is what ChromaDB indexes)
         concept_dir = wiki_concepts_dir / normalized_name
-        concept_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create _itself.md file (this is what ChromaDB indexes)
         itself_file = concept_dir / f"{normalized_name}_itself.md"
+
+        # #206 wiki-lane containment, BEFORE the mkdir so a garbage name mints
+        # nothing at all. A refusal is recorded per-concept and the drain
+        # continues — the loop's existing per-concept error discipline.
+        try:
+            check_write(str(itself_file), "wiki")
+        except CartonPathRefused as e:
+            errors.append(f"Refused {normalized_name}: {e}")
+            print(f"[WikiFiles] REFUSED {normalized_name}: {e}", file=sys.stderr)
+            continue
+
+        concept_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             # Build the _itself.md content
@@ -168,6 +185,24 @@ def _apply_carton_kv_edits(concept_rows: list, graph) -> None:
                 print(f"[KV-EDIT] EditHelper import failed, skipping edit for {row['name']}: {e}", file=sys.stderr)
         return
 
+    def _persist_outcome(node_name, err):
+        """Durable edit outcome (issue 142): a failed edit used to be SILENT at every durable
+        surface (the error lived only on the in-memory queue row). Persist failures as a node
+        property — get_concept shows properties, so the default read surface now surfaces them —
+        and CLEAR it on success so a stale error never outlives a later good edit. Best-effort:
+        outcome-recording must never break the batch (this function's own discipline)."""
+        try:
+            if err:
+                graph.execute_query(
+                    "MATCH (c:Wiki {n: $n}) SET c.kv_edit_error = $e, c.kv_edit_error_at = datetime()",
+                    {"n": node_name, "e": err})
+            else:
+                graph.execute_query(
+                    "MATCH (c:Wiki {n: $n}) REMOVE c.kv_edit_error, c.kv_edit_error_at",
+                    {"n": node_name})
+        except Exception as pe:
+            print(f"[KV-EDIT] {node_name}: outcome-persist failed (non-fatal): {pe}", file=sys.stderr)
+
     for row in concept_rows:
         if row.get('update_mode') != 'edit':
             continue
@@ -178,6 +213,7 @@ def _apply_carton_kv_edits(concept_rows: list, graph) -> None:
             row['update_mode'] = 'skip'
             row['kv_edit_error'] = "edit mode requires old_str_for_edit_case (was None)"
             print(f"[KV-EDIT] {name}: no old_str_for_edit_case — n.d unchanged", file=sys.stderr)
+            _persist_outcome(name, row['kv_edit_error'])
             continue
         # Fetch the CURRENT n.d (the file content EditHelper will edit).
         try:
@@ -187,17 +223,22 @@ def _apply_carton_kv_edits(concept_rows: list, graph) -> None:
             row['update_mode'] = 'skip'
             row['kv_edit_error'] = f"could not read current n.d: {e}"
             print(f"[KV-EDIT] {name}: read n.d failed — n.d unchanged: {e}", file=sys.stderr)
+            _persist_outcome(name, row['kv_edit_error'])
             continue
         if not current_nd:
             row['update_mode'] = 'skip'
             row['kv_edit_error'] = "node has no existing n.d to edit"
             print(f"[KV-EDIT] {name}: no existing n.d — n.d unchanged", file=sys.stderr)
+            _persist_outcome(name, row['kv_edit_error'])
             continue
         # UNDO LOG: write the PRE-edit n.d before touching anything.
         try:
             undo_dir = _carton_undo_dir_for_today()
-            undo_file = undo_dir / f"{name}.json"
             from datetime import datetime
+            # ATTEMPT-TIMESTAMPED (issue 142): one undo file PER ATTEMPT, never clobbered.
+            # The old single {name}.json meant a FAILED attempt overwrote the successful
+            # edit's undo from the same day — the safety net destroyed by the next miss.
+            undo_file = undo_dir / f"{name}.{datetime.now().strftime('%H%M%S_%f')}.json"
             undo_file.write_text(json.dumps({
                 "node": name,
                 "pre_edit_d": current_nd,
@@ -211,6 +252,7 @@ def _apply_carton_kv_edits(concept_rows: list, graph) -> None:
             row['update_mode'] = 'skip'
             row['kv_edit_error'] = f"undo-log write failed, edit refused: {e}"
             print(f"[KV-EDIT] {name}: undo-log write failed — edit refused: {e}", file=sys.stderr)
+            _persist_outcome(name, row['kv_edit_error'])
             continue
         # Surgical str-replace via EditHelper on a temp file (exactly-once enforced).
         tmp_path = None
@@ -223,15 +265,18 @@ def _apply_carton_kv_edits(concept_rows: list, graph) -> None:
             row['description'] = edited_nd
             row['update_mode'] = 'replace'  # write the whole edited n.d via the UNWIND CASE
             print(f"[KV-EDIT] {name}: applied surgical edit (old->new), n.d rewritten", file=sys.stderr)
+            _persist_outcome(name, None)  # success clears any stale kv_edit_error
         except ToolError as e:
             # 0 or >1 match (or other EditHelper refusal) — n.d UNCHANGED.
             row['update_mode'] = 'skip'
             row['kv_edit_error'] = f"str_replace refused (0 or >1 match): {e}"
             print(f"[KV-EDIT] {name}: str_replace refused — n.d unchanged: {e}", file=sys.stderr)
+            _persist_outcome(name, row['kv_edit_error'])
         except Exception as e:
             row['update_mode'] = 'skip'
             row['kv_edit_error'] = f"str_replace failed: {e}"
             print(f"[KV-EDIT] {name}: str_replace failed — n.d unchanged: {e}", file=sys.stderr)
+            _persist_outcome(name, row['kv_edit_error'])
         finally:
             if tmp_path is not None:
                 try:
@@ -343,7 +388,11 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
     if append_names and graph:
         try:
             existing_result = graph.execute_query(
-                "UNWIND $names AS name MATCH (n:Wiki {n: name}) WHERE n.d IS NOT NULL RETURN n.n AS name, n.d AS desc",
+                # `desc` is BACKTICKED because it is a RESERVED WORD on an embedded backend
+                # (kuzu parses it as the DESC sort keyword and the whole query fails). Backticks
+                # are valid identifier quoting in both dialects and the returned key is still
+                # `desc`, so nothing downstream changes — measured 2026-08-12.
+                "UNWIND $names AS name MATCH (n:Wiki {n: name}) WHERE n.d IS NOT NULL RETURN n.n AS name, n.d AS `desc`",
                 {'names': append_names}
             )
             existing_map = {}
@@ -422,6 +471,7 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
     # Use original timestamp if provided, otherwise use current datetime
     # desc_update_mode: append (default) | prepend | replace | skip (deduped)
     # NOTE: layer is determined by REQUIRES_EVOLUTION relationship, not a property
+    nodes_written = False
     try:
         create_query = """
         UNWIND $concepts AS c
@@ -441,9 +491,9 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
             WHEN n.d CONTAINS c.description
                 THEN n.d
             WHEN c.update_mode = 'append'
-                THEN n.d + '\n\n---\n\n' + c.description
+                THEN n.d + $sep + c.description
             WHEN c.update_mode = 'prepend'
-                THEN c.description + '\n\n---\n\n' + n.d
+                THEN c.description + $sep + n.d
             ELSE c.description
         END
         SET n.t = CASE WHEN n.t IS NULL THEN (CASE WHEN c.timestamp IS NOT NULL THEN datetime(c.timestamp) ELSE datetime() END) ELSE n.t END
@@ -452,11 +502,20 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
         SET n.source = CASE WHEN n.source IS NULL THEN c.source ELSE n.source END
         SET n.region = coalesce(c.region, n.region, 'soup')
         """
-        graph.execute_query(create_query, {'concepts': concept_rows})
+        # ⛔ THE SEPARATOR IS A PARAMETER, NOT A CYPHER LITERAL, and that is load-bearing rather
+        # than stylistic. It used to be the literal '\n\n---\n\n' inside the query text, which
+        # relies on the ENGINE processing backslash escapes in a string literal. neo4j does;
+        # kuzu 0.11.3 does NOT — it drops the backslashes, so the separator silently became
+        # 'nn---nn' and EVERY appended description would have been quietly corrupted with no
+        # error anywhere. Measured 2026-08-12. As a parameter the bytes are the driver's problem
+        # on both engines, which is what makes one query string correct everywhere.
+        graph.execute_query(create_query, {'concepts': concept_rows, 'sep': '\n\n---\n\n'})
+        nodes_written = True
         print(f"[UNWIND] Created {len(concept_rows)} concept nodes", file=sys.stderr)
     except Exception as e:
         errors.append(f"Concept creation failed: {e}")
         print(f"[UNWIND] ERROR creating concepts: {e}", file=sys.stderr)
+        traceback.print_exc()
 
     # Flatten all relationships and group by type
     rels_by_type = defaultdict(list)
@@ -475,11 +534,28 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
                 })
                 
                 # Create inverse relationships for bidirectionality
+                #
+                # THE DOMAIN AXES ARE COLLECTIONS. Every concept carries has_domain (and its
+                # finer siblings), so the inverse IS the domain's membership: a domain node
+                # reached by CONTAINS_CONCEPTS returns everything tagged with it, and domains
+                # already nest into HWSS by part_of, which makes the whole axis a recursive
+                # many-to-many collection lattice with no extra structure to maintain.
+                #
+                # The inverse is CONTAINS_CONCEPTS and deliberately NOT has_part: activate_collection
+                # recurses HAS_PART to depth 10, so making a domain a HAS_PART parent of its
+                # thousands of members would import the graph on every activation. A distinct
+                # edge gives the membership without the recursion, which is what the writer-side
+                # map in add_concept_tool.py already does for the sibling domain relations.
                 inverse_map = {
                     'PART_OF': 'HAS_PART',
                     'HAS_PART': 'PART_OF',
                     'IS_A': 'HAS_INSTANCES',
                     'INSTANTIATES': 'INSTANTIATED_BY',
+                    'HAS_DOMAIN': 'CONTAINS_CONCEPTS',
+                    'HAS_SUBDOMAIN': 'CONTAINS_CONCEPTS',
+                    'HAS_SUBSUBDOMAIN': 'CONTAINS_CONCEPTS',
+                    'HAS_ACTUAL_DOMAIN': 'CONTAINS_CONCEPTS',
+                    'HAS_PERSONAL_DOMAIN': 'CONTAINS_CONCEPTS',
                 }
                 if rel_type_upper in inverse_map:
                     inv_type = inverse_map[rel_type_upper]
@@ -524,23 +600,38 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
     try:
         batch_targets = list({r['target'] for rels in rels_by_type.values() for r in rels})
         if batch_targets:
-            graph.execute_query("""
-            UNWIND $targets AS name
-            MATCH (n:Wiki {n: name}) WHERE NOT (n)-[:IS_A]->()
-            WITH n, CASE
-                WHEN n.n STARTS WITH 'Iteration_Summary_'       THEN 'Iteration_Summary'
-                WHEN n.n STARTS WITH 'User_Message_'            THEN 'User_Message'
-                WHEN n.n STARTS WITH 'Agent_Message_'           THEN 'Agent_Message'
-                WHEN n.n STARTS WITH 'Tool_Call_'               THEN 'Tool_Call'
-                WHEN n.n STARTS WITH 'Unnamed_Conversation_At_' THEN 'Conversation'
-                WHEN n.n STARTS WITH 'Conversation_'            THEN 'Conversation'
-                WHEN n.n STARTS WITH 'Iteration_'               THEN 'Iteration'
-                ELSE null END AS typ
-            WHERE typ IS NOT NULL
-            MERGE (t:Wiki {n: typ})
-            MERGE (n)-[:IS_A]->(t)
-            MERGE (t)-[:HAS_INSTANCES]->(n)
-            """, {'targets': batch_targets})
+            # ⛔ THE PREFIX MATCH IS DONE IN PYTHON, NOT IN CYPHER, and that is a fix rather than
+            # a preference. The old form derived the type with a CASE and then used that variable
+            # as a pattern property; an embedded backend cannot evaluate a CASE-derived variable
+            # there ("Cannot evaluate expression with type VARIABLE", measured on kuzu 0.11.3
+            # 2026-08-12), so the whole block silently did nothing and no timeline stub was ever
+            # typed. It is also simply the wrong place for the work: python already holds the
+            # names, prefix matching is not database work, and one UNWIND over pre-computed rows
+            # is engine-neutral, shorter, and does the matching once instead of per row per pass.
+            # Order stays load-bearing: 'Iteration_Summary_' before 'Iteration_' (prefix overlap).
+            TIMELINE_PREFIXES = (
+                ('Iteration_Summary_', 'Iteration_Summary'),
+                ('User_Message_', 'User_Message'),
+                ('Agent_Message_', 'Agent_Message'),
+                ('Tool_Call_', 'Tool_Call'),
+                ('Unnamed_Conversation_At_', 'Conversation'),
+                ('Conversation_', 'Conversation'),
+                ('Iteration_', 'Iteration'),
+            )
+            typed_rows = []
+            for target in batch_targets:
+                for prefix, typ in TIMELINE_PREFIXES:
+                    if target.startswith(prefix):
+                        typed_rows.append({'name': target, 'typ': typ})
+                        break            # first match wins, exactly as the CASE did
+            if typed_rows:
+                graph.execute_query("""
+                UNWIND $rows AS row
+                MATCH (n:Wiki {n: row.name}) WHERE NOT (n)-[:IS_A]->()
+                MERGE (t:Wiki {n: row.typ})
+                MERGE (n)-[:IS_A]->(t)
+                MERGE (t)-[:HAS_INSTANCES]->(n)
+                """, {'rows': typed_rows})
     except Exception as e:
         print(f"[UNWIND] timeline stub typing skipped: {e}", file=sys.stderr)
 
@@ -595,8 +686,15 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
     # removed — youknow (:8102) is dead; SOMA is the validator.
     promoted = 0
 
+    # ⛔ concepts_created REPORTS THE WRITE, NOT THE INPUT (issue 176). It used to be
+    # len(concept_rows) unconditionally — so when the node-create UNWIND raised, the caller's
+    # `neo4j_succeeded = result['concepts_created'] > 0` still read True, the worker loop moved
+    # every file to processed/, and the batch vanished: queue consumed, nothing written, nothing
+    # dead-lettered (the exact silent-loss shape measured on the tenant box, where 23 consumed
+    # files left a 1-node store). Zero here makes the loop dead-letter the batch to failed/
+    # loudly instead.
     return {
-        'concepts_created': len(concept_rows),
+        'concepts_created': len(concept_rows) if nodes_written else 0,
         'relationships_created': total_rels,
         'errors': errors,
         'promoted': promoted,
@@ -616,7 +714,7 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
     Returns:
         List of dicts with {name, description, relationships}
     """
-    from carton_mcp.add_concept_tool import normalize_concept_name, OBSERVATION_TAGS
+    from carton_mcp.add_concept_tool import normalize_concept_name, OBSERVATION_TAGS, OBSERVATION_NON_TAG_KEYS
     from datetime import datetime
 
     try:
@@ -736,8 +834,10 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
         observation_name = f"{timestamp}_Observation"
 
         # Collect all part concepts — scan ALL keys, skip known non-tag keys
+        # (the set lives in add_concept_tool as OBSERVATION_NON_TAG_KEYS — ONE
+        # home, shared with observation_validation_errors, issue #198)
         all_parts = []
-        _NON_TAG_KEYS = {'confidence', 'hide_youknow', 'desc_update_mode', 'raw_concept', 'fixed', 'error_message', 'error_traceback'}
+        _NON_TAG_KEYS = OBSERVATION_NON_TAG_KEYS
         for tag in data:
             if tag in _NON_TAG_KEYS:
                 continue
@@ -786,6 +886,123 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
             concepts.extend(all_parts)
 
     return concepts
+
+
+def _process_timeline_merge(data: dict, graph) -> bool:
+    """Process one timeline_merge payload on the LIVE worker path.
+
+    The proven merge logic (transfer CREATED_DURING from the Unnamed conversation
+    node to the real one, then delete the Unnamed) previously lived ONLY inside
+    process_queue_file — dead code with zero callers since the worker loop moved
+    to parse_queue_file_to_concepts — so every timeline_merge queue file parsed
+    to [] and dead-lettered UNPROCESSED (found 2026-07-19 during the issue-61
+    triage: all 172 retried merge files bounced straight back to failed/, and
+    fresh merges were dead-lettering daily). Returns True on success (caller
+    consumes the file), False on any failure (caller dead-letters it).
+
+    THE SEMANTICS ARE NO LONGER THE DEAD PATH'S -- this line used to say "same query semantics as
+    the dead path, deliberately unchanged", and that stopped being true on 2026-08-24 while the
+    sentence stayed. Two deliberate divergences, both to stop edge loss: (a) EVERY relationship
+    type is transferred in both directions before the delete, not just CREATED_DURING; (b) the
+    delete is REFUSED outright when the merge target does not exist. The dead copy in
+    process_queue_file still has the original semantics and is NOT maintained in lockstep -- this
+    is the implementation of record.
+    """
+    unnamed = data.get('unnamed_concept')
+    real = data.get('real_concept')
+    if not unnamed or not real or graph is None:
+        return False
+    try:
+        result = graph.execute_query(
+            """
+            MATCH (c:Wiki)-[old:CREATED_DURING]->(unnamed:Wiki {n: $unnamed})
+            MATCH (real:Wiki {n: $real})
+            MERGE (c)-[:CREATED_DURING]->(real)
+            DELETE old
+            SET c.timeline_linked = true
+            RETURN count(c) as transferred
+            """,
+            {'unnamed': unnamed, 'real': real},
+        )
+        count = result[0]['transferred'] if result else 0
+
+        # TRANSFER EVERY OTHER RELATIONSHIP BEFORE DELETING (fixed 2026-08-24, measured).
+        # The query above moves ONLY CREATED_DURING; the DETACH DELETE below then destroys every
+        # OTHER edge on the placeholder. Measured on a live placeholder: 95 CREATED_DURING (moved)
+        # but also PART_OF / HAS_PART / HAS_INSTANCES (silently destroyed). That is real data loss:
+        # the doc-mirror journal attaches its entries to the ACTIVE conversation via part_of, and
+        # during the first window the active conversation IS this placeholder -- so every journal
+        # entry written before a precompact assigns real_concept would lose its position in the
+        # conversation at the very next compaction, with nothing reporting it.
+        # Relationship types cannot be parameterised in Cypher, so they are read FROM THE DB and
+        # sanitised to ^[A-Z_]+$ before interpolation -- the same discipline remove_relationship uses.
+        for direction in ("in", "out"):
+            q = ("MATCH (x:Wiki)-[r]->(u:Wiki {n: $unnamed}) RETURN DISTINCT type(r) AS t"
+                 if direction == "in" else
+                 "MATCH (u:Wiki {n: $unnamed})-[r]->(x:Wiki) RETURN DISTINCT type(r) AS t")
+            try:
+                rows = graph.execute_query(q, {'unnamed': unnamed}) or []
+            except Exception:
+                rows = []
+            for row in rows:
+                rtype = (row.get('t') or '') if isinstance(row, dict) else ''
+                if rtype == 'CREATED_DURING' or not re.fullmatch(r'[A-Z_]+', rtype):
+                    continue
+                move = (
+                    f"MATCH (x:Wiki)-[old:{rtype}]->(u:Wiki {{n: $unnamed}}) "
+                    f"MATCH (real:Wiki {{n: $real}}) "
+                    f"MERGE (x)-[:{rtype}]->(real) DELETE old RETURN count(x) AS n"
+                    if direction == "in" else
+                    f"MATCH (u:Wiki {{n: $unnamed}})-[old:{rtype}]->(x:Wiki) "
+                    f"MATCH (real:Wiki {{n: $real}}) "
+                    f"MERGE (real)-[:{rtype}]->(x) DELETE old RETURN count(x) AS n"
+                )
+                try:
+                    mres = graph.execute_query(move, {'unnamed': unnamed, 'real': real})
+                    moved = mres[0]['n'] if mres else 0
+                    if moved:
+                        count += moved
+                        print(f"[Worker] Timeline merge: moved {moved} {rtype} ({direction}) "
+                              f"{unnamed} -> {real}", file=sys.stderr)
+                except Exception as e:
+                    # FAIL LOUD, never silently drop an edge we were about to delete.
+                    print(f"[Worker] Timeline merge FAILED to move {rtype} ({direction}) "
+                          f"{unnamed} -> {real}: {e}", file=sys.stderr)
+                    return False
+
+        # NEVER DELETE WHEN THE TARGET IS ABSENT (2026-08-24, completing the all-types transfer
+        # added above). Every transfer above MATCHes `real`, so if `real` does not exist they all
+        # matched nothing and moved nothing; a DETACH DELETE here would then destroy the
+        # placeholder's PART_OF/HAS_PART edges with nowhere to have moved them, SILENTLY --
+        # precisely what the FAIL LOUD branch above refuses to do. Dead-letter instead; the file is
+        # retryable once the real conversation lands.
+        #
+        # ⛔ THIS BRANCH WAS THE NORMAL PATH UNTIL 2026-09-16, and the sentence that used to stand
+        # here said the opposite. It read: "Not reachable on the normal path (the daemon sorts
+        # queue files by name and the conversation concept is queued before the merge in the same
+        # run)". Queue ORDER was never the relevant thing. The caller collected concepts across
+        # the whole batch and wrote them only afterwards, while dispatching merges inline during
+        # that same collection pass — so the target was unwritten no matter which file sorted
+        # first, and this refusal fired on EVERY compaction. Measured 2026-09-14, 2026-09-15 and
+        # 2026-09-16: three windows whose journal entries stayed on the placeholder while their
+        # message ladders sat on the real node, because precompact writes those directly and they
+        # never needed a merge. The caller now defers merges to Phase 2m, after the batch write.
+        # So this refusal is correct and stays; what changed is that it should now be reached only
+        # by the two genuinely exceptional cases: the conversation concept dead-lettered while its
+        # merge did not, and a retry of a merge older than its conversation.
+        _exists = graph.execute_query(
+            "MATCH (r:Wiki {n: $real}) RETURN count(r) AS n", {'real': real})
+        if not (_exists and _exists[0].get('n')):
+            print(f"[Worker] Timeline merge: real conversation {real} does NOT exist -- refusing to "
+                  f"delete {unnamed}, dead-lettering so its edges are not lost", file=sys.stderr)
+            return False
+        graph.execute_query("MATCH (n:Wiki {n: $name}) DETACH DELETE n", {'name': unnamed})
+        print(f"[Worker] Timeline merge: {unnamed} -> {real} ({count} relationships transferred)", file=sys.stderr)
+        log_system_event(graph, "timeline_merge", f"Merged {unnamed} -> {real}, {count} relationships transferred", "observation_daemon")
+        return True
+    except Exception as e:
+        print(f"[Worker] Timeline merge error for {unnamed} -> {real}: {e}", file=sys.stderr)
+        return False
 
 
 def process_queue_file(queue_file: Path, shared_connection=None) -> bool:
@@ -1116,6 +1333,81 @@ def git_push_if_needed():
         print(f"[Worker] Git push error: {e}", file=sys.stderr)
 
 
+def _graph_open_preflight(timeout_s: int = 60) -> dict:
+    """Prove the graph can be opened, in a CHILD process, so a native crash is survivable.
+
+    Returns {"openable": bool, "reason": str, "evidence": [str]}. Never raises: a
+    preflight that itself blew up must not be the thing that takes the box down.
+
+    The child runs the SAME construction `_create_shared_neo4j` uses, so a pass here
+    means the real open will pass too. A negative returncode is death by signal —
+    that is the corrupt-database case, and the one this exists to name.
+    """
+    import subprocess  # function-local, matching this module's established import style
+    probe = (
+        "from heaven_base.tool_utils.neo4j_utils import KnowledgeGraphBuilder;"
+        "import os;"
+        "k=KnowledgeGraphBuilder("
+        "uri=os.getenv('NEO4J_URI','bolt://host.docker.internal:7687'),"
+        "user=os.getenv('NEO4J_USER','neo4j'),"
+        "password=os.getenv('NEO4J_PASSWORD','password'));"
+        "k._ensure_connection()"
+    )
+    evidence = []
+
+    # Size the store's files first — this is what tells an operator WHICH failure it is.
+    db_path = os.getenv("KUZU_DB_PATH")
+    if db_path:
+        try:
+            main_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+            wal_path = db_path + ".wal"
+            wal_bytes = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+            evidence.append(f"{db_path} = {main_bytes} bytes; {wal_path} = {wal_bytes} bytes")
+            if wal_bytes > main_bytes:
+                evidence.append(
+                    "the write-ahead log is LARGER than the main file — unreplayed writes"
+                )
+        except Exception as exc:
+            evidence.append(f"could not size the database files: {exc}")
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "openable": False,
+            "reason": f"opening the graph did not finish within {timeout_s}s (hung)",
+            "evidence": evidence,
+        }
+    except Exception as exc:
+        # The preflight could not run. Do NOT block the box on our own probe failing.
+        return {"openable": True, "reason": f"preflight skipped: {exc}", "evidence": evidence}
+
+    if proc.returncode < 0:
+        import signal as _signal
+        try:
+            signame = _signal.Signals(-proc.returncode).name
+        except Exception:
+            signame = f"signal {-proc.returncode}"
+        return {
+            "openable": False,
+            "reason": f"opening the graph died by {signame} — the database file is unreadable",
+            "evidence": evidence,
+        }
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        if tail:
+            evidence.append(f"child stderr: {tail[-1][:200]}")
+        return {
+            "openable": False,
+            "reason": f"opening the graph exited {proc.returncode}",
+            "evidence": evidence,
+        }
+    return {"openable": True, "reason": "graph opened cleanly", "evidence": evidence}
+
+
 def _create_shared_neo4j():
     """Create persistent Neo4j connection for worker daemon lifetime."""
     try:
@@ -1283,19 +1575,53 @@ def log_system_event(neo4j_conn, event_type: str, description: str, source: str)
         return
     try:
         from datetime import datetime
-        ts = datetime.now().strftime("%Y_%m_%dT%H_%M_%S")
+        # MICROSECONDS, not seconds. An instance name must be UNIQUE to the instance
+        # (Isaac 2026-08-21: "there are *zero instances* with universal names because
+        # instances have instance names"). At second resolution two events in the same
+        # second got the SAME name, and the CREATE below then made two nodes for them —
+        # measured: System_Event_2026_07_19T04_59_59_timeline_merge existed 77 times.
+        ts = datetime.now().strftime("%Y_%m_%dT%H_%M_%S_%f")
         event_name = f"System_Event_{ts}_{event_type}"
         day_name = f"Day_{datetime.now().strftime('%Y_%m_%d')}"
 
+        # THE TYPE NODE IS MERGED, NEVER CREATED. This line used to read
+        #     CREATE (e)-[:IS_A]->(:Wiki {n: "System_Event"})
+        # which minted a BRAND NEW System_Event node on every single call, so the
+        # universal was shattered into 41,721 byte-identical copies and `is_a
+        # System_Event` converged on nothing. A universal IS ITSELF — exactly one node.
+        # The instance is still CREATEd (it is genuinely new each time); only the type
+        # it points at is MERGEd.
+        # ⛔ EVERY MERGE IS COLLAPSED WITH `WITH ... LIMIT 1` BEFORE THE CREATE, AND THAT IS
+        # LOAD-BEARING ON A GRAPH THAT STILL HOLDS DUPLICATES — it is not defensive styling.
+        # MERGE on a name that has N duplicate nodes MATCHES ALL N and returns N ROWS, and
+        # every downstream clause then runs ONCE PER ROW. So the CREATE below became N
+        # creates. MEASURED IN PRODUCTION 2026-08-22, by deploying the CREATE->MERGE fix
+        # onto the still-shattered graph: `MERGE (etype:Wiki {n:"System_Event"})` matched
+        # the 41,751 duplicate type nodes and THREE events created 125,253 instance nodes
+        # in about three minutes.
+        #
+        # THE GENERAL LAW, which the ordering of this whole repair depends on: converting
+        # CREATE to MERGE does not merely fail to help on a shattered graph, IT AMPLIFIES.
+        # The de-duplication must therefore come BEFORE (or together with) any CREATE->MERGE
+        # conversion, never after it. A collapsed MERGE is safe in both worlds: exactly one
+        # row whether the name has 1 node or 41,751, so this is correct before AND after the
+        # dedupe lands.
         query = """
         MERGE (timeline:Wiki {n: "System_Timeline"})
         ON CREATE SET timeline.d = "Timeline of all background system events (daemon, linker, summarizer, projector)",
                       timeline.t = datetime(), timeline.source = "system"
+        WITH timeline LIMIT 1
         MERGE (day:Wiki {n: $day})
         ON CREATE SET day.d = "Day container", day.t = datetime()
+        WITH timeline, day LIMIT 1
         MERGE (timeline)-[:HAS_PART]->(day)
+        WITH day LIMIT 1
+        MERGE (etype:Wiki {n: "System_Event"})
+        ON CREATE SET etype.d = "A background system event (daemon, linker, summarizer, projector).",
+                      etype.t = datetime(), etype.source = "system"
+        WITH day, etype LIMIT 1
         CREATE (e:Wiki {n: $name, d: $desc, t: datetime(), source: $source, linked: true, timeline_linked: true})
-        CREATE (e)-[:IS_A]->(:Wiki {n: "System_Event"})
+        MERGE (e)-[:IS_A]->(etype)
         MERGE (e)-[:PART_OF]->(day)
         """
         neo4j_conn.execute_query(query, {
@@ -1426,7 +1752,26 @@ def linker_thread(stop_event: threading.Event):
     
     heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
     base_path = str(Path(heaven_data_dir) / 'wiki')
-    
+
+    # LINKER DEBOUNCE (Isaac 2026-08-09, issue 142): only link nodes UNTOUCHED for this many
+    # seconds. Every write/edit resets last_modified in the same SET that flips linked=false,
+    # so the window restarts on each modification — an actively-edited node is NEVER linked
+    # mid-session (which is what made surgical str-edits compose against stale linked text),
+    # and gets linked exactly once after the dust settles. Nodes with no last_modified (legacy
+    # backlog) link immediately, preserving existing behavior for them.
+    _DEFAULT_DEBOUNCE_S = 1800
+    _raw_debounce = os.getenv('CARTON_LINKER_DEBOUNCE_S', str(_DEFAULT_DEBOUNCE_S))
+    try:
+        linker_debounce_s = int(_raw_debounce)
+        if linker_debounce_s < 0:
+            raise ValueError("negative")
+    except (ValueError, TypeError):
+        print(f"[Linker] ERROR: CARTON_LINKER_DEBOUNCE_S={_raw_debounce!r} is not a "
+              f"non-negative integer — using default {_DEFAULT_DEBOUNCE_S}s", file=sys.stderr)
+        linker_debounce_s = _DEFAULT_DEBOUNCE_S
+    print(f"[Linker] Debounce: {linker_debounce_s}s (nodes modified more recently are skipped)",
+          file=sys.stderr)
+
     linked_total = 0
     cache_refresh_interval = 300  # Refresh cache every 5 mins
     last_cache_refresh = 0
@@ -1446,16 +1791,38 @@ def linker_thread(stop_event: threading.Event):
                 except Exception as e:
                     print(f"[Linker] Cache refresh error: {e}", file=sys.stderr)
             
-            # Query for unlinked concepts (batch of 100) — newest first so recent adds get scored fast
-            query = """
+            # Query for unlinked concepts (batch of 100) — newest-eligible first. THE DEBOUNCE
+            # (issue 142): skip anything modified within the window; last_modified is stamped in
+            # the same SET that flips linked=false, so each write/edit restarts the window and an
+            # actively-edited node is never linked mid-session. last_modified IS NULL (legacy
+            # backlog / nodes created outside the UNWIND path) links immediately, as before.
+            #
+            # ⛔ THE CUTOFF IS COMPUTED IN PYTHON, NOT WITH duration() IN CYPHER (issue 176).
+            # `datetime() - duration({seconds: $s})` is neo4j-only: kuzu 0.11.3 has no duration()
+            # and tries to parse the map literal AS an interval string — measured on the tenant
+            # box: `Conversion exception: Error occurred during parsing interval. Given:
+            # "{seconds: 1800}"`, crashing this thread every cycle forever (95 logged crashloops)
+            # so nothing was ever linked or timeline-linked there. Python already holds the
+            # clock; one UTC cutoff parameter compared with datetime($cutoff) is engine-neutral
+            # (the kuzu adapter translates datetime( → timestamp(, both engines parse the ISO
+            # literal, and both stamp last_modified as a UTC instant). Same pattern as the
+            # separator-as-parameter and prefix-match-in-python fixes above.
+            # A node of a VERBATIM type (Desc_Content, the raw content carton keeps as written) is never
+            # selected, so the linker never rewrites a doc(m) content node (card 813); the predicate is
+            # carton_utils.linker_eligible, the one the crown counts over the live graph.
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            from carton_mcp.carton_utils import VERBATIM_TYPES, linker_eligible
+            cutoff = (_dt.now(_tz.utc) - _td(seconds=linker_debounce_s)).strftime('%Y-%m-%dT%H:%M:%S')
+            query = f"""
             MATCH (c:Wiki)
-            WHERE c.linked = false OR c.linked IS NULL
+            WHERE {linker_eligible('c')}
             RETURN c.n as name, c.d as description
             ORDER BY c.t DESC
             LIMIT 100
             """
-            
-            result = linker_neo4j.execute_query(query)
+
+            result = linker_neo4j.execute_query(
+                query, {'cutoff': cutoff, 'verbatim_types': list(VERBATIM_TYPES)})
 
             # extract records from result (may be tuple or list)
             records = result[0] if isinstance(result, tuple) else result
@@ -1545,28 +1912,34 @@ def worker_daemon():
     Continuously watches queue directory and processes files.
     When queue is empty, pushes git changes.
     """
-    import fcntl
-
     # PID FILE LOCK - prevents duplicate workers from spawning
     # This prevents race conditions during MCP restart that cause:
     # - Multiple workers competing for queue files
     # - Concurrent Neo4j writes → deadlock
     # - Neo4j CPU spike (200% = 2 workers)
     # - Docker resource exhaustion
-    pid_file = Path('/tmp/carton_worker.pid')
+    #
+    # The acquisition itself lives in carton_worker_control — the module that already owns
+    # worker lifecycle (matching, stopping, spawning), one capability one module. It is there
+    # rather than inline because the ORDER of open-vs-flock is the thing that has to be
+    # PROVEN, and it cannot be proven here: this function starts chroma servers and never
+    # returns, so no test can call it. See its docstring for issue #276 item 4 — the old
+    # `open(pid_file, 'w')` truncated the file AT OPEN, before flock could refuse, so a
+    # starter that lost the race blanked the winner's pid on its way out.
+    #
+    # `pid_fd` is bound for this function's whole lifetime on purpose: closing the handle
+    # RELEASES the lock, and a released lock is how two workers end up draining one queue.
+    pid_file = WORKER_PID_FILE
 
     try:
-        pid_fd = open(pid_file, 'w')
-        fcntl.flock(pid_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        pid_fd.write(str(os.getpid()))
-        pid_fd.flush()
-        print(f"[Worker] Acquired PID lock (PID {os.getpid()})", file=sys.stderr)
-    except BlockingIOError:
-        print(f"[Worker] Another worker already running (PID file locked) - exiting gracefully", file=sys.stderr)
-        sys.exit(0)  # Exit gracefully - no error
+        pid_fd, _acquired = acquire_pid_lock(pid_file)
     except Exception as e:
         print(f"[Worker] ERROR: Failed to acquire PID lock: {e}", file=sys.stderr)
         sys.exit(1)
+    if not _acquired:
+        print(f"[Worker] Another worker already running (PID file locked) - exiting gracefully", file=sys.stderr)
+        sys.exit(0)  # Exit gracefully - no error
+    print(f"[Worker] Acquired PID lock (PID {os.getpid()})", file=sys.stderr)
 
     print("[Worker] CartON Observation Queue Worker starting...", file=sys.stderr)
 
@@ -1617,8 +1990,89 @@ def worker_daemon():
     queue_dir = get_observation_queue_dir()
     print(f"[Worker] Watching queue directory: {queue_dir}", file=sys.stderr)
 
+    # GIVE THE DEAD-LETTER PILE A READER. Its failures had none: the directory simply
+    # accumulated, and nothing anywhere reported how big it was or what was in it, so
+    # months of lost writes went unnoticed. Reported at every startup, never fatal —
+    # this is a number to look at, not a gate to fail on.
+    try:
+        for _line in dead_letter_report(queue_dir / 'failed').splitlines():
+            print(f"[Worker] {_line}", file=sys.stderr)
+    except Exception as _dl_err:
+        print(f"[Worker] dead-letter report skipped: {_dl_err}", file=sys.stderr)
+
+    # PREFLIGHT: prove the graph can be OPENED before we try to open it for real.
+    #
+    # WHY A SUBPROCESS (measured 2026-08-21): kuzu is embedded C++, and an unreplayable
+    # write-ahead log makes `kuzu.Database(path)` die by SIGSEGV. A signal kills the
+    # interpreter outright — no exception, no traceback, no dead-letter, nothing this
+    # process can log about itself. Under supervisord the worker reaches RUNNING before
+    # it opens the DB, so `autorestart=true` treats every death as a normal exit and
+    # respawns unconditionally: a tenant box crashlooped 274 TIMES over ~15 minutes
+    # while reporting Up with its port published and answering nothing at all. That is
+    # the silent-failure shape this codebase exists to refuse.
+    #
+    # Opening in a CHILD makes the crash observable: the child takes the signal, the
+    # parent survives to say exactly what is wrong and stop. Exit 78 (EX_CONFIG) is
+    # listed in supervisord's `exitcodes`, so supervisord stops respawning and leaves
+    # the program visibly EXITED instead of hiding the fault in a respawn loop.
+    _preflight = _graph_open_preflight()
+    if not _preflight["openable"]:
+        print("\n" + "=" * 78, file=sys.stderr)
+        print("[Worker] FATAL: THE GRAPH CANNOT BE OPENED. THIS BOX CANNOT SERVE.", file=sys.stderr)
+        print(f"[Worker] cause      : {_preflight['reason']}", file=sys.stderr)
+        for _line in _preflight["evidence"]:
+            print(f"[Worker] evidence   : {_line}", file=sys.stderr)
+        print("[Worker] what to do : this process OWNS the database file, so nothing else in", file=sys.stderr)
+        print("[Worker]              the box can read or write the graph while it is down.", file=sys.stderr)
+        print("[Worker]              A large .wal beside a tiny main file means an unreplayable", file=sys.stderr)
+        print("[Worker]              write-ahead log from a kill mid-write. BACK UP BOTH FILES", file=sys.stderr)
+        print("[Worker]              before any recovery attempt — the WAL holds the writes.", file=sys.stderr)
+        print("[Worker] NOT respawning: exiting 78 so this stays visible instead of looping.", file=sys.stderr)
+        print("=" * 78 + "\n", file=sys.stderr)
+        sys.exit(78)
+
     # Create shared Neo4j connection for entire daemon lifetime
     shared_neo4j = _create_shared_neo4j()
+
+    # THE WORKER SERVES THE GRAPH, AND ON EVERY BACKEND.
+    #
+    # On kuzu it MUST: kuzu is embedded and locks its directory against every other process, so
+    # unless this is running, nothing else in the box can read the graph at all. It is started
+    # here, right after the connection exists, because that connection IS what it serves.
+    #
+    # ⛔ IT NO LONGER SKIPS ON NEO4J, and that is the load-bearing half of removing the MCP
+    # server from the box. This block used to be gated on `GRAPH_BACKEND == kuzu`, with the
+    # stated reason that on neo4j the default path stayed byte-identical — true and harmless
+    # while the MCP server was the box's network surface. It is not harmless now: the MCP is
+    # gone (there is no agent in a box to use it; MCPs run on the tenant's own machine and CALL
+    # IN), so this endpoint is the ONLY service surface a box has. Gated on kuzu, a neo4j box
+    # would come up healthy, publish a port, and answer nothing at all.
+    #
+    # It works on both because it is store-agnostic BY CONSTRUCTION: it exposes exactly the four
+    # methods `GraphStore` defines, and `Neo4jStore` and `KuzuStore` both implement them. There
+    # is no dialect knowledge here to be wrong about either engine.
+    #
+    # FAIL-OPEN BY DESIGN: an endpoint that will not bind must never stop the queue drain — the
+    # box keeps ingesting, and says loudly that nothing can read it.
+    _kuzu_endpoint = None
+    try:
+        from carton_mcp.kuzu_query_endpoint import serve_in_thread, DEFAULT_PORT, required_key
+        _kuzu_port = int(os.getenv("KUZU_QUERY_PORT", DEFAULT_PORT))
+        _kuzu_endpoint, _ = serve_in_thread(shared_neo4j._store, _kuzu_port)
+        # REPORT WHAT IT ACTUALLY DID. This line used to say 127.0.0.1 unconditionally,
+        # which becomes a lie the moment CARTON_QUERY_HOST is set — and the one thing an
+        # operator needs from this log is whether the graph is now reachable from off-box
+        # and whether it is gated.
+        _kuzu_host = os.getenv("CARTON_QUERY_HOST", "127.0.0.1")
+        _backend = (os.getenv("GRAPH_BACKEND") or "neo4j").strip().lower()
+        print(f"[Worker] graph query endpoint on {_kuzu_host}:{_kuzu_port} "
+              f"(backend: {_backend}; auth: {'ON' if required_key() else 'off — local only'}; "
+              f"this process owns the database file)", file=sys.stderr)
+    except Exception as exc:
+        traceback.print_exc()
+        print(f"[Worker] WARNING: graph query endpoint did not start ({exc}). The queue drain "
+              f"continues, but NOTHING CAN READ THE GRAPH until it does — this endpoint is the "
+              f"box's only service surface.", file=sys.stderr)
 
     # Start background linker thread
     linker_stop_event = threading.Event()
@@ -1653,14 +2107,70 @@ def worker_daemon():
                 all_concepts = []
                 parsed_files = []  # Track which files parsed successfully
                 failed_files = []  # Track parse failures
+                # TIMELINE MERGES ARE COLLECTED HERE AND RUN AFTER THE CONCEPT WRITE (Phase 2m).
+                # Executing them inline in this parse phase IS the defect — see Phase 2m below.
+                merge_files = []
 
                 for queue_file in batch_files:
+                    # #198: the four-required-rels observation validation, LIVE
+                    # on the UNWIND lane as a LOUD DEAD-LETTER. The old validator
+                    # only existed in the dead process_queue_file path, so the
+                    # live lane validated nothing. A failing observation file is
+                    # annotated with the named reason (error_message — the key
+                    # check_failed_observations/retry_failed_observations already
+                    # read) and moved to failed/; the drain NEVER crashes.
+                    try:
+                        with open(queue_file) as _vf:
+                            _vdata = json.load(_vf)
+                    except Exception:
+                        _vdata = None  # unreadable files fall through to parse, which dead-letters them
+                    if _vdata is not None:
+                        _verrors = observation_validation_errors(_vdata)
+                        if _verrors:
+                            _vreason = "; ".join(_verrors)
+                            print(f"[Worker] VALIDATION dead-letter {queue_file.name}: {_vreason}", file=sys.stderr)
+                            # The reason travels WITH the file to the mover, which records it.
+                            # The wording is unchanged from when this branch annotated inline,
+                            # because it is the string the #198 rule documents.
+                            failed_files.append((
+                                queue_file,
+                                f"observation validation failed (issue #198): {_vreason}",
+                                None))
+                            continue
                     concepts = parse_queue_file_to_concepts(queue_file)
                     if concepts:
                         all_concepts.extend(concepts)
                         parsed_files.append(queue_file)
+                        continue
+                    # Empty parse: check for a TIMELINE-MERGE file (no concept
+                    # payload, so the parse legitimately returns []). Its handler
+                    # previously lived only in the dead process_queue_file path,
+                    # which made EVERY merge file dead-letter unprocessed (found
+                    # 2026-07-19, issue-61 triage). Route it to the live handler.
+                    try:
+                        with open(queue_file) as _qf:
+                            merge_data = json.load(_qf)
+                    except Exception:
+                        merge_data = None
+                    if merge_data and merge_data.get('timeline_merge'):
+                        # DEFERRED TO PHASE 2m — never run here. The merge's target conversation
+                        # is a CONCEPT queued by the same precompact run, and every concept in
+                        # this batch is only ACCUMULATED in this phase: it does not exist in the
+                        # graph until the batch write below. Running the merge here therefore
+                        # found its target absent on every compaction, refused the delete (which
+                        # is correct — the placeholder's edges must never be destroyed with
+                        # nowhere to have moved them), and dead-lettered a file its own error text
+                        # calls retryable. Nothing retries a dead-lettered merge, so a transient
+                        # ordering failure became permanent loss of the conversation POSITION of
+                        # every journal entry in that window — the message ladder survived because
+                        # precompact writes it straight at the real node and never needs the merge.
+                        # Measured 2026-09-14, 2026-09-15 and 2026-09-16, three windows stranded.
+                        merge_files.append((queue_file, merge_data))
                     else:
-                        failed_files.append(queue_file)
+                        failed_files.append((queue_file, (
+                            "the payload could not be parsed into any concept: it matches none of "
+                            "the queue's known shapes (raw_concept / concepts-list / observation / "
+                            "timeline_merge), or its JSON is unreadable."), None))
 
                 print(f"[Worker] Parsed {len(all_concepts)} concepts from {len(parsed_files)} files", file=sys.stderr)
 
@@ -1669,15 +2179,56 @@ def worker_daemon():
 
                 # Phase 2: UNWIND batch create in Neo4j (single batch operation)
                 neo4j_succeeded = False
+                _write_attempts = 0
+                _write_errors = []
                 if all_concepts and shared_neo4j:
-                    result = batch_create_concepts_neo4j(all_concepts, shared_neo4j)
-                    print(f"[Worker] UNWIND result: {result['concepts_created']} concepts, {result['relationships_created']} rels", file=sys.stderr)
+                    # RETRY WITH BACKOFF BEFORE CONDEMNING THE BATCH.
+                    #
+                    # A failure here does not lose ONE payload — it dead-letters every payload
+                    # parsed in the same batch (see the `failed_files.extend` below), up to
+                    # UNWIND_BATCH_SIZE of them. So a momentary store outage cost up to 2000
+                    # payloads at once, each filed as permanently broken, with nothing recording
+                    # that they were only standing next to a failed write.
+                    #
+                    # The reconnect between attempts is the half that actually recovers: the
+                    # common failure is a connection that went stale under the transaction, and
+                    # replacing it is what makes the next attempt succeed. Re-running the write is
+                    # safe because the node UNWIND is a MERGE and the append path already
+                    # de-duplicates, so a retry after a failed attempt cannot double-write.
+                    def _attempt_batch_write():
+                        r = batch_create_concepts_neo4j(all_concepts, shared_neo4j)
+                        print(f"[Worker] UNWIND result: {r['concepts_created']} concepts, {r['relationships_created']} rels", file=sys.stderr)
+                        if r['errors']:
+                            print(f"[Worker] UNWIND errors: {r['errors'][:3]}", file=sys.stderr)
+                        return r
 
-                    if result['errors']:
-                        print(f"[Worker] UNWIND errors: {result['errors'][:3]}", file=sys.stderr)
+                    def _reconnect_before_retry(attempt_no, delay, _r):
+                        # Replacing the connection is the half that actually recovers.
+                        nonlocal shared_neo4j
+                        print(f"[Worker] batch write FAILED (attempt {attempt_no}) — "
+                              f"{len(parsed_files)} file(s) at stake; waited {delay:.1f}s, "
+                              f"reconnecting and retrying", file=sys.stderr)
+                        shared_neo4j = _ensure_neo4j_alive(shared_neo4j)
+                        if shared_neo4j is None:
+                            print("[Worker] no graph connection could be re-established — "
+                                  "stopping the retries", file=sys.stderr)
+                            return False
+                        return True
 
-                    # Success = concepts were created AND no fatal errors
+                    result, _write_attempts = run_with_retry(
+                        _attempt_batch_write,
+                        # Success = concepts were created AND no fatal errors
+                        lambda r: r['concepts_created'] > 0,
+                        backoff_delays(retry_attempts()),
+                        before_retry=_reconnect_before_retry,
+                    )
+                    _write_errors = result['errors']
                     neo4j_succeeded = result['concepts_created'] > 0
+
+                    if neo4j_succeeded and _write_attempts > 1:
+                        print(f"[Worker] batch write RECOVERED on attempt {_write_attempts} — "
+                              f"{len(parsed_files)} file(s) saved from the dead-letter queue",
+                              file=sys.stderr)
 
                     # Create REQUIRES_EVOLUTION for SOUP concepts (incomplete — not projected)
                     for c in all_concepts:
@@ -1722,7 +2273,11 @@ def worker_daemon():
                                     print(f"[Worker] target_desc write failed for {target_name}: {e}", file=sys.stderr)
 
                 elif not shared_neo4j:
-                    print("[Worker] ERROR: No Neo4j connection — files stay in queue", file=sys.stderr)
+                    # States only what THIS site knows. It used to say "files stay in queue" — a claim about
+                    # the files' FATE, which is decided two phases below and which, until issue 280, decided
+                    # the opposite in the same iteration. The site that does not decide the fate no longer
+                    # asserts it; Phase 3 announces it, because Phase 3 is what determines it.
+                    print("[Worker] ERROR: no Neo4j connection — nothing will be attempted this batch", file=sys.stderr)
 
                 # REFACTOR-PLAN [SOMA-UNIFICATION 2026-06-16] — THE SOLE LIVE CALLER of the carton
                 #   ontology fabricator. journal Scalable_Publishing_Giint_Architecture_Soma_Unification_Removal (14:10).
@@ -1795,13 +2350,55 @@ def worker_daemon():
                     # GATED on is_system_type: a SOUP/CODE skill is still in d-chain
                     # scope so SOMA surfaces its release_effect, but an incomplete
                     # concept must NOT project.
+                    #
+                    # GRADE-EXEMPT effects (2026-08-20, e2e run-11 cascade): the gate above
+                    # exists for PROJECTORS — handlers that render the concept's OWN content
+                    # to files (dchain_skill_project / dchain_rule_project), where an
+                    # incomplete (SOUP/CODE) concept must not project. A cascade-COMPLETION
+                    # effect is a different kind: its firing condition is fully encoded in
+                    # its d-chain premise (the giint readiness cascade concludes only when
+                    # every level marked giint_level_ready), and the EVENT concept's verdict
+                    # grade says nothing about that condition — a giint project INSTANCE
+                    # grades CODE by construction ("N d-chain(s) pending"), so gating its
+                    # stamp on is_system_type silently dropped it forever (measured: all 4
+                    # cascade marks persisted in tenant soma_triples, giint_ready stamp never
+                    # dispatched, requirement-6 stalled). Effects named here dispatch at any
+                    # grade; the d-chain premise IS their gate.
+                    _GRADE_EXEMPT_EFFECTS = {
+                        # canonical (2026-08-20): store-side handler in the store's own
+                        # package, so the lean BOX worker (the remote-enqueue drainer,
+                        # which can never install llm_intelligence) can dispatch it.
+                        "carton_mcp.giint_effects:stamp_giint_project_ready",
+                        # legacy path — store rows registered before the move still name it;
+                        # llm_intelligence.projects keeps a thin delegate under this name.
+                        "llm_intelligence.projects:stamp_giint_project_ready",
+                        # issue #148: the carton_task kanban-card sync. A task INSTANCE
+                        # never grades is_system_type (it grades soup/code), so gating
+                        # this on the grade drops it forever — the same measured GIINT
+                        # cascade failure. Its d-chain premise (code_gap) IS the gate;
+                        # the handler is env-gated + never-raising on its own.
+                        "carton_mcp.substrate_projector:sync_task_kanban_card",
+                        # issue #712: the doc-mirror board's build-freed ratchet. A lane
+                        # TRANSITION instance grades soup/code and never is_system_type, exactly
+                        # like the card above, so gating it on the grade would drop it forever.
+                        # Its d-chain premise — the non-build lanes listed positively, with
+                        # code_gap first so an incomplete transition skips — IS the gate.
+                        "carton_mcp.doc_mirror_kanban_effects:ratchet_on_build_freed",
+                        # card 780: LFPOOP join A. Each partial (call graph, rollup wiring, ring
+                        # set) is a vaulted-type INSTANCE that grades code, never is_system_type;
+                        # its d-chain premise (code_gap) IS the gate.
+                        "carton_mcp.lfpoop_join_effects:write_rollup_wiring",
+                        "carton_mcp.lfpoop_join_effects:write_learned_ring_set",
+                        "carton_mcp.lfpoop_join_effects:write_ab3_states",
+                    }
                     import importlib as _importlib
                     _eff_seen = set()
                     for c in all_concepts:
-                        if not c.get("is_system_type"):
-                            continue
                         for eff in (c.get("release_effects") or []):
                             handler = (eff.get("handler") or "").strip()
+                            if (not c.get("is_system_type")
+                                    and handler not in _GRADE_EXEMPT_EFFECTS):
+                                continue
                             # arg = the CartON neo4j node name (c.name). SOMA's
                             # release_effect arg is the SOMA-normalized (lowercase_
                             # underscore) form of THIS SAME concept — it does NOT match
@@ -1901,119 +2498,47 @@ def worker_daemon():
                 # Phase 2.5c: PBML auto-lane-move — detect phase-completion concepts → GIINT update_task_status
                 if all_concepts and neo4j_succeeded:
                     try:
-                        from llm_intelligence.projects import update_task_status as giint_update_task
-                        # done_signal → is_done → IN_REVIEW → measure lane
-                        # inclusion_map → is_measured → DONE → learn lane
-                        # bml_learning → is_measured → DONE → learn lane, THEN direct TK move to archive
-                        PBML_TRIGGERS = {
-                            "done_signal": {"is_done": True, "is_blocked": False, "blocked_description": None, "is_ready": False},
-                            "inclusion_map": {"is_done": True, "is_blocked": False, "blocked_description": None, "is_ready": False, "is_measured": True},
-                            "bml_learning": {"is_done": True, "is_blocked": False, "blocked_description": None, "is_ready": False, "is_measured": True},
-                            "odyssey_learning_decision": {"is_done": True, "is_blocked": False, "blocked_description": None, "is_ready": False, "is_measured": True},
-                        }
-                        # Triggers that also need direct TK archive move (GIINT has no archive status)
-                        # Odyssey_Learning_Decision is the AUTHORITATIVE trigger — GNOSYS bml_learning no longer archives
-                        ARCHIVE_TRIGGERS = {"odyssey_learning_decision"}
+                        # The move itself lives in llm_intelligence.pbml_lane so this daemon
+                        # and the WakingDreamer odyssey tick share ONE implementation. The
+                        # tick exists because under a tenant lane the dispatching worker is
+                        # the BOX worker, which is lean BY RULING and hits the ImportError
+                        # branch below forever — so the ecosystem-side tick is the lane that
+                        # actually runs there. Only the graph access differs between the two
+                        # callers, which is why the module takes an injected query function.
+                        from llm_intelligence.pbml_lane import apply_pbml_move, match_trigger
                         for c in all_concepts:
-                            rels = c.get("relationships", {})
-                            if isinstance(rels, list):
-                                rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
-                            c_isa = [t.lower().replace(" ", "_") for t in rels.get("is_a", [])]
-                            # Match against triggers
-                            matched_trigger = None
-                            for trigger_type in PBML_TRIGGERS:
-                                if trigger_type in c_isa:
-                                    matched_trigger = trigger_type
-                                    break
-                            if not matched_trigger:
+                            trigger = match_trigger(c)
+                            if not trigger:
                                 continue
-                            # Extract GIINT path from part_of relationships
-                            part_of_targets = rels.get("part_of", [])
-                            giint_task = None
-                            giint_deliverable = None
-                            for target in part_of_targets:
-                                t_lower = target.lower()
-                                if t_lower.startswith("giint_task_"):
-                                    giint_task = target
-                                elif t_lower.startswith("giint_deliverable_"):
-                                    giint_deliverable = target
-                            if not giint_task and not giint_deliverable:
-                                print(f"[Worker] PBML trigger {matched_trigger} for {c.get('name','')} — no GIINT task/deliverable in part_of, skipping", file=sys.stderr)
+                            move = apply_pbml_move(c, shared_neo4j.execute_query)
+                            if not move.get("moved"):
+                                print(f"[Worker] PBML lane move skipped for {c.get('name','')}: {move.get('reason')}", file=sys.stderr)
                                 continue
-                            # Resolve GIINT path from Neo4j (task → deliverable → component → feature → project)
-                            try:
-                                target_name = giint_task or giint_deliverable
-                                path_query = (
-                                    "MATCH (t:Wiki {n: $target})-[:PART_OF]->(d:Wiki)-[:PART_OF]->(comp:Wiki)"
-                                    "-[:PART_OF]->(f:Wiki)-[:PART_OF]->(p:Wiki) "
-                                    "WHERE p.n STARTS WITH 'Giint_Project_' "
-                                    "RETURN p.n AS project, f.n AS feature, comp.n AS component, d.n AS deliverable, t.n AS task"
-                                )
-                                with shared_neo4j.driver.session() as neo_session:
-                                    result = neo_session.run(path_query, target=target_name).single()
-                                if not result:
-                                    print(f"[Worker] PBML trigger {matched_trigger} — could not resolve GIINT path for {target_name}", file=sys.stderr)
-                                    continue
-                                # Strip GIINT prefixes for update_task_status params
-                                project_id = result["project"].replace("Giint_Project_", "")
-                                feature_name = result["feature"].replace("Giint_Feature_", "")
-                                component_name = result["component"].replace("Giint_Component_", "")
-                                deliverable_name = result["deliverable"].replace("Giint_Deliverable_", "")
-                                task_id = result["task"].replace("Giint_Task_", "") if result["task"] else None
-                                if not task_id:
-                                    print(f"[Worker] PBML trigger {matched_trigger} — no task_id resolved, skipping", file=sys.stderr)
-                                    continue
-                                params = PBML_TRIGGERS[matched_trigger].copy()
-                                update_result = giint_update_task(
-                                    project_id=project_id,
-                                    feature_name=feature_name,
-                                    component_name=component_name,
-                                    deliverable_name=deliverable_name,
-                                    task_id=task_id,
-                                    key_insight=c.get("description", "")[:200],
-                                    **params
-                                )
-                                print(f"[Worker] 🔄 PBML auto-move: {matched_trigger} → {task_id} in {project_id}: {update_result.get('treekanban_sync', {})}", file=sys.stderr)
-                                # Odyssey ML trigger: done_signal fires the full ML pipeline
-                                if matched_trigger == "done_signal":
-                                    try:
-                                        from odyssey.utils import dispatch_chain as odyssey_dispatch_chain
-                                        concept_name = c.get("name", "")
-                                        # Fire in background thread to not block daemon
-                                        _odyssey_thread = threading.Thread(
-                                            target=odyssey_dispatch_chain,
-                                            args=(concept_name,),
-                                            daemon=True,
-                                            name=f"odyssey_{concept_name[:40]}",
-                                        )
-                                        _odyssey_thread.start()
-                                        print(f"[Worker] 🔬 Odyssey ML chain triggered for {concept_name}", file=sys.stderr)
-                                    except ImportError:
-                                        print("[Worker] Odyssey not installed, skipping ML verification", file=sys.stderr)
-                                    except Exception as ody_err:
-                                        print(f"[Worker] Odyssey trigger failed: {ody_err}", file=sys.stderr)
-                                # Archive triggers: after GIINT moves to learn, directly move TK card to archive
-                                if matched_trigger in ARCHIVE_TRIGGERS:
-                                    try:
-                                        from heaven_bml_sqlite.heaven_bml_sqlite_client import HeavenBMLSQLiteClient
-                                        tk_board = os.getenv("GIINT_TREEKANBAN_BOARD")
-                                        if tk_board:
-                                            tk_client = HeavenBMLSQLiteClient()
-                                            tk_cards = tk_client.get_all_cards(tk_board)
-                                            import json as _json
-                                            for tk_card in tk_cards:
-                                                tk_tags = tk_card.get("tags", [])
-                                                if isinstance(tk_tags, str):
-                                                    tk_tags = _json.loads(tk_tags) if tk_tags.startswith("[") else [tk_tags]
-                                                if task_id in tk_tags and tk_card.get("status") == "learn":
-                                                    archive_result = tk_client._make_request("PUT", f"/api/sqlite/cards/{tk_card['id']}", {"board": tk_board, "status": "archive"})
-                                                    if archive_result:
-                                                        print(f"[Worker] 🏁 PBML archive: card #{tk_card['id']} moved to archive", file=sys.stderr)
-                                                    break
-                                    except Exception as arch_err:
-                                        print(f"[Worker] PBML archive move failed: {arch_err}", file=sys.stderr)
-                            except Exception as path_err:
-                                print(f"[Worker] PBML path resolution failed for {c.get('name','')}: {path_err}", file=sys.stderr)
+                            print(f"[Worker] 🔄 PBML auto-move: {move['trigger']} → {move['task_id']} in {move['project_id']}: {move.get('treekanban_sync', {})}", file=sys.stderr)
+                            if move.get("archived_card"):
+                                print(f"[Worker] 🏁 PBML archive: card #{move['archived_card']} moved to archive", file=sys.stderr)
+                            if move.get("archive_error"):
+                                print(f"[Worker] PBML archive move failed: {move['archive_error']}", file=sys.stderr)
+                            # Odyssey ML trigger: done_signal fires the full ML pipeline.
+                            # Deliberately NOT inside pbml_lane — the two callers fire odyssey
+                            # at different points in their own flow, so each owns its trigger.
+                            if trigger == "done_signal":
+                                try:
+                                    from odyssey.utils import dispatch_chain as odyssey_dispatch_chain
+                                    concept_name = c.get("name", "")
+                                    # Fire in background thread to not block daemon
+                                    _odyssey_thread = threading.Thread(
+                                        target=odyssey_dispatch_chain,
+                                        args=(concept_name,),
+                                        daemon=True,
+                                        name=f"odyssey_{concept_name[:40]}",
+                                    )
+                                    _odyssey_thread.start()
+                                    print(f"[Worker] 🔬 Odyssey ML chain triggered for {concept_name}", file=sys.stderr)
+                                except ImportError:
+                                    print("[Worker] Odyssey not installed, skipping ML verification", file=sys.stderr)
+                                except Exception as ody_err:
+                                    print(f"[Worker] Odyssey trigger failed: {ody_err}", file=sys.stderr)
                     except ImportError:
                         print("[Worker] GIINT not available, skipping PBML auto-lane-move", file=sys.stderr)
                     except Exception as pbml_err:
@@ -2076,8 +2601,52 @@ def worker_daemon():
                     if written_paths:
                         sync_rag_incremental(changed_files=written_paths)
 
-                # Phase 3: Move files based on Neo4j result
-                if neo4j_succeeded:
+                # Phase 2m: TIMELINE MERGES, AFTER THE CONCEPT WRITE AND NEVER BESIDE IT.
+                #
+                # A merge names two nodes: the placeholder session_start minted when the window
+                # OPENED, and the real Conversation node precompact mints when it CLOSED. The
+                # second is an ordinary concept dropped in the same queue run, so it exists only
+                # once the batch write above has run. Dispatching the merge in the parse phase —
+                # which is what this code did until 2026-09-16 — asks it to find a node this very
+                # batch has not written yet, on every single compaction.
+                #
+                # It is deliberately NOT gated on neo4j_succeeded: a batch holding only merge
+                # files parses no concepts at all, so neo4j_succeeded is False while the targets
+                # landed in some earlier batch and the merges are perfectly runnable.
+                #
+                # The failure text is unchanged and still accurate — it is the string the
+                # timeline-merge dev-flow rule documents — but it should now be reachable only
+                # for the cases it actually describes: a target whose own concept dead-lettered,
+                # or a retry of a merge older than its conversation.
+                for _merge_file, _merge_data in merge_files:
+                    if _process_timeline_merge(_merge_data, shared_neo4j):
+                        _merge_file.unlink(missing_ok=True)
+                    else:
+                        failed_files.append((_merge_file, (
+                            "timeline merge failed: the merge target conversation does not "
+                            "exist yet, or one of the placeholder's edges could not be moved "
+                            "onto it. Retryable once the real conversation node lands."), None))
+
+                # Phase 3: Move files based on Neo4j result — THREE outcomes, never two.
+                #
+                # ⛔ THIS BLOCK USED TO ASK ONE QUESTION, `did the write succeed`, AND TREAT
+                # EVERY NO AS THE SAME NO (issue 280). With no connection at all, Phase 2's
+                # `if all_concepts and shared_neo4j` is false, so the retry lane — including
+                # the reconnect that is the half which actually recovers — never runs:
+                # _write_attempts stays 0 and _write_errors stays empty. This block then
+                # condemned every parsed file with `batch write to the graph failed (unknown)
+                # after 0 attempt(s)`, in the SAME batch iteration in which the line one phase
+                # earlier printed `files stay in queue`. Both cannot be true and the log was
+                # the one that was wrong. Measured on the live pile before the fix.
+                #
+                # The decision now lives in carton_deadletter.batch_disposition, as a PURE
+                # function, and that is not ceremony: this block sits inside a loop that
+                # starts chroma servers and never returns, so nothing can call it — the
+                # suite says so in its own words — which is exactly how a two-state
+                # disposition survived here unexamined. A pure decision is the first version
+                # of this rule that can be driven by a test at all.
+                _disposition = batch_disposition(neo4j_succeeded, _write_attempts)
+                if _disposition == PROCESSED:
                     processed_dir = queue_dir / 'processed'
                     processed_dir.mkdir(exist_ok=True)
                     for queue_file in parsed_files:
@@ -2086,22 +2655,45 @@ def worker_daemon():
                             processed_count += 1
                         except Exception as e:
                             print(f"[Worker] Failed to move {queue_file.name}: {e}", file=sys.stderr)
-                else:
-                    # Neo4j failed — move parsed files to failed/ so they don't vanish
+                elif _disposition == REQUEUE:
+                    # NOTHING WAS ATTEMPTED. There was no graph connection, so the write was
+                    # never tried and these payloads have no failure of their own to report.
+                    # They STAY IN THE QUEUE, which is what the message printed one phase
+                    # earlier already promised, and the next tick retries them once
+                    # _ensure_neo4j_alive re-establishes the connection at the top of the
+                    # batch. A payload that was never attempted is not a defective payload.
+                    #
+                    # THE COST, stated here rather than discovered later: while the store
+                    # stays down the queue IS the retry buffer, by design, and it grows
+                    # without bound. That is the deliberate trade — an unbounded queue is
+                    # recoverable and a dead-lettered payload filed under a reason that says
+                    # nothing was tried is not.
                     if parsed_files:
-                        print(f"[Worker] Neo4j write failed — moving {len(parsed_files)} files to failed/", file=sys.stderr)
-                        failed_files.extend(parsed_files)
+                        print(f"[Worker] no graph connection — {len(parsed_files)} file(s) STAY "
+                              f"IN THE QUEUE for the next tick; nothing was attempted, so "
+                              f"nothing is dead-lettered", file=sys.stderr)
+                else:
+                    # Neo4j failed after every retry — dead-letter the parsed files WITH the
+                    # store's own error text. These payloads are not defective; they were
+                    # standing in a batch whose write failed, and the recorded reason is what
+                    # lets a later reader tell those two cases apart at all.
+                    if parsed_files:
+                        _reason = batch_failure_reason(_write_errors, _write_attempts)
+                        print(f"[Worker] Neo4j write failed after {_write_attempts} attempt(s) — "
+                              f"dead-lettering {len(parsed_files)} file(s), each carrying the reason",
+                              file=sys.stderr)
+                        failed_files.extend(
+                            (f, _reason, _write_attempts) for f in parsed_files)
 
-                # Move failed parse files
+                # Move every failed file, EACH CARRYING ITS OWN REASON.
+                # This replaces a bare rename that recorded nothing: a payload landed in
+                # failed/ with no trace of why, so a transient rejection and a permanently
+                # malformed one were indistinguishable forever after.
                 if failed_files:
                     failed_dir = queue_dir / 'failed'
-                    failed_dir.mkdir(exist_ok=True)
-                    for queue_file in failed_files:
-                        try:
-                            queue_file.rename(failed_dir / queue_file.name)
+                    for queue_file, reason, attempts in failed_files:
+                        if dead_letter(queue_file, failed_dir, reason, attempts=attempts):
                             failed_count += 1
-                        except Exception:
-                            pass
 
                 print(f"[Worker] Batch done. Total: {processed_count} processed, {failed_count} failed", file=sys.stderr)
 

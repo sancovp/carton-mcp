@@ -1,9 +1,11 @@
 ---
 name: mcp-skill-carton
-description: "WHAT: the CartON MCP — a persistent knowledge graph (Neo4j + ChromaDB) you add concepts to, query, edit, and project. WHEN: persisting knowledge, creating observations/concepts, querying concept networks, semantic search, or editing a concept's description/structured data."
+description: "WHAT: the CartON MCP, a persistent knowledge graph you add to, query, edit and project. WHEN: persisting or querying knowledge in CartON."
 ---
 
 # mcp-skill-carton
+
+**In full:** WHAT: the CartON MCP — a persistent knowledge graph (Neo4j + ChromaDB) you add concepts to, query, edit, and project. WHEN: persisting knowledge, creating observations/concepts, querying concept networks, semantic search, or editing a concept's description/structured data.
 
 MCP shim index for CartON (Cartographic Ontology Net) — a persistent knowledge graph on Neo4j (the
 `:Wiki` namespace) + ChromaDB (semantic search). Saying a concept POSTs an `add_event` to SOMA :8091,

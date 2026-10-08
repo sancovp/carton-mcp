@@ -150,6 +150,34 @@ def test_publish_manifest_no_comment_omits_key():
     assert parsed["units"] == []
 
 
+def test_publish_manifest_preserves_non_ascii():
+    """The rendered bytes must carry a literal em-dash, never a \\u2014 escape.
+
+    This is a BYTE-level assertion on purpose. json.loads round-trips both forms
+    identically, so a parsed-value assertion cannot see the defect: an escaped
+    manifest parses to exactly the same object and every earlier test here passes.
+    What differs is the FILE, and the file is the artifact — the two other writers of
+    publish-manifest.json (scalable-publishing/bin/render_manifest_from_carton.py and
+    bin/generate_marketplace.py) both pass ensure_ascii=False, and this third writer
+    did not, so it emitted a byte-different manifest that read as permanently modified
+    in git. Measured 2026-08-22: 13 escapes on disk against 13 literals at HEAD.
+    """
+    em_dash = "—"
+    units = [{
+        "name": "doc-mirror", "subdir": "d", "public_repo": "r", "pypi": False,
+        "readme_description": f"doc-mirror {em_dash} a plugin.",
+        "readme_links": json.dumps({}), "readme_badges": json.dumps({}),
+    }]
+    out = PublishManifest(units=units, manifest_comment=f"a {em_dash} b").render()
+
+    assert em_dash in out, "em-dash was escaped out of the rendered bytes"
+    assert "\\u2014" not in out, "rendered bytes carry a \\u2014 escape"
+    # and it must still be valid JSON carrying the same values
+    parsed = json.loads(out)
+    assert parsed["_comment"] == f"a {em_dash} b"
+    assert parsed["units"][0]["readme"]["description"] == f"doc-mirror {em_dash} a plugin."
+
+
 if __name__ == "__main__":
     import sys
     tests = [v for k, v in sorted(globals().items())

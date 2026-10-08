@@ -39,7 +39,9 @@ extra bookkeeping is needed. If a real agent later works with that concept and i
 `source='agent'`, it becomes eligible again automatically — this falls out of the eligibility query
 being source-based, per Isaac's design, with nothing extra built for the re-entry case.
 
-THE THREE HARD LAWS this agent's SDNAC obeys (see `WEBBER_SYSTEM_PROMPT`): (1) NEVER touch a served
+THE FOUR HARD LAWS this agent's SDNAC obeys (see `WEBBER_SYSTEM_PROMPT`): (4) NEVER write onto a declared
+system type and never declare one — enforced at the CartON front door by `webbing_write_guard.py`, which
+refuses any `source='webbing_agent'` write that does either. (1) NEVER touch a served
 concept's existing `n.d` — verified mechanism: an add_concept call that OMITS the `concept` (description)
 argument normalizes to an empty string (add_concept_tool_func), and the daemon's write-CASE
 `n.d CONTAINS c.description` branch leaves an existing non-empty `n.d` COMPLETELY UNCHANGED when the
@@ -157,6 +159,58 @@ def _format_rels(rels: dict) -> str:
     )
 
 
+SOMA_RESULT_ACTIONS = (
+    "WHAT TO DO WITH EACH add_concept RESULT. The first line says what was written. The middle lines are "
+    "information: the DEATH block, the 'SOMA:' grade line (MEREO, SOUP, CODE or SYSTEM_TYPE), numbered "
+    "MEREO[n], FILL[n] and SOUP[n] lines in SOMA's words, D2, CB, CRITICAL and the 'SOMA help:' line. A MEREO or "
+    "SOUP grade means the concept is not validly the type it claims: its execution failed, and CartON keeps the "
+    "write so it can be seen. The last lines, each starting 'DO <TOKEN>:', are the instructions; each names the "
+    "information line it acts on, and one naming several tokens ('DO SOUP[2], SOUP[3]: ...') gives the same "
+    "instruction for each. A DO line that asks for a fill says the part is important to fill next only if it is "
+    "inside the meaning you meant; for you that is the meaning the served concept's prose states. Never expand "
+    "past that prose because SOMA names a part: SOMA always names one. Act on them before your next concept:\n"
+    "  a. The DEATH block, CRITICAL, D2, CB and the SOMA help line are not yours to act on; read past them.\n"
+    "  b. 'DO MEREO[n]: this is important to fill next, but only if Y is inside the meaning you meant: define Y "
+    "...' (the same on a FILL[n] line): Y is a type you named that SOMA does not know. When the served prose "
+    "means Y, give Y its four lists: add_concept Y with a one-line concept, is_a naming a concept that already "
+    "exists (never System_Type), part_of, produces, instantiates and source='webbing_agent'. When the prose does "
+    "not mean Y, or you cannot say what Y is, drop the claim: name Y in no further is_a this run. Define Y only, "
+    "one level: if Y's own write comes back with a DO MEREO line naming another type, leave that one. If Y's "
+    "write comes back REFUSED, Y is a declared system type SOMA has not admitted: leave Y and the claim, and do "
+    "not try Y again this run.\n"
+    "  c. 'DO MEREO[n]: this is important to fill next, but only if Y is inside the meaning you meant: declare Y "
+    "a type ...' (the same on a FILL[n] line): declaring a type is not yours; drop the claim: name Y in no "
+    "further is_a this run.\n"
+    "  d. 'DO SOUP[n]: this is important to fill next, but only if it is inside the meaning you meant: "
+    "add_concept X with properties P ..., filled from what X is; otherwise drop the is_a T claim.': when X is a "
+    "concept you were served or created and its prose states each P, supply it: add_concept X with properties "
+    "{\"P\": \"the value\"} for each property, and relationships [{\"relationship\": \"P\", \"related\": "
+    "[\"an existing concept\"]}] for each relationship the line names (omit concept for a served X). When the "
+    "prose does not state it, drop the claim: put T on no further concept this run.\n"
+    "  e. Every other DO line ('DO SOUP[n]: leave it ...', 'DO SOUP[n]: when you know it ...', which names your "
+    "domain or personal-domain tags, 'DO SOUP[n]: do what it says ...'): not yours to fill; leave it.\n"
+    "  f. '❌ ... REFUSED (not written)' or '❌ ... REJECTED': nothing was written; leave that concept alone and "
+    "go on.\n"
+    "  g. No DO line: the write landed; go on.\n"
+    "You are additive only, so a claim already written stays in CartON, not validly its type; dropping it means "
+    "not repeating it."
+)
+
+DOMAIN_AXIS_LAW = (
+    "DOMAIN AND SUBDOMAIN. add_concept requires a domain and a subdomain, and each names a domain node: is_a "
+    "Domain with has_about, part_of a domain whose part_of chain reaches Health, Wealth, Social or Spiritual. For "
+    "every concept you write about a served concept, pass that served concept's own HAS_DOMAIN and HAS_SUBDOMAIN "
+    "from its served relationships. Name a different subdomain only when the served prose is about something no "
+    "served subdomain names, and then pass subdomain_about: one line from the served prose saying what the "
+    "subdomain is about; CartON writes it first, is_a Domain, part_of your domain. When a served concept has no "
+    "HAS_DOMAIN, or its prose is about a domain none names, name a new domain only with domain_about and "
+    "domain_part_of, the existing domain node it sits in. A new name passed without its about param still lands, "
+    "and SOMA grades it soup: not validly a Domain, its execution failed. A domain roots by part_of; hwss_rooted is "
+    "the mark SOMA derives from that chain, so never write an hwss_rooted relationship. A SOUP line about a domain "
+    "or subdomain you did not name new this run is not yours; leave it."
+)
+
+
 def _build_batch_goal(batch: list, rels_by_concept: dict) -> str:
     """SERVE the batch's concept LIST (names + current description + current relationships) in the
     goal, exactly like Sophia's `_build_convo_goal` serves a journal list — the agent does NOT hunt for
@@ -192,9 +246,13 @@ def _build_batch_goal(batch: list, rels_by_concept: dict) -> str:
         f"amending the served concepts above and creating new children). This is the recursion-guard: "
         f"it is a harmless no-op on an already-sourced existing concept (source is set once at creation "
         f"and never overwritten) and it is the load-bearing tag on any brand-new concept you create, so "
-        f"it is never re-served to you or any future webbing-agent run.\n\n"
-        f"Process ALL {len(batch)} concepts above ({names}). Say GOAL ACCOMPLISHED once every one has "
-        f"been given real structure."
+        f"it is never re-served to you or any future webbing-agent run.\n"
+        f"  7. NEVER write onto a concept that is a declared system type, and NEVER put System_Type in an "
+        f"is_a list. A system type is code, declared with params through vault; CartON refuses both writes.\n"
+        f"  8. {DOMAIN_AXIS_LAW}\n"
+        f"  9. After EVERY add_concept call, act on its result:\n{SOMA_RESULT_ACTIONS}\n\n"
+        f"Process ALL {len(batch)} concepts above ({names}). Once every one has real structure, write "
+        f"```GOAL ACCOMPLISHED``` exactly so, fenced: the run ends only on that text."
     )
 
 
@@ -212,7 +270,7 @@ WEBBER_SYSTEM_PROMPT = (
     "implies, and call add_concept to ADD that structure. ALWAYS pass every relationship as a LIST "
     "(Carton_Schema_Always_List_Requirement — real entities generically have more than one part; never "
     "a bare single value).\n\n"
-    "THE THREE HARD LAWS (never violate any of these):\n"
+    "THE FOUR HARD LAWS (never violate any of these):\n"
     "  1. NEVER touch a served concept's existing description (n.d). When calling add_concept on one of "
     "the concepts you were SERVED, OMIT the `concept` argument (description) entirely — leave it unset. "
     "This is verified safe: an omitted/absent description normalizes to an empty string, and carton's "
@@ -225,11 +283,23 @@ WEBBER_SYSTEM_PROMPT = (
     "when amending a served concept and when creating a brand-new child concept. This is the "
     "recursion-guard that keeps your own output from being re-served back to you: any concept you "
     "create with this tag is excluded from a future webbing-agent run unless a real agent later "
-    "re-engages it through the main queue.\n\n"
+    "re-engages it through the main queue.\n"
+    "  4. NEVER write onto a concept that is a declared system type (it is_a System_Type), and NEVER put "
+    "System_Type in an is_a list. A system type is code, declared with params through vault; CartON refuses "
+    "both writes, so leave such a concept as it is.\n\n"
+    + DOMAIN_AXIS_LAW + "\n\n"
+    + SOMA_RESULT_ACTIONS + "\n\n"
     "Recursion/depth is bounded naturally by your own finite turns this run — atomize what the served "
-    "prose genuinely implies, do not chase structure indefinitely. Execute tool calls immediately; say "
-    "GOAL ACCOMPLISHED once every served concept in your list has real structure."
+    "prose genuinely implies, do not chase structure indefinitely. Execute tool calls immediately; once "
+    "every served concept in your list has real structure, write ```GOAL ACCOMPLISHED``` exactly so, "
+    "fenced: the run ends only on that text."
 )
+
+
+# The system prompt the webbing agent is built with: its prompt behind the absolute persona line naming it, so
+# heaven renders only this prompt instead of pasting every rule, CLAUDE.md and skill under the home dir and
+# the dirs it reads into each call (issue 688).
+WEBBER_AGENT_PROMPT = f"absolute_skillmanager_persona=webbing_agent\n\n{WEBBER_SYSTEM_PROMPT}"
 
 
 def _get_mcp():
@@ -247,25 +317,27 @@ def _get_mcp():
     }}}
 
 
+def _webber_run_config(prompt: str, model: str, mcp_servers: dict):
+    """The SDNA HermesConfig of one webbing-agent run: 3 heaven iterations (max_turns) of up to 200 tool
+    calls each (HeavenAgentArgs.max_tool_calls, the agent constructor argument), compaction on, a fresh
+    history."""
+    from sdna.config import HermesConfig, HeavenInputs, HeavenAgentArgs, HeavenHermesArgs
+    return HermesConfig(
+        name="webbing_agent", system_prompt=WEBBER_AGENT_PROMPT, goal=prompt, model=model, max_turns=3,
+        permission_mode="bypassPermissions", backend="heaven", mcp_servers=mcp_servers,
+        heaven_inputs=HeavenInputs(
+            agent=HeavenAgentArgs(provider="ANTHROPIC", max_tokens=8000, enable_compaction=True,
+                                  max_tool_calls=200),
+            hermes=HeavenHermesArgs(history_id=None)))
+
+
 # ── THE PRIMITIVE: run ONE webbing-agent SDNAC on an arbitrary goal ─────────────────────────────────
 async def call_webber_with_this_prompt(prompt: str, model: str = DEFAULT_MODEL) -> dict:
-    """Run ONE webbing-agent SDNAC to completion on `prompt` (the goal). Compaction ON, thousands of
-    tool calls, history_id=None — unlike Sophia there is no cross-run momentum web to rehydrate from
-    (each run is a fresh, self-contained, bounded batch), so a fresh history every run is correct, not
-    a gap. Returns the flow result dict. Mirrors docmirror-cohere.call_sophia_with_this_prompt almost
-    verbatim (same HeavenInputs shape, same MCP wiring, same model default)."""
+    """Run ONE webbing-agent SDNAC on `prompt` (the goal) with `_webber_run_config`. Returns the flow
+    status."""
     from sdna import sdna_flow, sdnac, ariadne
-    from sdna.config import HermesConfig, HeavenInputs, HeavenAgentArgs, HeavenHermesArgs
-    heaven_inputs = HeavenInputs(
-        agent=HeavenAgentArgs(provider="ANTHROPIC", max_tokens=8000, enable_compaction=True,
-                              extra_agent_kwargs={"max_tool_calls": 2000}),
-        hermes=HeavenHermesArgs(history_id=None),
-    )
     flow = sdna_flow('webbing_agent', sdnac('webbing_agent', ariadne('prep'),
-        config=HermesConfig(
-            name="webbing_agent", system_prompt=WEBBER_SYSTEM_PROMPT, goal=prompt,
-            model=model, max_turns=200, permission_mode="bypassPermissions", backend="heaven",
-            heaven_inputs=heaven_inputs, mcp_servers=_get_mcp())))
+        config=_webber_run_config(prompt, model, _get_mcp())))
     result = await flow.execute()
     return {"status": str(getattr(result, "status", "?"))}
 
@@ -287,33 +359,65 @@ def _next_batch(carton, cap: int = BATCH_CAP) -> list:
     rows = _q(carton,
         "MATCH (c:Wiki) WHERE c.linked = true AND c.source IN $chat_sources AND c.webbed IS NULL "
         "WITH c, size([(c)-[r2]->() WHERE NOT type(r2) IN $base_rels | r2]) AS other_rel_count "
-        "RETURN c.n AS n, c.d AS d, toString(c.t) AS t, other_rel_count "
-        "ORDER BY c.t ASC LIMIT $fetch_cap",
+        "WHERE coalesce(c.score, 0) < $score_threshold OR other_rel_count < $min_rel_count "
+        "RETURN c.n AS n, c.d AS d, toString(c.t) AS t, other_rel_count, c.score AS score "
+        "ORDER BY c.t ASC LIMIT $cap",
         chat_sources=list(CHAT_SOURCES), base_rels=list(BASE_RELS_EXCLUDED),
-        fetch_cap=cap * FETCH_MULTIPLIER)
-    if not rows:
-        return []
+        score_threshold=DEFAULT_SCORE_THRESHOLD, min_rel_count=DEFAULT_MIN_REL_COUNT, cap=cap)
+    print(f"[WebbingAgent] _next_batch: {len(rows)} eligible selected (cap={cap})", file=sys.stderr)
+    return rows
 
-    concept_cache = carton.get_all_concept_names()
-    eligible = [
-        r for r in rows
-        if _is_underdeveloped(r.get("d") or "", concept_cache, r.get("other_rel_count") or 0)
-    ]
-    selected = eligible[:cap]
-    print(f"[WebbingAgent] _next_batch: {len(rows)} candidates fetched, "
-          f"{len(eligible)} eligible, {len(selected)} selected (cap={cap})", file=sys.stderr)
-    return selected
+
+def _mark_examined_and_sufficient(carton, rejected: list) -> int:
+    """Mark a candidate that was EXAMINED and found already well-structured as `webbed`.
+
+    THE HEAD-OF-QUEUE WALL THIS REMOVES, measured 2026-09-13 on the live graph. `_next_batch`
+    fetches the 90 OLDEST un-webbed concepts (`ORDER BY c.t ASC`), and nothing ever marked the
+    ones it REJECTED — so a candidate that is already well-structured stayed un-webbed, stayed the
+    oldest, and was re-fetched on every tick forever. The fetch could never reach past it. The
+    live worker measured exactly that: 90 candidates fetched, 0 eligible, 0 selected, every tick,
+    for EIGHT DAYS — pid alive since 2026-09-05 with `processed_total: 1` and 74,349 concepts
+    queued behind a permanent wall of 90. It was never slow; it was walled off.
+
+    MARKING THEM IS HONEST, NOT A WAIVER. `webbed` means this agent has dealt with the concept,
+    and it has: it looked, and the concept already carries the structure that would have been
+    added. `_verify_and_mark_webbed` applies the IDENTICAL predicate for the identical reason on
+    the other side of a run — comes out well-structured, gets marked; does not, stays eligible.
+    This applies the same rule to a concept that went IN well-structured. No edge, description or
+    source is changed, so the recursion guard is untouched, and a concept that later needs webbing
+    re-enters exactly as before: a real agent re-queues it under a chat source.
+    """
+    from carton_mcp.carton_utils import set_concept_properties
+    marked = 0
+    for r in rejected:
+        try:
+            if set_concept_properties(r["n"], {"webbed": True}, mode="merge").get("success"):
+                marked += 1
+        except Exception as e:
+            print(f"[WebbingAgent] could not mark {r['n']} examined-and-sufficient "
+                  f"({type(e).__name__}: {e})", file=sys.stderr)
+    if rejected:
+        print(f"[WebbingAgent] marked {marked}/{len(rejected)} examined-and-sufficient candidates "
+              f"webbed, so the oldest-first window advances past them", file=sys.stderr)
+    return marked
 
 
 def _pending_count(carton) -> int:
-    """Upper-bound pending count (dry-run/report only): concepts that PASS the coarse Cypher filter
-    (linked/source/webbed). This does NOT apply the description-score signal (which needs the
-    concept_cache computed in Python) — so it can over-report slightly versus what `_next_batch`
-    actually selects. Honest bound, not a precise figure — state what this is, not more."""
+    """EXACT pending count: the same predicate `_next_batch` selects on, as one Cypher count.
+
+    This used to be an UPPER BOUND, and its docstring said so honestly, because the score signal
+    "needs the concept_cache computed in Python" so the count could not apply it. That is no longer
+    true: D2 already scores every concept at write time and persists it as `c.score` (339,746 nodes
+    carry it, 0-100), so the score is a property to read, never a thing to recompute. The count and
+    the selection now ask the graph the identical question and cannot disagree."""
     from carton_mcp.observation_worker_daemon import CHAT_SOURCES
     rows = _q(carton,
         "MATCH (c:Wiki) WHERE c.linked = true AND c.source IN $chat_sources AND c.webbed IS NULL "
-        "RETURN count(c) AS c", chat_sources=list(CHAT_SOURCES))
+        "WITH c, size([(c)-[r2]->() WHERE NOT type(r2) IN $base_rels | r2]) AS other_rel_count "
+        "WHERE coalesce(c.score, 0) < $score_threshold OR other_rel_count < $min_rel_count "
+        "RETURN count(c) AS c",
+        chat_sources=list(CHAT_SOURCES), base_rels=list(BASE_RELS_EXCLUDED),
+        score_threshold=DEFAULT_SCORE_THRESHOLD, min_rel_count=DEFAULT_MIN_REL_COUNT)
     return rows[0]["c"] if rows else 0
 
 
@@ -343,16 +447,20 @@ def _verify_and_mark_webbed(carton, batch: list) -> list:
     names = [r["n"] for r in batch]
     if not names:
         return []
+    # THE SAME PREDICATE THE SELECTION USES, asked of the graph — D2's stored `c.score`, not a
+    # recomputation. A concept that comes back here is one that NO LONGER satisfies the eligibility
+    # predicate, i.e. it improved, so it earns `webbed`. One that still satisfies it is absent from
+    # this result and stays un-webbed, eligible again next tick — no silent partial credit, exactly
+    # as before, with the Python scoring pass removed rather than the rule changed.
     rows = _q(carton,
         "MATCH (c:Wiki) WHERE c.n IN $names "
         "WITH c, size([(c)-[r2]->() WHERE NOT type(r2) IN $base_rels | r2]) AS other_rel_count "
-        "RETURN c.n AS n, c.d AS d, other_rel_count",
-        names=names, base_rels=list(BASE_RELS_EXCLUDED))
-    concept_cache = carton.get_all_concept_names()
+        "WHERE NOT (coalesce(c.score, 0) < $score_threshold OR other_rel_count < $min_rel_count) "
+        "RETURN c.n AS n",
+        names=names, base_rels=list(BASE_RELS_EXCLUDED),
+        score_threshold=DEFAULT_SCORE_THRESHOLD, min_rel_count=DEFAULT_MIN_REL_COUNT)
     marked = []
     for r in rows:
-        if _is_underdeveloped(r.get("d") or "", concept_cache, r.get("other_rel_count") or 0):
-            continue  # still under-structured — leave un-webbed, eligible again next tick
         res = set_concept_properties(r["n"], {"webbed": True}, mode="merge")
         if res.get("success"):
             marked.append(r["n"])
@@ -379,7 +487,18 @@ def call_webber(model: str = DEFAULT_MODEL, dry_run: bool = False, cap: int = BA
     carton = _carton()
     batch = _batch_for_names(carton, concept_names) if concept_names else _next_batch(carton, cap=cap)
     if not batch:
-        return {"processed_batch": False, "pending": 0, "msg": "caught up"}
+        # PENDING IS MEASURED HERE, NEVER ASSERTED. This returned a hardcoded `"pending": 0`
+        # alongside "caught up", which is the strongest possible claim made from no measurement —
+        # and it was WRONG by 74,349 on 2026-09-13, because an empty BATCH means nothing eligible
+        # was found in the fetched window, not that the queue is empty. The worker reads this
+        # number, sees 0, takes catch_up_once's `n == 0` branch, writes caught_up=true and logs
+        # NOTHING (the one return path there with no log call) — so eight days of a walled-off
+        # queue rendered as a healthy caught-up lane on every surface that asked.
+        remaining = _pending_count(carton)
+        return {"processed_batch": False, "pending": remaining,
+                "msg": ("caught up" if remaining == 0 else
+                        f"no eligible concept in the fetched window, but {remaining} remain "
+                        f"un-webbed — the window is oldest-first and does not reach them")}
     if dry_run:
         return {"dry": True, "batch_size": len(batch), "names": [b["n"] for b in batch],
                 "pending": _pending_count(carton)}
