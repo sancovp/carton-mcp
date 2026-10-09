@@ -111,6 +111,70 @@ def remote() -> bool:
 
 
 # ----------------------------------------------------------------------------------------------
+# THE HOST'S STATE CROSSES AS HEADERS — a flag on the agent's machine changes what the SDK sends
+# ----------------------------------------------------------------------------------------------
+# A flag file, an active identity, a kill switch: each lives on the machine the SDK runs on, the
+# SDK reads it there, and what it reads shapes the call — the box never sees a file, only the
+# call. `host_flags()` is what the client reads; `REQUEST` is what the server keeps, per request
+# thread, for the operations to read through `request_user()` / `request_flag()`.
+
+_HOST_FLAG_FILES = {
+    # the SM gate engages when its enable file exists and its kill switch does not
+    "sm_gate": ("CARTON_SM_GATE_ENABLED", "/tmp/heaven_data/carton_sm_gate_enabled",
+                "CARTON_SM_GATE_DISABLED", "/tmp/heaven_data/carton_sm_gate_disabled"),
+}
+
+
+def host_flags(env=None) -> Dict[str, bool]:
+    """The flags of THIS machine, read from its files: what the SDK forwards with every call."""
+    env = os.environ if env is None else env
+    flags = {}
+    for name, (on_var, on_default, off_var, off_default) in _HOST_FLAG_FILES.items():
+        on = os.path.exists(env.get(on_var, on_default))
+        off = os.path.exists(env.get(off_var, off_default))
+        flags[name] = bool(on and not off)
+    return flags
+
+
+def host_identity(env=None) -> str:
+    """Who is acting on THIS machine: `CARTON_USER`, else the active identity a persona declared
+    (the cross-process file), else `AGENT_IDENTITY`, else ""."""
+    env = os.environ if env is None else env
+    user = (env.get("CARTON_USER") or "").strip()
+    if user:
+        return user
+    try:
+        from carton_mcp import sm_gate
+        active = sm_gate.get_active_identity()
+    except Exception:  # noqa: BLE001 — a missing module is "no persona", not a failure
+        active = None
+    return (active or env.get("CARTON_SM_ACTOR") or env.get("AGENT_IDENTITY") or "").strip()
+
+
+REQUEST = threading.local()
+
+
+def request_user() -> str:
+    """The caller's identity for the request this thread serves ("" outside a request)."""
+    return getattr(REQUEST, "user", "") or ""
+
+
+def request_flag(name: str) -> bool:
+    """A host flag the caller forwarded with this request (False outside a request)."""
+    return bool((getattr(REQUEST, "flags", None) or {}).get(name))
+
+
+def _set_request(user: str, flags: Dict[str, bool]) -> None:
+    REQUEST.user = user
+    REQUEST.flags = dict(flags)
+
+
+def _clear_request() -> None:
+    REQUEST.user = ""
+    REQUEST.flags = {}
+
+
+# ----------------------------------------------------------------------------------------------
 # THE OPERATIONS — registered by server_fastmcp with @operation(name), one beside each tool
 # ----------------------------------------------------------------------------------------------
 
@@ -241,7 +305,7 @@ def call_carton(operation: str, params: Optional[Dict[str, Any]] = None, *,
     import urllib.request
 
     key = key if key is not None else os.environ.get("CARTON_KEY", "")
-    user = user if user is not None else os.environ.get("CARTON_USER", "")
+    user = user if user is not None else host_identity()
     if timeout is None:
         timeout = float(os.environ.get("CARTON_TIMEOUT_S") or DEFAULT_TIMEOUT_S)
     body = json.dumps({"operation": name, "params": params}, default=_jsonable).encode("utf-8")
@@ -250,6 +314,9 @@ def call_carton(operation: str, params: Optional[Dict[str, Any]] = None, *,
         headers["Authorization"] = f"Bearer {key}"
     if user:
         headers["X-Carton-User"] = user
+    on = [name for name, value in host_flags().items() if value]
+    if on:
+        headers["X-Carton-Flags"] = ",".join(on)
     req = urllib.request.Request(f"{url}/call", data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -350,6 +417,10 @@ def _make_handler(key: str, gate, dispatch: Callable[[str, Dict[str, Any]], Any]
                     gate(operation, params)
                 except Exception as exc:  # noqa: BLE001 — 402: understood, authenticated, declined
                     return self._send(402, {"ok": False, "error": f"{exc}"})
+            # the caller's identity and host flags, kept for this request's thread only
+            flags = {name.strip(): True for name in (self.headers.get("X-Carton-Flags") or "").split(",")
+                     if name.strip()}
+            _set_request((self.headers.get("X-Carton-User") or "").strip(), flags)
             try:
                 result = dispatch(operation, params)
             except CartonError as exc:
@@ -357,6 +428,8 @@ def _make_handler(key: str, gate, dispatch: Callable[[str, Dict[str, Any]], Any]
             except Exception as exc:  # noqa: BLE001 — the operation's own message, readable as itself
                 logger.exception("carton operation %s failed", operation)
                 return self._send(400, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                _clear_request()
             self._send(200, {"ok": True, "result": result})
 
         def log_message(self, *args):

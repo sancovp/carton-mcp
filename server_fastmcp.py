@@ -207,8 +207,14 @@ _neo4j_conn = _create_shared_neo4j()
 # Initialize utilities with shared connection
 utils = CartOnUtils(shared_connection=_neo4j_conn)
 
-# Stash for failed add_concept payloads — retry merges without re-typing everything
+# Stash for failed add_concept payloads — retry merges without re-typing everything. SERVED, the
+# stash is the box's and every caller of the account shares the process, so a key is the caller's:
+# one caller's failed write never merges into another caller's retry of the same name.
 _concept_stash: dict = {}
+
+
+def _stash_key(name: str):
+    return (_carton_api.request_user(), name) if _carton_api.SERVING else name
 
 # --- SM-GATE wiring (the carton-native CyberneticiRcus state-machine gate on the LIVE tool surface) ---
 # Isaac 2026-06-20: every tool that retrieves/queries is gated by the active state machine and checks
@@ -224,6 +230,11 @@ _SM_GATE_ENABLE_FLAG = os.getenv("CARTON_SM_GATE_ENABLED",
                                  "/tmp/heaven_data/carton_sm_gate_enabled")
 
 def _sm_gate_on() -> bool:
+    # THE FLAG IS THE HOST'S: on the agent's machine the SDK reads the enable file and the kill
+    # switch (`carton_api.host_flags`) and forwards "sm_gate" with the call; the process serving
+    # the box reads what was forwarded, never its own files. In-process, the two are one machine.
+    if _carton_api.SERVING:
+        return _carton_api.request_flag("sm_gate")
     try:
         return os.path.exists(_SM_GATE_ENABLE_FLAG) and not _sm_gate.gate_disabled()
     except Exception:
@@ -235,8 +246,13 @@ def _sm_actor() -> str:
     # the skill-manager-mcp process — env can't cross processes at runtime, so the persona hands its
     # carton_identity over via a file, exactly like the gate's own flag-files) FIRST, then env,
     # default 'Gnosys'. Absent the file => unchanged ('Gnosys'), so this is default-safe.
-    handle = (_sm_gate.get_active_identity()
-              or os.getenv("CARTON_SM_ACTOR") or os.getenv("AGENT_IDENTITY") or "Gnosys")
+    # Served: the actor is the caller the SDK named (`X-Carton-User`, from the agent's machine —
+    # its persona file, its env); the box's own files name no one.
+    if _carton_api.SERVING:
+        handle = _carton_api.request_user() or "Gnosys"
+    else:
+        handle = (_sm_gate.get_active_identity()
+                  or os.getenv("CARTON_SM_ACTOR") or os.getenv("AGENT_IDENTITY") or "Gnosys")
     # "identities are actual things" (Isaac 2026-06-23): resolve the raw carton_identity handle to its
     # Agent_Identity ENTITY node (MERGE-ensured) so the gate's lifecycle/Execution_State attaches to a
     # REAL identity node, not a bare handle that matches nothing. Only reached when the gate is ON
@@ -582,7 +598,7 @@ def _op_add_concept(
             f"❌ Invalid personal_domain '{personal_domain}'. Must be one of: "
             f"{', '.join(PERSONAL_DOMAINS)}"
         )
-    stash_key = concept_name.strip()
+    stash_key = _stash_key(concept_name.strip())
     if clear_stash:
         _concept_stash.pop(stash_key, None)
     try:
@@ -1099,11 +1115,15 @@ def _op_add_document_concept(
         # #206 canonical-path gate — SYNCHRONOUS at the front door, before anything
         # is queued, precisely because the queue path above is fire-and-forget and
         # its failures are silent: the caller must see this refusal.
-        from carton_mcp.carton_pathguard import check_write, CartonPathRefused
-        try:
-            check_write(canonical_path, "create")
-        except CartonPathRefused as e:
-            return f"❌ REFUSED (not queued): {e}"
+        # The path is the CALLER's: the document lives on the agent's host, and the tool runs this
+        # guard there against the host's own roots before calling; the box stores the path as given
+        # (`has_canonical_path`) and never resolves it against its own disk.
+        if not _carton_api.SERVING:
+            from carton_mcp.carton_pathguard import check_write, CartonPathRefused
+            try:
+                check_write(canonical_path, "create")
+            except CartonPathRefused as e:
+                return f"❌ REFUSED (not queued): {e}"
 
         # Build relationships list
         rels = []
@@ -1175,6 +1195,12 @@ def add_document_concept(
     Returns:
         Formatted result showing success/failure
     """
+    # the path is this machine's — guarded here, against this machine's sanctioned roots
+    from carton_mcp.carton_pathguard import check_write, CartonPathRefused
+    try:
+        check_write(canonical_path, "create")
+    except CartonPathRefused as e:
+        return f"❌ REFUSED (not queued): {e}"
     return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("add_document_concept", {"concept_name": concept_name, "description": description, "canonical_path": canonical_path, "template": template, "relationships": relationships})))
 
 
@@ -1224,7 +1250,7 @@ def _op_add_observation_batch(observation_data: dict, hide_youknow: bool = False
         geometry_warning = _check_observation_geometry(observation_data)
 
         # Merge from stash if previous observation failed
-        stashed_obs = _concept_stash.pop("_observation_pending", None)
+        stashed_obs = _concept_stash.pop(_stash_key("_observation_pending"), None)
         if stashed_obs:
             # Merge: current tags take precedence, stashed fills gaps
             for tag in ("insight_moment", "struggle_point", "daily_action", "implementation", "emotional_state"):
@@ -1241,7 +1267,7 @@ def _op_add_observation_batch(observation_data: dict, hide_youknow: bool = False
             return f"✅ {result}\n\n⚠️ WARN: GEOMETRY ERROR: {warning_text} -- You may want to keep observing accordingly"
         return f"✅ {result}"
     except Exception as e:
-        _concept_stash["_observation_pending"] = observation_data
+        _concept_stash[_stash_key("_observation_pending")] = observation_data
         traceback.print_exc()
         return (
             f"❌ {str(e)}\n\n"
@@ -1748,40 +1774,32 @@ CartON Usage Guide:
             traceback.print_exc()
             result_parts.append(f"❌ Error retrying failed observations: {str(e)}")
 
-    if enable_gps:
-        try:
-            heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-            gps_flag_file = Path(heaven_data_dir) / 'carton_gps_enabled'
-            gps_flag_file.write_text('1')
-            result_parts.append("✅ GPS auto-injection enabled")
-        except Exception as e:
-            traceback.print_exc()
-            result_parts.append(f"❌ Error enabling GPS: {str(e)}")
-
-    if disable_gps:
-        try:
-            heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-            gps_flag_file = Path(heaven_data_dir) / 'carton_gps_enabled'
-            if gps_flag_file.exists():
-                gps_flag_file.unlink()
-            result_parts.append("✅ GPS auto-injection disabled")
-        except Exception as e:
-            traceback.print_exc()
-            result_parts.append(f"❌ Error disabling GPS: {str(e)}")
-
-    if get_gps_status:
-        try:
-            heaven_data_dir = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-            gps_flag_file = Path(heaven_data_dir) / 'carton_gps_enabled'
-            if gps_flag_file.exists():
-                result_parts.append("GPS auto-injection: ✅ ENABLED")
-            else:
-                result_parts.append("GPS auto-injection: ❌ DISABLED")
-        except Exception as e:
-            traceback.print_exc()
-            result_parts.append(f"❌ Error checking GPS status: {str(e)}")
-
+    # enable_gps / disable_gps / get_gps_status: THE FLAG IS THE HOST'S — the tool handles them on
+    # the agent's machine (`_gps_flag`); an operation never writes a flag into the box.
     return "\n".join(result_parts) if result_parts else "No actions requested"
+
+
+def _gps_flag(enable: bool, disable: bool, status: bool) -> list:
+    """The GPS auto-injection flag of THIS machine — `$HEAVEN_DATA_DIR/carton_gps_enabled`, the file
+    the summarizer's hook on this same machine reads. Local to set, local to check: it changes what
+    the SDK here does, and nothing of it reaches the box."""
+    parts = []
+    flag = Path(os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')) / 'carton_gps_enabled'
+    try:
+        if enable:
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text('1')
+            parts.append("✅ GPS auto-injection enabled")
+        if disable:
+            if flag.exists():
+                flag.unlink()
+            parts.append("✅ GPS auto-injection disabled")
+        if status:
+            parts.append("GPS auto-injection: ✅ ENABLED" if flag.exists() else "GPS auto-injection: ❌ DISABLED")
+    except Exception as e:
+        traceback.print_exc()
+        parts.append(f"❌ Error on the GPS flag: {str(e)}")
+    return parts
 
 
 @mcp.tool()
@@ -1818,7 +1836,11 @@ def carton_management(
     Returns:
         Formatted string with requested information (one per line)
     """
-    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("carton_management", {"restart_bg_server": restart_bg_server, "get_git_repo_url": get_git_repo_url, "get_carton_dir": get_carton_dir, "get_carton_guide": get_carton_guide, "get_requires_evolution_list": get_requires_evolution_list, "sync_rag": sync_rag, "check_failed_observations": check_failed_observations, "retry_failed_observations": retry_failed_observations, "enable_gps": enable_gps, "disable_gps": disable_gps, "get_gps_status": get_gps_status, "page": page})))
+    parts = _gps_flag(enable_gps, disable_gps, get_gps_status)   # this machine's flag, handled here
+    if any((restart_bg_server, get_git_repo_url, get_carton_dir, get_carton_guide, get_requires_evolution_list,
+            sync_rag, check_failed_observations, retry_failed_observations)):
+        parts.append(_carton_api.as_text(_carton_api.call_carton("carton_management", {"restart_bg_server": restart_bg_server, "get_git_repo_url": get_git_repo_url, "get_carton_dir": get_carton_dir, "get_carton_guide": get_carton_guide, "get_requires_evolution_list": get_requires_evolution_list, "sync_rag": sync_rag, "check_failed_observations": check_failed_observations, "retry_failed_observations": retry_failed_observations, "enable_gps": False, "disable_gps": False, "get_gps_status": False, "page": page})))
+    return overflow_to_file("\n".join(parts) if parts else "No actions requested")
 
 
 @_carton_api.operation("rename_concept")
@@ -2301,38 +2323,27 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
 
 @_carton_api.operation("youknow_sparql")
 def _op_youknow_sparql(query: str) -> str:
-    """The operation behind the `youknow_sparql` tool — runs where the graph is; the tool renders its answer."""
+    """The operation behind the `youknow_sparql` tool — SOMA's query, sent to SOMA.
+
+    SOMA is its own system with ONE entrypoint (`POST /event`, `SOMA_URL`); its OWL files live with
+    it, never with CartON. CartON forwards the SPARQL as a `sparql` event and answers with what SOMA
+    answered. A SOMA that cannot be reached is reported as such — nothing here loads an ontology.
+    """
+    import urllib.request as _u
+    import urllib.error as _ue
+    from carton_mcp.add_concept_tool import SOMA_URL
+    body = json.dumps({"source": "carton_youknow_sparql", "sparql": query, "observations": []}).encode()
+    req = _u.Request(SOMA_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        import owlready2
-    except ImportError:
-        return json.dumps({"success": False, "error": "owlready2 not available"})
-    try:
-        import os as _os
-        # SOMA's OWN OWL files (the total-runtime OWL the SOMA validator loads).
-        # soma.owl + uarl.owl + starsystem.owl live next to each other in the soma-prolog package.
-        soma_owl_dir = _os.environ.get(
-            "SOMA_OWL_DIR",
-            "/home/GOD/gnosys-plugin-v2/base/soma-prolog/soma_prolog",
-        )
-        soma_owl_files = ["soma.owl", "uarl.owl", "starsystem.owl"]
-        loaded = []
-        world = owlready2.World()
-        for fname in soma_owl_files:
-            fpath = _os.path.join(soma_owl_dir, fname)
-            if _os.path.exists(fpath):
-                world.get_ontology("file://" + fpath).load()
-                loaded.append(fname)
-        if not loaded:
-            return json.dumps({
-                "success": False,
-                "error": f"No SOMA OWL files found in {soma_owl_dir} (looked for {soma_owl_files}); set SOMA_OWL_DIR",
-            })
-        results = []
-        for row in world.sparql(query):
-            results.append({f"var{i}": str(v) for i, v in enumerate(row)})
-        return json.dumps({"success": True, "loaded": loaded, "results": results}, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        with _u.urlopen(req, timeout=60) as resp:
+            answer = json.loads(resp.read().decode("utf-8"))
+    except _ue.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        return json.dumps({"success": False, "error": f"SOMA {exc.code}: {detail[:600]}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"success": False, "error": f"SOMA unreachable at {SOMA_URL}: {exc}"})
+    result = answer.get("result", answer)
+    return result if isinstance(result, str) else json.dumps(result, indent=2, default=str)
 
 
 @mcp.tool()
@@ -2343,9 +2354,10 @@ def youknow_sparql(query: str) -> str:
     2026-06-15. Loads SOMA's three OWL files into one owlready2 world (soma.owl =
     schema/class definitions, uarl.owl = foundation/core-sentence, starsystem.owl =
     GIINT/Navy/Sanctum/Skills) and runs the SPARQL against that combined world. This is
-    the same OWL the SOMA validator (POST localhost:8091/event) reasons over.
+    the same OWL the SOMA validator (POST `SOMA_URL`) reasons over — CartON sends the query to SOMA
+    as a `sparql` event and returns SOMA's answer.
 
-    This queries the ONTOLOGY, not the CartON Neo4j graph. Use this for:
+    This queries the ONTOLOGY, not the CartON graph. Use this for:
     - Checking OWL class restrictions ("what does GIINT_Deliverable require?")
     - Exploring the foundation ontology structure (uarl) and domain ontologies (starsystem)
 
@@ -3020,7 +3032,10 @@ def equip_frame(frame: str) -> str:
     Returns:
         Frame-specific observation prompt/description
     """
-    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("equip_frame", {"frame": frame})))
+    # THE FRAMES FILE IS THE HOST'S (`CARTON_FRAMES_PATH`, the file `add_frame` extends and the summarizer
+    # on this machine reads): the tool reads it here. The operation touches no graph; it stays registered
+    # for the self-hosted process, where here and the box are one machine.
+    return overflow_to_file(_op_equip_frame(frame))
 
 # CartON Knowledge Management Prompts
 @mcp.prompt()
@@ -4143,7 +4158,11 @@ def substrate_projector(
                   If provided, renders concept through template before projecting
         get_instructions: If True, returns usage instructions
     """
-    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("substrate_projector", {"substrate": substrate, "target": target, "description_only": description_only, "template": template, "get_instructions": get_instructions})))
+    # THE SUBSTRATE IS THE HOST'S — a file, a rule, a skill, an env var on the agent's machine. The tool
+    # projects HERE: every graph read inside (`CartOnUtils.query_wiki_graph`, the SDK's read front door)
+    # routes itself to the box when `CARTON_URL` is set, and every write lands where the agent is. The
+    # operation stays registered for the self-hosted process; served, its env projection refuses.
+    return overflow_to_file(_op_substrate_projector(substrate, target, description_only, template, get_instructions))
 
 
 def _ensure_daemon_running():

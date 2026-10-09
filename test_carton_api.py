@@ -19,6 +19,11 @@ WHAT IT PINS:
   t_g  call_carton with no CARTON_URL runs in-process; with one, it crosses the wire and the server's
        HEAVEN_DATA_DIR is the one written — the two-machine split: the box writes, the client never does
   t_h  every MCP tool is call_carton(<its name>, <its arguments>) + a render; the result is the server's
+  t_j  the host's flags (the SM gate's files) and identity (the persona file) cross as headers and
+       live only for the request that carried them
+  t_k  the tools that touch the host's disk — equip_frame, the GPS flag, substrate_projector,
+       add_document_concept's path guard — run on the host and never reach the box
+  t_l  the retry stash is keyed by the caller when served
   t_i  a real operation end to end: add_concept over the wire lands in the SERVER's queue and
        query_wiki_graph answers rows (ladybug; skipped without it)
 """
@@ -280,6 +285,123 @@ def t_h_every_tool_is_call_carton_plus_rendering():
         server.shutdown(); server.server_close()
         for k, v in prev.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def t_j_the_hosts_flags_and_identity_cross_as_headers_and_live_only_for_the_request():
+    """A flag on the agent's machine (the SM gate's enable file) and the persona it declared travel
+    as headers; the serving thread reads them through request_flag/request_user for that request
+    and nothing else; a second caller without them is served without them."""
+    seen = []
+
+    def dispatch(operation, params):
+        seen.append((operation, api.request_user(), api.request_flag("sm_gate")))
+        return "ok"
+
+    server, url = _serve(dispatch=dispatch, key="")
+    on_flag = os.path.join(TMP, "sm_on")
+    off_flag = os.path.join(TMP, "sm_off")
+    id_file = os.path.join(TMP, "active_identity")
+    prev = {k: os.environ.get(k) for k in ("CARTON_URL", "CARTON_KEY", "CARTON_USER", "CARTON_SM_GATE_ENABLED",
+                                           "CARTON_SM_GATE_DISABLED", "CARTON_SM_ACTIVE_IDENTITY", "AGENT_IDENTITY")}
+    try:
+        os.environ.update(CARTON_URL=url, CARTON_KEY="", CARTON_SM_GATE_ENABLED=on_flag,
+                          CARTON_SM_GATE_DISABLED=off_flag, CARTON_SM_ACTIVE_IDENTITY=id_file)
+        os.environ.pop("CARTON_USER", None); os.environ.pop("AGENT_IDENTITY", None)
+        for f in (on_flag, off_flag, id_file):
+            if os.path.exists(f):
+                os.remove(f)
+        # nothing on the host: no flag, no identity
+        assert api.host_flags() == {"sm_gate": False}
+        assert api.host_identity() == ""
+        api.call_carton("get_concept", {"concept_name": "X"})
+        assert seen[-1] == ("get_concept", "", False), seen[-1]
+        # the host switches the gate on and a persona declares itself (sm_gate's own file)
+        with open(on_flag, "w") as fh:
+            fh.write("1")
+        from carton_mcp import sm_gate
+        import importlib
+        importlib.reload(sm_gate)   # it reads CARTON_SM_ACTIVE_IDENTITY at import
+        sm_gate.set_active_identity("starship_pilot")
+        assert api.host_flags() == {"sm_gate": True}
+        assert api.host_identity() == "starship_pilot"
+        api.call_carton("get_concept", {"concept_name": "X"})
+        assert seen[-1] == ("get_concept", "starship_pilot", True), seen[-1]
+        # the kill switch on the host wins
+        with open(off_flag, "w") as fh:
+            fh.write("1")
+        api.call_carton("get_concept", {"concept_name": "X"})
+        assert seen[-1] == ("get_concept", "starship_pilot", False), seen[-1]
+        # outside a request the serving thread holds nothing
+        assert api.request_user() == "" and api.request_flag("sm_gate") is False
+        # CARTON_USER names the caller over the persona
+        os.environ["CARTON_USER"] = "acct-4"
+        api.call_carton("get_concept", {"concept_name": "X"})
+        assert seen[-1][1] == "acct-4", seen[-1]
+    finally:
+        server.shutdown(); server.server_close()
+        for k, v in prev.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        from carton_mcp import sm_gate
+        import importlib
+        importlib.reload(sm_gate)
+
+
+def t_k_the_tools_that_touch_the_hosts_disk_run_on_the_host():
+    """With CARTON_URL set: equip_frame reads this machine's frames file, carton_management's GPS
+    flag is this machine's file, substrate_projector's instructions and add_document_concept's path
+    guard run here — none of them reaches the box; carton_management's other flags still do."""
+    from carton_mcp import server_fastmcp
+    import asyncio
+    seen = []
+
+    def dispatch(operation, params):
+        seen.append((operation, params))
+        return "served"
+
+    server, url = _serve(dispatch=dispatch, key="")
+    frames = os.path.join(TMP, "frames.json")
+    data_dir = os.path.join(TMP, "heaven_data_k")
+    prev = {k: os.environ.get(k) for k in ("CARTON_URL", "CARTON_KEY", "CARTON_FRAMES_PATH", "HEAVEN_DATA_DIR")}
+    try:
+        os.environ.update(CARTON_URL=url, CARTON_KEY="", CARTON_FRAMES_PATH=frames, HEAVEN_DATA_DIR=data_dir)
+        with open(frames, "w") as fh:
+            json.dump({"my_frame": "Observe: the thing"}, fh)
+        run = lambda name, args: asyncio.run(server_fastmcp.mcp._tool_manager.get_tool(name).run(args))  # noqa: E731
+        out = run("equip_frame", {"frame": "my_frame"})
+        assert "Observe: the thing" in out and seen == [], (out, seen)
+        out = run("carton_management", {"enable_gps": True, "get_gps_status": True})
+        assert "ENABLED" in out and os.path.exists(os.path.join(data_dir, "carton_gps_enabled")) and seen == [], (out, seen)
+        out = run("carton_management", {"disable_gps": True, "get_carton_dir": True})
+        assert "disabled" in out and "served" in out and seen[-1][0] == "carton_management", (out, seen)
+        assert seen[-1][1]["get_carton_dir"] is True and seen[-1][1]["disable_gps"] is False, seen[-1]
+        seen.clear()
+        out = run("substrate_projector", {"get_instructions": True})
+        assert "substrate" in out.lower() and seen == [], (out[:80], seen)
+        out = run("add_document_concept", {"concept_name": "Doc_X", "description": "d", "canonical_path": "/nowhere/outside/doc.md"})
+        assert out.startswith("❌ REFUSED") and seen == [], (out, seen)
+        inside = os.path.join(data_dir, "docs", "doc.md")
+        run("add_document_concept", {"concept_name": "Doc_X", "description": "d", "canonical_path": inside})
+        assert seen[-1][0] == "add_document_concept" and seen[-1][1]["canonical_path"] == inside, seen[-1]
+    finally:
+        server.shutdown(); server.server_close()
+        for k, v in prev.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def t_l_the_stash_is_the_callers_when_served():
+    from carton_mcp import server_fastmcp
+    prev = api.SERVING
+    try:
+        api.SERVING = False
+        assert server_fastmcp._stash_key("X") == "X"
+        api.SERVING = True
+        api._set_request("alice", {})
+        assert server_fastmcp._stash_key("X") == ("alice", "X")
+        api._set_request("bob", {})
+        assert server_fastmcp._stash_key("X") == ("bob", "X")
+    finally:
+        api._clear_request()
+        api.SERVING = prev
 
 
 def t_i_a_real_operation_end_to_end_on_ladybug():

@@ -16,7 +16,7 @@ drains the queue — serves CARTON'S SDK, the MCP's tool list by name, on ONE do
 caller's machine                                    the box (the worker: owns the graph file, drains the queue)
   MCP tool ── call_carton(op, params) ──►  POST /call {"operation","params"} → {"ok","result"}   carton_api.py
   Ribcage · SOMA · any program ─────────►  GET  /health
-                       Bearer CARTON_KEY, X-Carton-User
+                       Bearer CARTON_KEY · X-Carton-User (the host's identity) · X-Carton-Flags (the host's flags)
 no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP beside its own worker)
 ```
 
@@ -24,7 +24,7 @@ no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP 
 
 | file | lines | what it answers |
 |---|---|---|
-| `knowledge/carton-mcp/carton_api.py` | 1–400 | the enum · the registry · `execute` (params validated by the OPERATION's own arg model, top-level `None` dropped) · `call_carton` · `remote()` · the server (key before body · 400 by name · 402 gate · `SERVING` · `WRITE_OVERFLOW_FILES=False` in the serving process) |
+| `knowledge/carton-mcp/carton_api.py` | 1–470 | the enum · the registry · `execute` (params validated by the OPERATION's own arg model, top-level `None` dropped) · `call_carton` · `remote()` · `host_flags` / `host_identity` (the client) · `REQUEST` / `request_user` / `request_flag` (the server, per request thread) · the server (key before body · 400 by name · 402 gate · `SERVING` · `WRITE_OVERFLOW_FILES=False` in the serving process) |
 | `knowledge/carton-mcp/server_fastmcp.py` | 85–125 · 176–297 · 467–513 · 545–4117 · 4120–4151 | overflow rule · import-time `_neo4j_conn`/`utils`/`_concept_stash` · `_graph_conn` · the SM gate's actor · the name gate · every op/tool pair (grep `_carton_api.operation`) · `main()` |
 | `knowledge/carton-mcp/observation_worker_daemon.py` | 1418–1453 · 1915–1975 · 2645–2694 | the worker's own builder and its reconnect · the drain · the server start (fail-open) |
 | `knowledge/carton-mcp/add_concept_tool.py` | 593–616 · 681–700 · 842–925 · 1512–1700 · 2045–2200 · 2751–2820 · 3867–4100 | `/proc` guard · the module connection · the queue (local only) · the helpers that BUILD AND CLOSE their own `KnowledgeGraphBuilder` (harmless: a holder's close is a no-op on the shared store) · `add_concept_tool_func` — THE SDK'S WRITE FRONT DOOR: with `CARTON_URL` set and not `SERVING` it is `call_carton("add_concept", …)` · `rename_concept_func` |
@@ -41,12 +41,24 @@ no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP 
 ## COHERENCE SET — what moves when this moves
 
 - an operation runs in the BOX's process: anything it reads from env, disk or process state is the box's. DO:[resolve
-  every caller-side input in the TOOL and send it as a PARAM — `add_concept` reads a `desc_update_mode="path"` file
-  and runs `_check_name_expectations` on the agent's machine; `observe_from_identity_pov` resolves `AGENT_IDENTITY`
-  there and the op takes the param first; `query_cb_math` runs its passthrough in the TOOL — the CB shell and its key
-  are the agent's machine's, the op touches no graph] NOT:[read `os.environ`/a caller path/a caller flag file inside an op — the
-  SM-gate actor file, the frames file, the CB key file, `SOMA_OWL_DIR`, the GPS flag are still read box-side and owed
-  the same move; the op REFUSES a `path` mode when `SERVING`]
+  every caller-side input in the TOOL and send it as a PARAM or a HEADER, or keep the whole move on the host:
+  · a PARAM — `add_concept` reads a `desc_update_mode="path"` file and runs `_check_name_expectations` on the agent's
+    machine; `observe_from_identity_pov` resolves `AGENT_IDENTITY` there and the op takes the param first;
+    `add_document_concept` runs the path guard on the host (the document's host) and the box stores the path as given
+  · a HEADER — THE HOST'S FLAGS AND IDENTITY CROSS WITH EVERY CALL: `carton_api.host_flags()` reads this machine's
+    flag files (the SM gate's enable file and kill switch) and `host_identity()` its persona file / `CARTON_USER` /
+    `AGENT_IDENTITY`; `call_carton` sends them as `X-Carton-Flags` and `X-Carton-User`; the server keeps them in
+    `carton_api.REQUEST` for that request's thread only (`request_flag` · `request_user`), so `_sm_gate_on()` and
+    `_sm_actor()` read the CALLER's flag and identity when `SERVING` and this machine's files otherwise; the retry
+    stash is keyed `(request_user, name)` when served
+  · THE WHOLE MOVE ON THE HOST — the tool runs the SDK function here and never calls the box: `equip_frame` (the frames
+    file is the host's), `carton_management`'s `enable_gps`/`disable_gps`/`get_gps_status` (`_gps_flag`: the flag the
+    summarizer on this machine reads; the other management flags still cross), `substrate_projector` (the substrate
+    is the host's — its graph reads route themselves to the box through `CartOnUtils.query_wiki_graph`, its writes land
+    here), `query_cb_math` (the CB shell is the host's)
+  · SOMA'S — `youknow_sparql` is a `sparql` payload on SOMA's one entrypoint (`SOMA_URL`); SOMA answers from its own
+    OWL world (`soma_prolog.util_deps.owl_core.sparql`); CartON holds no ontology]
+  NOT:[read `os.environ`/a caller path/a caller flag file inside an op; the op REFUSES a `path` mode when `SERVING`]
 - an operation mutates the BOX's process: `substrate_projector` type `env` refuses when `carton_api.SERVING`; the gate
   snapshots its limit and env at load, so the quota cannot be lifted from the wire. NOT:[a new op that writes
   `os.environ` · an op that writes server files a caller then expects on its own disk]
@@ -79,7 +91,8 @@ no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP 
 - `execute(op, params)`: unknown name → 400 by name; params dropped of top-level `None`, validated by the operation's
   own arg model (`func_metadata` on the op); coroutine results run; `TextContent` → its text
 - `call_carton`: no `CARTON_URL` → `execute` here; with one → `POST {url}/call`, `Bearer CARTON_KEY`,
-  `X-Carton-User CARTON_USER`; refusal → `CartonError(status, message)`
+  `X-Carton-User` = `host_identity()` (`CARTON_USER` · the persona file · `AGENT_IDENTITY`), `X-Carton-Flags` = the
+  host's flags that are on (`host_flags()`); refusal → `CartonError(status, message)`
 - `serve_in_thread`: non-`127.0.0.1` bind with no key REFUSES TO START; key checked before the body (401); `/health`
   behind the key; gate `CARTON_CALL_GATE=module:function` → 402; an op's exception → 400 with its message; the real
   dispatcher sets `SERVING` (so `carton_management(restart_bg_server)` refuses in the worker) and
@@ -99,9 +112,11 @@ no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP 
 | the process env | `substrate_projector` `{"type":"env","var_name":"CARTON_MAX_NODES"}` over the wire (refused), then `CARTON_MAX_NODES` written in the serving process after the gate loaded, then a NEW `add_concept` at the limit | the projection refused; still 402 (`test_call_gate.py` writes 1000000 into the env after load and gets 402) |
 | env names | `git grep` each name in the writer list and the reader list (excluding `CHANGELOG.md`, `docs/`, `context/journal/`, `system/rules/`) | every reader's name has a writer and the reverse; zero hits for a removed name in code or config |
 | the registry | `operations()` (t_a) and per-op signature: parameter names equal to the tool's (t_h) | 31 = 31 = 31; no mismatch |
+| the headers | the host's SM-gate files and persona file set, then `call_carton` against a recording dispatcher | the dispatcher sees `request_user` = the persona and `request_flag("sm_gate")` True; the kill switch makes it False; outside a request both are empty (t_j) |
+| the host's disk | `CARTON_URL` set, then the `equip_frame` · GPS · `substrate_projector` · `add_document_concept` tools | the frames file read here, the GPS flag written here, the path guard refusing here — the dispatcher sees none of them (t_k) |
 | the overflow file | a tool answer over 10k chars | ONE overflow file holding the WHOLE text, its pointer in the answer; two answers in one second never share a name |
 
-Gates, run bare, read the counts: `test_carton_api.py` (9/9) · `test_carton_transport.py` (14/14) ·
+Gates, run bare, read the counts: `test_carton_api.py` (12/12) · `test_carton_transport.py` (14/14) ·
 `test_queue_submit.py` (5/5) · `test_universal_write.py` (6/6) · `base/heaven-framework/tests/test_graph_store.py`
 (42/42) · `application/carton-saas/metering/test_call_gate.py` (9/9) · ribcage `tests.test_carton_store` (7/7).
 `test_carton_api.py` needs `base/answer-refs` and `base/soma-sdk` on `PYTHONPATH`, or t_h/t_i fail at import.
