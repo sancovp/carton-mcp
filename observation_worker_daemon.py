@@ -2036,8 +2036,9 @@ def worker_daemon():
 
     # THE WORKER SERVES THE GRAPH, AND ON EVERY BACKEND.
     #
-    # On kuzu it MUST: kuzu is embedded and locks its directory against every other process, so
-    # unless this is running, nothing else in the box can read the graph at all. It is started
+    # On kuzu it MUST: the engine is embedded and one process owns the file — a second read-write
+    # open is refused by the lock, and a second read_only open (ladybug) is served a stale snapshot —
+    # so unless this is running, nothing else in the box can read the live graph at all. It is started
     # here, right after the connection exists, because that connection IS what it serves.
     #
     # ⛔ IT NO LONGER SKIPS ON NEO4J, and that is the load-bearing half of removing the MCP
