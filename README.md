@@ -91,14 +91,11 @@ and research loops.
 
 **Local (default):** stdio transport. Point your MCP client at the server; nothing else to run.
 
-**Network:** set `CARTON_TRANSPORT` + `CARTON_API_KEY` and Carton serves streamable HTTP behind a
-bearer gate (`network_gateway.py`). Three laws are enforced in code, not documentation:
-
-- **Fail closed** — a network transport without an API key refuses to start. There is no
-  unauthenticated network Carton.
-- **SSE is refused** — long agent sessions produced broken pipes; the transport resolver rejects it
-  outright rather than letting a caller opt into a known failure.
-- **Binds localhost by default** — exposing it is an explicit act.
+**Hosted (the carton box):** the box has no MCP server. Its service surface is the graph query endpoint the
+worker serves (`kuzu_query_endpoint.py`, 8192) behind `CARTON_KEY`; your MCP runs on your own machine with
+`KUZU_QUERY_URL`, `CARTON_USER` and `CARTON_KEY` set and calls in (`KuzuHttpStore`). The transport laws, held in
+`carton_transport.py`: stdio only; `sse` refused; `http`/`streamable-http` refused by name as removed. The endpoint
+refuses to start on a non-local bind without a key.
 
 **Metering:** set `CARTON_MAX_NODES` and the quota gate (`carton_quota.py`) enforces at the write
 chokepoint, before anything reaches the queue. It **refuses growth, not refinement** — at quota,

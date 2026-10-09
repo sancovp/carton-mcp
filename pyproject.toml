@@ -9,9 +9,8 @@ requires-python = ">=3.11"
 dependencies = [
     # range, not exact: heaven-framework's installed metadata pins 2.9.0 while
     # its setup.py pins 2.12.2 (the known standalone drift) — an exact pin here
-    # conflicts with one of them. stdio works on 2.9; NETWORK mode
-    # (CARTON_TRANSPORT=http) needs >=2.11 for the static-token verifier —
-    # network_gateway raises an actionable error below that. Box images pin exact.
+    # conflicts with one of them. stdio is the only transport (carton_transport.py);
+    # the box serves the graph query endpoint, not an MCP. Box images pin exact.
     "answer-refs>=0.1.0",
     "fastmcp>=2.9.0,<3",
     "pydantic==2.10.6",
