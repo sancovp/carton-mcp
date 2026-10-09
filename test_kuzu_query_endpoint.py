@@ -5,8 +5,9 @@
 
 Run as a SCRIPT (this repo's convention — the repo root IS the `carton_mcp` package).
 
-WHY A SECOND PROCESS IS THE ONLY HONEST TEST. kuzu locks its database directory against every
-other process, including read_only opens, which is the entire reason this endpoint exists. A test
+WHY A SECOND PROCESS IS THE ONLY HONEST TEST. The owner holds the database directory: a second
+read-write open is refused by the lock, and a second read_only open is refused (kuzu 0.11.3) or
+served a stale snapshot (ladybug), which is the entire reason this endpoint exists. A test
 that serves and queries inside ONE process proves nothing about that: it would pass just as well
 if the client were quietly opening the file itself. So the client here is a genuine subprocess
 that is given ONLY `KUZU_QUERY_URL` — never `KUZU_DB_PATH` — and the assertion is that it reads
@@ -50,11 +51,22 @@ def check(name, fn):
 
 
 def _has_kuzu():
+    """Whether the engine the seam imports (`ladybug`) is installed."""
     try:
-        import kuzu  # noqa: F401
+        from heaven_base.tool_utils.graph_store import _engine
+        _engine()
         return True
     except ImportError:
         return False
+
+
+def test_ENGINE_UNDER_TEST():
+    """Names the engine this run proved, so a green run says what it was green ON."""
+    if not _has_kuzu():
+        raise AssertionError("ladybug is not installed — this gate cannot verify the thing it exists for")
+    from heaven_base.tool_utils.graph_store import _engine
+    eng = _engine()
+    print(f"ENGINE {eng.__name__} {eng.__version__}")
 
 
 CLIENT = r'''
@@ -76,7 +88,7 @@ print("FOUND " + json.dumps(found, default=str))
 
 def test_a_SEPARATE_PROCESS_reads_and_writes_the_owners_database_over_localhost():
     if not _has_kuzu():
-        raise AssertionError("kuzu is not installed — this gate cannot verify the thing it exists for")
+        raise AssertionError("ladybug is not installed — this gate cannot verify the thing it exists for")
     tmp = tempfile.mkdtemp(prefix="kuzu_endpoint_gate_")
     server = None
     try:
@@ -120,7 +132,7 @@ def test_a_FAILED_QUERY_arrives_as_the_ENGINES_OWN_MESSAGE_not_a_bare_status():
     """Every dialect delta in this port was found by reading an engine error. If the endpoint
     flattened them to a status code, the seam built to expose them would hide them instead."""
     if not _has_kuzu():
-        raise AssertionError("kuzu is not installed")
+        raise AssertionError("ladybug is not installed")
     tmp = tempfile.mkdtemp(prefix="kuzu_endpoint_err_")
     server = None
     try:
@@ -212,7 +224,7 @@ def test_the_endpoint_binds_LOOPBACK_BY_DEFAULT_so_an_existing_box_is_unchanged(
     reader the opposite of the truth keeps passing while misinforming them.
     """
     if not _has_kuzu():
-        raise AssertionError("kuzu is not installed")
+        raise AssertionError("ladybug is not installed")
     tmp = tempfile.mkdtemp(prefix="kuzu_endpoint_bind_")
     server = None
     try:

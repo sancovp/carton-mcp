@@ -72,10 +72,28 @@ def test_the_KUZU_shape_yields_the_SAME_types_in_the_SAME_order():
     assert CartOnUtils._relationship_type_path(value) == ["IS_A", "PART_OF"], value
 
 
+def test_the_LADYBUG_shape_UPPER_CASE_keys_yields_the_SAME_types_in_the_SAME_order():
+    """ladybug spells the engine's internal keys upper-case: `_RELS` carrying `_LABEL`.
+
+    Measured against ladybug 0.21.2 — the literal shape it returns. Read with the lower-case
+    spelling only, this came back `[]` with no error: every network path silently untyped.
+    """
+    value = {
+        "_NODES": [{"_ID": {"offset": 1, "table": 0}, "_LABEL": "Wiki", "n": "B"}],
+        "_RELS": [
+            {"_SRC": {"offset": 0}, "_DST": {"offset": 1}, "_ID": {"offset": 0}, "_LABEL": "IS_A"},
+            {"_SRC": {"offset": 1}, "_DST": {"offset": 2}, "_ID": {"offset": 1}, "_LABEL": "PART_OF"},
+        ],
+    }
+    assert CartOnUtils._relationship_type_path(value) == ["IS_A", "PART_OF"], value
+
+
 def test_BOTH_SHAPES_AGREE_which_is_the_whole_point():
     neo = [{"relationship_type": "HAS_PART"}, {"relationship_type": "IS_A"}]
     kuzu = {"_rels": [{"_label": "HAS_PART"}, {"_label": "IS_A"}]}
+    ladybug = {"_RELS": [{"_LABEL": "HAS_PART"}, {"_LABEL": "IS_A"}]}
     assert CartOnUtils._relationship_type_path(neo) == CartOnUtils._relationship_type_path(kuzu)
+    assert CartOnUtils._relationship_type_path(neo) == CartOnUtils._relationship_type_path(ladybug)
 
 
 def test_the_MILO_CONTRACT_holds_an_ordered_INDEXABLE_list_of_strings():
@@ -87,7 +105,7 @@ def test_the_MILO_CONTRACT_holds_an_ordered_INDEXABLE_list_of_strings():
 
 
 def test_an_EMPTY_or_MISSING_value_is_an_empty_path_never_a_crash():
-    for empty in (None, [], {}, {"_rels": []}, "", 0):
+    for empty in (None, [], {}, {"_rels": []}, {"_RELS": []}, "", 0):
         assert CartOnUtils._relationship_type_path(empty) == [], repr(empty)
 
 
@@ -113,14 +131,16 @@ def test_the_rel_type_FILTER_still_reaches_the_pattern():
 
 # ---------------------------------------------------------------- E2E through the real facade
 
-def test_get_concept_network_RUNS_ON_KUZU_end_to_end():
-    """The actual failing surface: the facade, on a real kuzu database, not a shape unit test."""
-    try:
-        import kuzu  # noqa: F401
-    except ImportError:
-        raise AssertionError("kuzu is not installed — this gate cannot verify the thing it exists for")
-
+def test_get_concept_network_RUNS_ON_THE_EMBEDDED_ENGINE_end_to_end():
+    """The actual failing surface: the facade, on a real embedded database (ladybug, or kuzu 0.11.3
+    through the reference shim), not a shape unit test. This is what proves the key spellings."""
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "base", "heaven-framework"))
+    try:
+        from heaven_base.tool_utils.graph_store import _engine
+        eng = _engine()
+    except ImportError:
+        raise AssertionError("ladybug is not installed — this gate cannot verify the thing it exists for")
+    print(f"        ENGINE {eng.__name__} {eng.__version__}")
     tmp = tempfile.mkdtemp(prefix="kuzu_network_gate_")
     prev_backend = os.environ.get("GRAPH_BACKEND")
     prev_path = os.environ.get("KUZU_DB_PATH")

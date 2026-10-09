@@ -1705,11 +1705,15 @@ class CartOnUtils:
         the same move already used for the timeline-stub typing. One query string, correct
         everywhere, and no Cypher rewriting.
 
-        THE TWO SHAPES, both measured rather than assumed:
-          neo4j → a LIST of relationships, each already through `_serialize_relationship`:
-                  `[{'type': 'Relationship', 'relationship_type': 'IS_A', 'properties': {…}}, …]`
-          kuzu  → ONE recursive-rel DICT, plain python straight through `_serialize_dict`:
-                  `{'_nodes': [...], '_rels': [{'_label': 'IS_A', '_src': …}, …]}`
+        THE THREE SHAPES, all measured rather than assumed:
+          neo4j   → a LIST of relationships, each already through `_serialize_relationship`:
+                    `[{'type': 'Relationship', 'relationship_type': 'IS_A', 'properties': {…}}, …]`
+          ladybug → ONE recursive-rel DICT, plain python straight through `_serialize_dict`, its
+                    internal keys UPPER-case: `{'_NODES': [...], '_RELS': [{'_LABEL': 'IS_A', …}]}`
+          kuzu    → the same dict with the internal keys lower-case (`_nodes` `_rels` `_label`),
+                    the frozen 0.11.3 reference engine.
+        Both spellings are read, because a reader that names one gets `[]` from the other engine
+        with no error at all.
 
         THE RETURN CONTRACT IS AN ORDERED LIST OF TYPE STRINGS and must stay that way:
         `milo/tool_rag.py:221` indexes it (`path[0] == rel_type`) to decide whether a connected
@@ -1717,15 +1721,18 @@ class CartOnUtils:
         """
         if not value:
             return []
-        rels = value.get('_rels', []) if isinstance(value, dict) else value
+        if isinstance(value, dict):
+            rels = value.get('_RELS', value.get('_rels', []))
+        else:
+            rels = value
         if not isinstance(rels, (list, tuple)):
             return []
         types = []
         for rel in rels:
             if not isinstance(rel, dict):
                 continue
-            # `relationship_type` is the serialized-neo4j key; `_label` is kuzu's own.
-            rel_type = rel.get('relationship_type') or rel.get('_label')
+            # `relationship_type` is the serialized-neo4j key; `_LABEL` / `_label` the engine's.
+            rel_type = rel.get('relationship_type') or rel.get('_LABEL') or rel.get('_label')
             if rel_type:
                 types.append(rel_type)
         return types

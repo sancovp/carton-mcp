@@ -1,7 +1,8 @@
 """The localhost query endpoint the kuzu-owning process serves — the other half of KuzuHttpStore.
 
-WHY THIS EXISTS. kuzu is embedded and locks its database directory against every other process,
-including read_only opens. carton is not one process: the MCP server, the worker daemon and each
+WHY THIS EXISTS. The engine (ladybug, Kuzu's continuation) is embedded: the process that opens the
+database directory holds it, a second read-write open is refused by the lock, and a second
+read_only open is served a stale snapshot. carton is not one process: the MCP server, the worker daemon and each
 agent's stdio subprocess all read the graph. So exactly ONE process owns the file and the rest
 ask it. That owner is the WORKER, because it is already the only writer (the queue drain), and
 this module is what it serves.
