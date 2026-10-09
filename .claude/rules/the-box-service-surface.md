@@ -68,7 +68,7 @@ no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP 
   DO:[take `shared_connection` / `_graph_conn()`; a build-and-close helper is harmless but still redundant]
 - ONE overflow per answer, the tool's: `_fmt` renders only; the tool wraps its result in `overflow_to_file` once; the
   file name carries microseconds and the pid. NOT:[an `overflow_to_file` inside an op or a render]
-- an off-box writer has NO local lane on kuzu: `make_store` opens only an embedded file, `submit_queue_entry` writes
+- an off-box writer has NO local lane on Ladybug: `make_store` opens only an embedded file, `submit_queue_entry` writes
   only the local queue. The SDK's two front doors route THEMSELVES: `add_concept_tool_func` and
   `CartOnUtils.query_wiki_graph` are `call_carton(...)` when `CARTON_URL` is set and the process is not `SERVING`, so
   SOMA's vault mirror, the summarizers, dragonbones and Ribcage reach the box without knowing. NOT:[a program-side
