@@ -76,6 +76,9 @@ no CARTON_URL ⇒ call_carton = execute() in this process (self-hosted, the MCP 
 - the enum = the registry = the tool list (`operations()`); a tool and its op share parameter NAMES; the op is the
   SDK's contract for a PROGRAM, so it may take as optional what the tool requires of an AGENT (`add_concept`'s four
   core relations and three domains: None = not given, no relationship built); `execute` validates against the OP
+- THE BOX'S WHOLE ENV is `CARTON_KEY` (its one secret) + `GRAPH_BACKEND` · `KUZU_DB_PATH` · `CARTON_HOST` · `CARTON_PORT` (the
+  machine config); `supervisord.conf` names no other variable — a `%(ENV_X)s` for a variable a driver-made box lacks exits
+  supervisord before anything starts (measured on the first driver-made box). NOT:[`NEO4J_*` anywhere in the box's lane]
 - env names, writer ↔ reader: `CARTON_HOST`/`CARTON_PORT`/`CARTON_KEY`/`CARTON_CALL_GATE` (server) ·
   `CARTON_URL`/`CARTON_KEY`/`CARTON_USER`/`CARTON_TIMEOUT_S` (client) · `CARTON_QUERY_BIND`/`CARTON_HOST_PORT` are
   compose-side port mapping only; a compose box binds `127.0.0.1` inside the container unless `CARTON_HOST=0.0.0.0`

@@ -2600,10 +2600,11 @@ def worker_daemon():
     )
     print(f"[Worker] chroma daemon (embedder) started on port {_chroma_daemon_port}", file=sys.stderr)
 
-    # Verify environment variables
-    required_env = ['NEO4J_URI', 'NEO4J_USER', 'NEO4J_PASSWORD']
+    # Verify environment variables — THE STORE'S OWN: on Ladybug the file's path, on neo4j the server's three.
+    # A box the control plane's driver makes carries CARTON_KEY and the store's settings and nothing of neo4j;
+    # demanding NEO4J_* there stopped the first driver-made box before it served (measured on carton-box-a5).
     optional_env = ['GITHUB_PAT', 'REPO_URL']
-    missing_required = [var for var in required_env if not os.getenv(var)]
+    missing_required = store_env_missing(os.environ)
     missing_optional = [var for var in optional_env if not os.getenv(var)]
 
     if missing_required:
@@ -2745,6 +2746,14 @@ def worker_daemon():
     linker_stop_event.set()
     linker.join(timeout=5)
     print(f"[Worker] Shutdown complete. Final stats: {processed_count} processed, {failed_count} failed", file=sys.stderr)
+
+
+def store_env_missing(env) -> list:
+    """The store's required variables that `env` lacks: `KUZU_DB_PATH` when GRAPH_BACKEND is kuzu (Ladybug — the
+    default), the three NEO4J_* otherwise. Pure, so a test can hand it any environment."""
+    backend = (env.get("GRAPH_BACKEND") or "kuzu").strip().lower()
+    required = ["KUZU_DB_PATH"] if backend == "kuzu" else ["NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD"]
+    return [var for var in required if not env.get(var)]
 
 
 if __name__ == "__main__":
