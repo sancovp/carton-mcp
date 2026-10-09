@@ -50,8 +50,11 @@ time, whatever order the writes were made in. A node's PROPERTIES land after the
 read 0 of 21 nodes with `canonical_intent` two minutes after landing and 21 of 21 fifty minutes later.
 
 - **Measure write lag on the GRAPH:** the entry's own authored stamp (the `_YYYY_MM_DDTHH_MM_SS` its name
-  ends with) against its landing `t`. Never from `/tmp/heaven_data/carton_queue`: a payload file stays in
-  that directory after its node lands, so a file count or the oldest file's age is not the backlog.
+  ends with) against its landing `t`. Never from a file count under `carton_queue`: a drained payload
+  stays there, in `processed/` or `failed/`. The backlog is the top-level `*.json` only — the box
+  endpoint's `/queued` answers it as `waiting`.
+- **Ask whether ONE entry landed:** `POST /queued {"names": [<the name /enqueue answered>]}` →
+  `queued` · `processed` · `failed` · `absent`. `processed` means the batch holding it was written.
 - **Never order by `t` alone** where writes from one batch must stay in sequence: ties are a batch, so
   break them by the authored stamp, then the name. A tied `t` also hides a batch-mate from any
   `n.t < x` search.
@@ -65,7 +68,8 @@ read 0 of 21 nodes with `canonical_intent` two minutes after landing and 21 of 2
   annotates it.
 - **properties — state.** Status, order, timestamps, flags, gates, paths. Especially designs and
   specs: their state lives in properties. Scratch-lane properties write synchronously and never
-  touch `n.d`.
+  touch `n.d`. A value is a str/int/float/bool or a flat list of those; `None` unsets the key; a
+  nested value is refused — JSON-encode it and store the string.
 - **prose (`n.d`) — annotation only.** It describes; it does not carry knowledge. A fact that exists
   only in prose is invisible to every structural reader and to SOMA.
 - **split content (`split_content_concept`) — raw content that was mistakenly a description.** Use it

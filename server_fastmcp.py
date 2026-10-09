@@ -582,7 +582,7 @@ def add_concept(
         hide_youknow: If False (default), SOMA validates and shows SOUP/ONT status. If True, skip validation - silent add.
         clear_stash: If True, discard any stashed payload for this concept before processing. Use when a previous stash has stale/wrong values.
         typed_values: OPTIONAL. List of [value, type] string pairs declaring programming types for relationship targets (e.g. [["Starsystem", "Domain"]] → SOMA receives tv('starsystem','domain')). Unknown values default to string_value.
-        properties: OPTIONAL. Dict of {key: value} NODE PROPERTIES to set on the concept (the scratch lane — status/order/gates/sm config/…). This is the SECOND meaning-channel beside relationships: relationships become graph edges, properties become neo4j node properties. Values are scalars (str/int/float/bool) or flat lists of those — NEVER nested objects or concept-refs. Applied by the daemon via set_properties AFTER the node is written (same drain → no race; reserved/managed keys n/d/t/c/region/source/… are refused). Lets add_concept set BOTH edges and properties in one call (so you do not need a separate set_properties call).
+        properties: OPTIONAL. Dict of {key: value} NODE PROPERTIES to set on the concept (the scratch lane — status/order/gates/sm config/…). This is the SECOND meaning-channel beside relationships: relationships become graph edges, properties become neo4j node properties. Values are scalars (str/int/float/bool) or flat lists of those — NEVER nested objects or concept-refs (JSON-encode a nested value into a string); None unsets the key. Applied by the daemon via set_properties AFTER the node is written (same drain → no race; reserved/managed keys n/d/t/c/region/source/… are refused). Lets add_concept set BOTH edges and properties in one call (so you do not need a separate set_properties call).
         soma_run_id: OPTIONAL. The run-id of a parked SOMA compose-SUGGESTION you are ACCEPTING with this add. SOMA's L3b surfaces a pure-mereo suggestion (a unique admissible candidate for a still-empty required slot) in the `compose_suggestions=` verdict block with a stable run-id (concept.prop.candidate). You ACCEPT it not via a separate RPC but by simply SAYING the fill — calling add_concept with the relationship that fills the slot — and passing soma_run_id so the parked review item is marked resolved (observation is the only operation; the add IS the compose, re-derivation resumes past the gap). Omit to add normally. To REJECT a suggestion, just do not add it.
 
     Returns:
@@ -871,8 +871,9 @@ def set_properties(concept_name: str, properties: dict, mode: str = "merge") -> 
 
     Reserved keys (n, d, t, c, linked, score, source, timeline_linked, odyssey_linked,
     system_generated, last_modified) are REFUSED and reported — they are managed fields.
-    Value types: str/int/float/bool and flat lists of those. A nested dict value is REFUSED
-    (flatten it or json.dumps it yourself).
+    Value types: str/int/float/bool and flat lists of those. A None value in "merge" UNSETS
+    that key (it is removed and reported as removed). A nested dict value, or a list holding
+    one, REFUSES the call — JSON-encode it (json.dumps) and store the string.
 
     Property doctrine (Option-4 hybrid): scratch classes (Blog_Request, Chain_Step, etc.)
     and untyped nodes get a DIRECT property write only; ontology-bearing classes ALSO emit a

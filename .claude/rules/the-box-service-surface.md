@@ -11,14 +11,15 @@ tenant's laptop                                  their carton box
   MCP (stdio) → KuzuHttpStore ── Bearer key ──→ kuzu_query_endpoint (:8192)
                                                    /query /set_properties
                                                    /remove_properties
-                                                   /find_by_properties /health
+                                                   /find_by_properties
+                                                   /enqueue /queued /health
 ```
 
 | component | status | note |
 |---|---|---|
 | `kuzu_query_endpoint.py` | **THE SERVICE SURFACE** | real routes, real rows. `required_key()` demands `CARTON_KEY` when set and checks it **before the body is read**; unset = the old private in-box wire, byte-identical. `serve_in_thread` **REFUSES TO START** on a non-local bind with no key |
 | `KuzuHttpStore` (heaven-framework `graph_store.py`) | **THE CLIENT** | sends `Authorization: Bearer` + `X-Carton-User` from env, headers attached only when configured. Constructed with NO ARGUMENTS is the real path — that is how MCP settings deliver credentials |
-| the worker (`observation_worker_daemon`) | **SERVES IT, ON EVERY BACKEND** | it owns the graph. The start used to be gated on `GRAPH_BACKEND=kuzu`; that gate is GONE, because with the MCP removed a neo4j box would come up healthy and answer nothing. The endpoint is store-agnostic by construction — it exposes exactly the four `GraphStore` methods, and both stores implement them |
+| the worker (`observation_worker_daemon`) | **SERVES IT, ON EVERY BACKEND** | it owns the graph, so it serves the endpoint whatever `GRAPH_BACKEND` is: a neo4j box without it would come up healthy and answer nothing. The endpoint is store-agnostic by construction — the four `GraphStore` methods, which both stores implement, plus the queue's two routes, which touch no store |
 | `carton_transport.py` | the transport law, all that outlived the gateway | stdio only; `sse` refused (Mar 13 2026 broken pipes); `http`/`streamable-http` refused **by name as REMOVED**, never downgraded. 14/14 |
 | `network_gateway.py` | **DELETED** | it made carton's MCP server LISTEN so something could dial in. Nothing could: a box has no agent |
 | `[program:carton-mcp]` in the box | **DELETED** | see `application/carton-saas/box/supervisord.conf`, which carries the reasoning where an operator will meet it |
@@ -33,8 +34,18 @@ that is the real path, and it is how MCP settings deliver credentials.
 
 The worker (`observation_worker_daemon`) serves the endpoint ON EVERY BACKEND, because it owns the graph.
 Do not gate that start on `GRAPH_BACKEND=kuzu`: with the MCP removed, a neo4j box would come up healthy
-and answer nothing. The endpoint is store-agnostic by construction — it exposes exactly the four
-`GraphStore` methods, and both stores implement them.
+and answer nothing. The endpoint is store-agnostic by construction — the four `GraphStore` methods
+(`/query`, `/set_properties`, `/remove_properties`, `/find_by_properties`), which both stores implement,
+plus the queue's two routes, which touch no store, plus `/health`. Add no other core route: a
+product-specific route goes through the `CARTON_EXTRA_ROUTES` hook.
+
+THE QUEUE'S TWO ROUTES. `/enqueue {entry, suffix}` writes one entry into THIS box's queue and answers its
+filename; the name sorts in enqueue order and the file appears whole (`add_concept_tool.write_queue_entry`),
+so entries posted one after another drain one after another. The write is asynchronous, so `/enqueue`'s
+answer says nothing about landing: `/queued {names}` does — `{"waiting": N}` plus, per name, `queued` (not
+drained) · `processed` (written to the graph) · `failed` (dead-lettered, the reason inside the file) ·
+`absent` (never enqueued here). `/queued` is read-only and answers only for plain `.json` names inside the
+queue dir and its `processed/` and `failed/`.
 
 `carton_transport.py` carries the transport law: stdio only. `sse` is refused. `http` and
 `streamable-http` are refused BY NAME AS REMOVED, never downgraded.
@@ -50,11 +61,14 @@ block, every repeated sequence rewritten as an `@N` ref (`carton_render.render_a
 correct for an agent reading prose and silently wrong for anything reading rows: a board served through
 it is partial and says nothing.
 
-Dev-flow, and NEVER edit one place only. Touching `kuzu_query_endpoint` (`handle` / `required_key` /
-`_authorized` / `serve_in_thread`), the `KuzuHttpStore` credential half, or the worker's endpoint start →
+Dev-flow, and NEVER edit one place only. Touching `kuzu_query_endpoint` (`handle` / `enqueue` /
+`required_key` / `_authorized` / `serve_in_thread`), `add_concept_tool.write_queue_entry` or
+`queue_status`, the `KuzuHttpStore` credential half, or the worker's endpoint start →
 edit them coherently, then the gate: `python3 test_query_endpoint_auth.py` (7/7 — client against server
-over a REAL socket, never two mocks agreeing) AND `python3 test_kuzu_query_endpoint.py` (6/6) AND `python3
-test_carton_transport.py` (14/14). "It imported" is not the gate.
+over a REAL socket, never two mocks agreeing) AND `python3 test_kuzu_query_endpoint.py` (7/7) AND `python3
+test_carton_transport.py` (14/14) AND, for the queue's routes or the drain, `python3 test_queue_submit.py`
+(4/4) AND `python3 test_universal_write.py` (6/6 — enqueue → drain → graph on a real embedded graph).
+"It imported" is not the gate.
 
 Changing the transport laws → `carton_transport.py` plus the one call in `server_fastmcp.main()`.
 

@@ -66,8 +66,9 @@ and never put graph logic in the lib.**
    `batch_create_concepts_neo4j` (`observation_worker_daemon.py:119`) — the `SET n.d = CASE … END` at
    `:254-281` implements `desc_update_mode` (append/prepend/replace/skip), and the fence-preservation guard
    runs there at `:229-247` (calls `carry_forward_fences` with `removed_fences`).
-   There is exactly **ONE live parse path**: `parse_queue_file_to_concepts` (`:444`), called from the
-   worker's main loop (the UNWIND batch at `:1383` calls it → `batch_create_concepts_neo4j` at `:1398`);
+   There is exactly **ONE live parse path**: `parse_queue_file_to_concepts`, called from `drain_once` (the
+   one batch the worker's loop runs per tick: it calls the parse → `batch_create_concepts_neo4j`); both of
+   its concept formats build their rows with `_concept_row`, so a key forwarded there reaches both;
    it forwards `removed_fences` at **`:486`**, and `batch_create_concepts_neo4j` reads `removed_fences`
    into the concept row at **`:161`**. Every fence/desc-mode change lands HERE.
    `process_queue_file` (`:598`) is **DEAD CODE — it has ZERO callers** (verified 2026-06-10: only its def

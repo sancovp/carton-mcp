@@ -8,9 +8,11 @@ ask it. That owner is the WORKER, because it is already the only writer (the que
 this module is what it serves.
 
 It is the pattern carton already runs twice — SOMA on :8091, the chroma daemon on :8190 — and is
-deliberately small: it exposes the four methods `GraphStore` defines and nothing else. There is no
-query builder here and no dialect knowledge; the store it wraps has all of that already, so this
-file cannot drift away from what an in-process caller would have got.
+deliberately small: it exposes the four methods `GraphStore` defines, plus the queue's two routes —
+`/enqueue` writes one entry into this machine's queue, `/queued` says how many wait and where named
+entries are (queued · processed · failed · absent) — and nothing else. There is no query builder
+here and no dialect knowledge; the store it wraps has all of that already, so this file cannot
+drift away from what an in-process caller would have got.
 
 ⭐ THIS IS THE BOX'S SERVICE SURFACE — the routes a client calls, with a key on them. A tenant
 puts their user and key in their MCP settings; their MCP runs on their own machine and CALLS IN
@@ -55,6 +57,9 @@ def handle(store, path: str, body: dict) -> dict:
                                                                int(body.get("limit") or 25))}
     if path == "/enqueue":
         return {"ok": True, "result": enqueue(body.get("entry") or {}, body.get("suffix") or "")}
+    if path == "/queued":
+        from carton_mcp.add_concept_tool import queue_status
+        return {"ok": True, "result": queue_status(body.get("names") or [])}
     if path == "/health":
         return {"ok": True, "result": {"backend": "kuzu", "owner": "worker"}}
     return {"ok": False, "error": f"unknown path {path!r}"}
@@ -65,17 +70,14 @@ def enqueue(entry: dict, suffix: str = "") -> str:
 
     The queue belongs to the machine whose worker drains it. A client writing the file
     locally instead produces a file nobody reads and a success message.
+
+    The name sorts in enqueue order and the file appears whole (`write_queue_entry`), so
+    entries this endpoint accepts one after another drain one after another. Whether a name
+    has landed is `/queued`'s answer, not this one's: the write is asynchronous.
     """
-    import uuid as _uuid
-    from datetime import datetime as _dt
+    from carton_mcp.add_concept_tool import write_queue_entry
 
-    from carton_mcp.add_concept_tool import get_observation_queue_dir
-
-    name = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{str(_uuid.uuid4())[:8]}{suffix}.json"
-    path = get_observation_queue_dir() / name
-    with open(path, "w") as fh:
-        json.dump(entry, fh, indent=2)
-    return name
+    return write_queue_entry(entry, suffix)
 
 
 def load_gate(env=None):
@@ -264,10 +266,10 @@ def _make_handler(store, key="", gate=None, extra=None):
                 self._send(400, {"ok": False, "error": f"bad request body: {exc}"})
                 return
             # Non-core paths go to the operator's extra routes (the core set below is the
-            # GraphStore surface + /enqueue + /health — exactly what `handle` dispatches).
+            # GraphStore surface + /enqueue + /queued + /health — exactly what `handle` dispatches).
             if self.path.split("?", 1)[0] not in (
                 "/query", "/set_properties", "/remove_properties",
-                "/find_by_properties", "/enqueue", "/health",
+                "/find_by_properties", "/enqueue", "/queued", "/health",
             ):
                 if self._try_extra("POST", body):
                     return

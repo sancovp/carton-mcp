@@ -518,26 +518,31 @@ def t_the_daemon_phase_three_actually_branches_on_the_disposition():
     The import-consistency test above proves the symbol is imported. That is not enough
     here — a revert of Phase 3 to `if neo4j_succeeded: ... else: ...` would leave the
     import untouched, pass every other test in this file, and restore the exact defect.
-    Nothing can execute worker_daemon() (it starts chroma servers and never returns),
-    which is why the call is asserted statically instead of exercised.
+    Phase 3 lives in drain_once, the one batch worker_daemon() runs per tick, so the pin is
+    on BOTH: drain_once branches on the disposition, and worker_daemon drains through it.
     """
     import ast
     import inspect
     import carton_mcp.observation_worker_daemon as daemon
 
     tree = ast.parse(inspect.getsource(daemon))
-    worker = next((n for n in ast.walk(tree)
-                   if isinstance(n, ast.FunctionDef) and n.name == "worker_daemon"), None)
-    assert worker is not None, "worker_daemon is gone — this pin needs rewriting, not deleting"
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    worker, drain = funcs.get("worker_daemon"), funcs.get("drain_once")
+    assert worker is not None and drain is not None, \
+        "worker_daemon or drain_once is gone — this pin needs rewriting, not deleting"
 
-    calls = {n.func.id for n in ast.walk(worker)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "batch_disposition" in calls, \
-        "worker_daemon no longer calls batch_disposition — Phase 3 is back to two states"
+    def calls(fn):
+        return {n.func.id for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
 
-    names = {n.id for n in ast.walk(worker) if isinstance(n, ast.Name)}
+    assert "drain_once" in calls(worker), \
+        "worker_daemon no longer drains through drain_once — Phase 3 below is not what runs"
+    assert "batch_disposition" in calls(drain), \
+        "drain_once no longer calls batch_disposition — Phase 3 is back to two states"
+
+    names = {n.id for n in ast.walk(drain) if isinstance(n, ast.Name)}
     assert "REQUEUE" in names, \
-        "worker_daemon no longer references REQUEUE — the never-attempted branch is gone"
+        "drain_once no longer references REQUEUE — the never-attempted branch is gone"
     print("  MARKER: DAEMON_BRANCHES_ON_DISPOSITION_OK")
 
 

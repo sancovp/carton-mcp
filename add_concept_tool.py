@@ -18,6 +18,7 @@ import re
 import os
 import sys
 import time
+import threading
 import traceback
 from difflib import get_close_matches
 import logging
@@ -843,25 +844,81 @@ def get_observation_queue_dir():
     return queue_dir
 
 
+_QUEUE_NAME_LOCK = threading.Lock()
+_queue_name_last = 0  # the last stamp handed out by this process, as YYYYmmddHHMMSSffffff
+
+
+def write_queue_entry(entry: dict, suffix: str = "") -> str:
+    """Write one entry into THIS machine's queue dir and return its filename.
+
+    THE NAME SORTS IN ENQUEUE ORDER. The worker drains `sorted(glob('*.json'))`, so the name
+    is the order. It is `YYYYmmdd_HHMMSS_ffffff_<uuid8><suffix>.json`: the second-resolution
+    prefix every reader already sorts on, then the microsecond, from a stamp this process
+    never lets go backwards — a stamp at or below the last one becomes the last one plus one —
+    so two entries enqueued in one second (or across a clock step) drain in the order they
+    were enqueued. The uuid keeps names from different processes apart; across processes the
+    order is the clocks', and nothing promises more.
+
+    THE FILE APPEARS WHOLE. It is written under a name the worker's glob does not match and
+    renamed into place, all inside the lock, so the worker never reads a half-written entry
+    and never sees entry N+1 before entry N.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _dt
+
+    global _queue_name_last
+    queue_dir = get_observation_queue_dir()
+    with _QUEUE_NAME_LOCK:
+        stamp = max(int(_dt.now().strftime('%Y%m%d%H%M%S%f')), _queue_name_last + 1)
+        _queue_name_last = stamp
+        s = f"{stamp:020d}"
+        name = f"{s[:8]}_{s[8:14]}_{s[14:]}_{str(_uuid.uuid4())[:8]}{suffix}.json"
+        part = queue_dir / (name + ".part")
+        with open(part, "w") as fh:
+            json.dump(entry, fh, indent=2)
+        os.replace(part, queue_dir / name)
+    return name
+
+
 def submit_queue_entry(entry: dict, suffix: str = "") -> str:
     """Queue one entry and return its filename.
 
     REMOTE when KUZU_QUERY_URL names a carton box: the entry is POSTed and the BOX writes
     it, because the queue belongs to the machine whose worker drains it. Writing it here
     would leave a file on the caller's own disk that nothing ever reads, and still report
-    success. LOCAL when the url is empty — the owner/self-hosted case, unchanged.
+    success. LOCAL when the url is empty — the owner/self-hosted case, `write_queue_entry`.
     """
-    import uuid as _uuid
-    from datetime import datetime as _dt
-
     url = (os.getenv("KUZU_QUERY_URL") or "").strip()
     if url:
         from heaven_base.tool_utils.graph_store import KuzuHttpStore
         return KuzuHttpStore(url)._post("/enqueue", {"entry": entry, "suffix": suffix})
-    name = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{str(_uuid.uuid4())[:8]}{suffix}.json"
-    with open(get_observation_queue_dir() / name, "w") as fh:
-        json.dump(entry, fh, indent=2)
-    return name
+    return write_queue_entry(entry, suffix)
+
+
+def queue_status(names=None) -> dict:
+    """Where this machine's queue entries are: `{"waiting": N}` plus, for each name asked
+    about, one of "queued" (not drained yet) · "processed" (written to the graph) · "failed"
+    (dead-lettered, its reason inside the file) · "absent" (never enqueued here).
+
+    Read-only. A name is looked up only as a plain `.json` file name inside the queue dir and
+    its two subdirs — anything else answers "absent" and touches no other path.
+    """
+    queue_dir = get_observation_queue_dir()
+    out = {"waiting": sum(1 for _ in queue_dir.glob('*.json'))}
+    if names:
+        found = {}
+        for name in names:
+            name = str(name)
+            state = "absent"
+            if name.endswith(".json") and Path(name).name == name:
+                for where, label in ((queue_dir, "queued"), (queue_dir / "processed", "processed"),
+                                     (queue_dir / "failed", "failed")):
+                    if (where / name).is_file():
+                        state = label
+                        break
+            found[name] = state
+        out["names"] = found
+    return out
 
 
 # ============================================================================
@@ -2769,7 +2826,8 @@ def add_concept_tool_func(
             meaning-channel beside relationships: relationships become graph edges;
             properties become neo4j node properties (status/order/gates/sm config/
             …). Values are scalars (str/int/float/bool) or flat lists of those —
-            NEVER nested objects or concept-refs (those are relationships). Carried
+            NEVER nested objects or concept-refs (those are relationships; a nested
+            value is JSON-encoded into a string by the caller); None unsets the key. Carried
             in the queue JSON; the daemon applies set_concept_properties AFTER the
             node is written (the node already exists in the same drain → no race,
             which is why the SM gates/steps no longer need <sm_spec> JSON in n.d).

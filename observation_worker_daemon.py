@@ -702,17 +702,76 @@ def batch_create_concepts_neo4j(concepts_data: list, shared_connection) -> dict:
     }
 
 
+def _concept_row(data: dict, name: str, rels_dict: dict, source: str) -> dict:
+    """One concept's row for the batch write, read off a raw_concept file or one entry of a
+    concepts list. ONE builder for both, so the two can never again carry different keys."""
+    return {
+        'name': name,
+        'description': data.get('description', ''),
+        'relationships': rels_dict,
+        'timestamp': data.get('timestamp'),  # Pass through original timestamp
+        'desc_update_mode': data.get('desc_update_mode', 'append'),  # append/prepend/replace/edit
+        # CartON KV 'edit' mode: the old_str to surgically str-replace within the existing
+        # n.d (the description above is the new_str). Applied by batch_create_concepts_neo4j.
+        'old_str_for_edit_case': data.get('old_str_for_edit_case'),
+        'removed_fences': data.get('removed_fences', []),  # CartON KV fence-preservation guard (MAIN worker-loop path; the raw_concept branch in process_queue_file already forwards it)
+        'skip_ontology_healing': data.get('skip_ontology_healing', False),
+        # YOUKNOW CODE decision — triggers substrate projection in Phase 2.5a
+        'is_code': data.get('is_code', False),
+        'gen_target': data.get('gen_target'),
+        # SOMA SYSTEM_TYPE decision (doc 28) — CODE + all d-chains pass.
+        # Phase 2.5a routes projection on is_system_type + is_a, not gen_target.
+        'is_system_type': data.get('is_system_type', False),
+        # SOUP tracking — daemon creates REQUIRES_EVOLUTION if is_soup=True
+        'is_soup': data.get('is_soup', False),
+        'soup_reason': data.get('soup_reason'),
+        # Timeline source — who/what created this concept
+        'source': source,
+        # Target descs — cached KV from EC desc= on +{} claims
+        'target_descs': data.get('target_descs', {}),
+        # RELEASE-LAW projection effects (FIX-5 step 3): the release_effect
+        # facts SOMA surfaced in the verdict, [{handler, arg}]. Phase 2.5a
+        # imports + dispatches each AFTER the neo4j write (gated on is_system_type).
+        'release_effects': data.get('release_effects', []),
+        # AUTHORIZATION-TYPED fillable requests (the carton brain, Isaac 2026-06-28):
+        # SOMA gaps whose fill authority is NOT observing_agent, parsed by add_concept_tool
+        # via the SOMA SDK into [{authorization, concept, gap, expected_type, reason,
+        # reply_contract, request_id}]. Phase 2.5d durably PARKS each (the passive/pull
+        # leg of the request/resume protocol). Mirrors release_effects above — without
+        # this line they are DROPPED here and never reach any dispatch.
+        'fillable_requests': data.get('fillable_requests', []),
+        # CARTON-BUNDLE-BACK composed triples (Isaac 2026-06-28): SOMA's backward-chain
+        # compose DEDUCED these [{concept, prop, value}] and surfaced them in the composed=
+        # verdict section; add_concept_tool parsed them. Phase 2.5e MERGEs each as a neo4j
+        # edge AFTER the node write so carton's KG realizes SOMA's deductions. Mirrors
+        # release_effects above — without this line they are DROPPED and never reach the KG.
+        'composed_triples': data.get('composed_triples', []),
+        # L3b PURE-MEREO SUGGESTIONS (Isaac 2026-06-28): unique admissible candidates SOMA
+        # found for still-empty slots with no authorizing d-chain; [{concept, prop,
+        # expected_type, candidate, reviewer_role}]. Phase 2.5f durably PARKS each for review
+        # (mints a run-id for L3c). Mirrors composed_triples — without this line they are
+        # DROPPED and no review item is ever created.
+        'compose_suggestions': data.get('compose_suggestions', []),
+        # NODE PROPERTIES (the 🏷 property channel). batch_create_concepts_neo4j
+        # applies these via set_concept_properties AFTER the node MERGE (node
+        # exists in the same drain → no race). Scalars/flat-lists only. {} when none.
+        'properties': data.get('properties', {}),
+    }
+
+
 def parse_queue_file_to_concepts(queue_file: Path) -> list:
     """
     Parse a queue file into flat list of concept dicts for batch processing.
 
     Handles three formats:
     - raw_concept files: single concept
-    - concepts list files: {"concepts": [...]} with name/description/relationships per item
+    - concepts list files: {"concepts": [...]}, each item carrying every key a raw_concept
+      file does (properties included); `source` falls back to the file's own
     - observation files: N+1 concepts (wrapper + parts via observation tags)
 
     Returns:
-        List of dicts with {name, description, relationships}
+        List of dicts with {name, description, relationships, ...} — `_concept_row`'s keys
+        for the first two formats
     """
     from carton_mcp.add_concept_tool import normalize_concept_name, OBSERVATION_TAGS, OBSERVATION_NON_TAG_KEYS
     from datetime import datetime
@@ -738,58 +797,7 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
                 if rel_type and related:
                     rels_dict[rel_type] = related
 
-            concepts.append({
-                'name': name,
-                'description': data.get('description', ''),
-                'relationships': rels_dict,
-                'timestamp': data.get('timestamp'),  # Pass through original timestamp
-                'desc_update_mode': data.get('desc_update_mode', 'append'),  # append/prepend/replace/edit
-                # CartON KV 'edit' mode: the old_str to surgically str-replace within the existing
-                # n.d (the description above is the new_str). Applied by batch_create_concepts_neo4j.
-                'old_str_for_edit_case': data.get('old_str_for_edit_case'),
-                'removed_fences': data.get('removed_fences', []),  # CartON KV fence-preservation guard (MAIN worker-loop path; the raw_concept branch in process_queue_file already forwards it)
-                'skip_ontology_healing': data.get('skip_ontology_healing', False),
-                # YOUKNOW CODE decision — triggers substrate projection in Phase 2.5a
-                'is_code': data.get('is_code', False),
-                'gen_target': data.get('gen_target'),
-                # SOMA SYSTEM_TYPE decision (doc 28) — CODE + all d-chains pass.
-                # Phase 2.5a routes projection on is_system_type + is_a, not gen_target.
-                'is_system_type': data.get('is_system_type', False),
-                # SOUP tracking — daemon creates REQUIRES_EVOLUTION if is_soup=True
-                'is_soup': data.get('is_soup', False),
-                'soup_reason': data.get('soup_reason'),
-                # Timeline source — who/what created this concept
-                'source': data.get('source', 'agent'),
-                # Target descs — cached KV from EC desc= on +{} claims
-                'target_descs': data.get('target_descs', {}),
-                # RELEASE-LAW projection effects (FIX-5 step 3): the release_effect
-                # facts SOMA surfaced in the verdict, [{handler, arg}]. Phase 2.5a
-                # imports + dispatches each AFTER the neo4j write (gated on is_system_type).
-                'release_effects': data.get('release_effects', []),
-                # AUTHORIZATION-TYPED fillable requests (the carton brain, Isaac 2026-06-28):
-                # SOMA gaps whose fill authority is NOT observing_agent, parsed by add_concept_tool
-                # via the SOMA SDK into [{authorization, concept, gap, expected_type, reason,
-                # reply_contract, request_id}]. Phase 2.5d durably PARKS each (the passive/pull
-                # leg of the request/resume protocol). Mirrors release_effects above — without
-                # this line they are DROPPED here and never reach any dispatch.
-                'fillable_requests': data.get('fillable_requests', []),
-                # CARTON-BUNDLE-BACK composed triples (Isaac 2026-06-28): SOMA's backward-chain
-                # compose DEDUCED these [{concept, prop, value}] and surfaced them in the composed=
-                # verdict section; add_concept_tool parsed them. Phase 2.5e MERGEs each as a neo4j
-                # edge AFTER the node write so carton's KG realizes SOMA's deductions. Mirrors
-                # release_effects above — without this line they are DROPPED and never reach the KG.
-                'composed_triples': data.get('composed_triples', []),
-                # L3b PURE-MEREO SUGGESTIONS (Isaac 2026-06-28): unique admissible candidates SOMA
-                # found for still-empty slots with no authorizing d-chain; [{concept, prop,
-                # expected_type, candidate, reviewer_role}]. Phase 2.5f durably PARKS each for review
-                # (mints a run-id for L3c). Mirrors composed_triples — without this line they are
-                # DROPPED and no review item is ever created.
-                'compose_suggestions': data.get('compose_suggestions', []),
-                # NODE PROPERTIES (the 🏷 property channel). batch_create_concepts_neo4j
-                # applies these via set_concept_properties AFTER the node MERGE (node
-                # exists in the same drain → no race). Scalars/flat-lists only. {} when none.
-                'properties': data.get('properties', {}),
-            })
+            concepts.append(_concept_row(data, name, rels_dict, data.get('source', 'agent')))
     elif data.get('concepts') and isinstance(data['concepts'], list):
         # Concepts list format: {"concepts": [{name, description, relationships}, ...]}
         # Used by observe_from_identity_pov and batch concept submissions
@@ -818,13 +826,12 @@ def parse_queue_file_to_concepts(queue_file: Path) -> list:
                     if rel_type and target:
                         rels_dict.setdefault(rel_type, []).append(target)
 
-            concepts.append({
-                'name': name,
-                'description': concept_data.get('description', ''),
-                'relationships': rels_dict,
-                'desc_update_mode': concept_data.get('desc_update_mode', 'append'),
-                'source': concept_data.get('source', data.get('source', 'agent')),
-            })
+            # THE SAME ROW AS A raw_concept FILE, read off this entry. This branch used to build
+            # its own five-key dict, so a concept sent in a list lost its properties and every
+            # SOMA-verdict key on the way to the graph, and a caller that needed properties had
+            # to send one file per concept. Only `source` falls back to the file's own value.
+            concepts.append(_concept_row(concept_data, name, rels_dict,
+                                         concept_data.get('source', data.get('source', 'agent'))))
 
         if concepts:
             print(f"[Parse] Parsed {len(concepts)} concepts from concepts-list format in {queue_file.name}", file=sys.stderr)
@@ -1905,6 +1912,625 @@ def linker_thread(stop_event: threading.Event):
     print(f"[Linker] Thread shutting down. Total linked: {linked_total}", file=sys.stderr)
 
 
+def drain_once(queue_dir: Path, shared_neo4j) -> dict:
+    """Drain ONE batch of the queue — the worker loop's whole write path, callable on its own.
+
+    Phase 1 parses up to UNWIND_BATCH_SIZE files (validation dead-letters first), Phase 2 writes
+    them in one batch with retry, Phase 2.5 runs the post-write effects, Phase 2m the timeline
+    merges, Phase 3 files every payload as processed, requeued or dead-lettered. `worker_daemon`
+    calls this once per tick; a test calls it directly with its own queue dir and connection.
+
+    Returns {"connection", "files", "processed", "failed"}: the connection to keep using (a
+    stale one is replaced inside), how many files this batch took (0 = the queue was empty, and
+    nothing else ran), and how many were filed as processed and as failed.
+    """
+    queue_files = sorted(queue_dir.glob('*.json'))
+    if not queue_files:
+        return {'connection': shared_neo4j, 'files': 0, 'processed': 0, 'failed': 0}
+    processed = 0
+    failed = 0
+
+    # Health check Neo4j before each batch — reconnect if stale
+    shared_neo4j = _ensure_neo4j_alive(shared_neo4j)
+
+    # TRUE UNWIND: Parse batch of files into flat concept list
+    batch_files = queue_files[:UNWIND_BATCH_SIZE]
+    print(f"[Worker] UNWIND batch: {len(batch_files)} files (queue has {len(queue_files)} total)", file=sys.stderr)
+
+    # Phase 1: Parse all files into flat concept array
+    all_concepts = []
+    parsed_files = []  # Track which files parsed successfully
+    failed_files = []  # Track parse failures
+    # TIMELINE MERGES ARE COLLECTED HERE AND RUN AFTER THE CONCEPT WRITE (Phase 2m).
+    # Executing them inline in this parse phase IS the defect — see Phase 2m below.
+    merge_files = []
+
+    for queue_file in batch_files:
+        # #198: the four-required-rels observation validation, LIVE
+        # on the UNWIND lane as a LOUD DEAD-LETTER. The old validator
+        # only existed in the dead process_queue_file path, so the
+        # live lane validated nothing. A failing observation file is
+        # annotated with the named reason (error_message — the key
+        # check_failed_observations/retry_failed_observations already
+        # read) and moved to failed/; the drain NEVER crashes.
+        try:
+            with open(queue_file) as _vf:
+                _vdata = json.load(_vf)
+        except Exception:
+            _vdata = None  # unreadable files fall through to parse, which dead-letters them
+        if _vdata is not None:
+            _verrors = observation_validation_errors(_vdata)
+            if _verrors:
+                _vreason = "; ".join(_verrors)
+                print(f"[Worker] VALIDATION dead-letter {queue_file.name}: {_vreason}", file=sys.stderr)
+                # The reason travels WITH the file to the mover, which records it.
+                # The wording is unchanged from when this branch annotated inline,
+                # because it is the string the #198 rule documents.
+                failed_files.append((
+                    queue_file,
+                    f"observation validation failed (issue #198): {_vreason}",
+                    None))
+                continue
+        concepts = parse_queue_file_to_concepts(queue_file)
+        if concepts:
+            all_concepts.extend(concepts)
+            parsed_files.append(queue_file)
+            continue
+        # Empty parse: check for a TIMELINE-MERGE file (no concept
+        # payload, so the parse legitimately returns []). Its handler
+        # previously lived only in the dead process_queue_file path,
+        # which made EVERY merge file dead-letter unprocessed (found
+        # 2026-07-19, issue-61 triage). Route it to the live handler.
+        try:
+            with open(queue_file) as _qf:
+                merge_data = json.load(_qf)
+        except Exception:
+            merge_data = None
+        if merge_data and merge_data.get('timeline_merge'):
+            # DEFERRED TO PHASE 2m — never run here. The merge's target conversation
+            # is a CONCEPT queued by the same precompact run, and every concept in
+            # this batch is only ACCUMULATED in this phase: it does not exist in the
+            # graph until the batch write below. Running the merge here therefore
+            # found its target absent on every compaction, refused the delete (which
+            # is correct — the placeholder's edges must never be destroyed with
+            # nowhere to have moved them), and dead-lettered a file its own error text
+            # calls retryable. Nothing retries a dead-lettered merge, so a transient
+            # ordering failure became permanent loss of the conversation POSITION of
+            # every journal entry in that window — the message ladder survived because
+            # precompact writes it straight at the real node and never needs the merge.
+            # Measured 2026-09-14, 2026-09-15 and 2026-09-16, three windows stranded.
+            merge_files.append((queue_file, merge_data))
+        else:
+            failed_files.append((queue_file, (
+                "the payload could not be parsed into any concept: it matches none of "
+                "the queue's known shapes (raw_concept / concepts-list / observation / "
+                "timeline_merge), or its JSON is unreadable."), None))
+
+    print(f"[Worker] Parsed {len(all_concepts)} concepts from {len(parsed_files)} files", file=sys.stderr)
+
+    # NOTE: Auto-linking is handled by background thread (linker_thread)
+    # Main loop just inserts fast, linker picks up unlinked nodes asynchronously
+
+    # Phase 2: UNWIND batch create in Neo4j (single batch operation)
+    neo4j_succeeded = False
+    _write_attempts = 0
+    _write_errors = []
+    if all_concepts and shared_neo4j:
+        # RETRY WITH BACKOFF BEFORE CONDEMNING THE BATCH.
+        #
+        # A failure here does not lose ONE payload — it dead-letters every payload
+        # parsed in the same batch (see the `failed_files.extend` below), up to
+        # UNWIND_BATCH_SIZE of them. So a momentary store outage cost up to 2000
+        # payloads at once, each filed as permanently broken, with nothing recording
+        # that they were only standing next to a failed write.
+        #
+        # The reconnect between attempts is the half that actually recovers: the
+        # common failure is a connection that went stale under the transaction, and
+        # replacing it is what makes the next attempt succeed. Re-running the write is
+        # safe because the node UNWIND is a MERGE and the append path already
+        # de-duplicates, so a retry after a failed attempt cannot double-write.
+        def _attempt_batch_write():
+            r = batch_create_concepts_neo4j(all_concepts, shared_neo4j)
+            print(f"[Worker] UNWIND result: {r['concepts_created']} concepts, {r['relationships_created']} rels", file=sys.stderr)
+            if r['errors']:
+                print(f"[Worker] UNWIND errors: {r['errors'][:3]}", file=sys.stderr)
+            return r
+
+        def _reconnect_before_retry(attempt_no, delay, _r):
+            # Replacing the connection is the half that actually recovers.
+            nonlocal shared_neo4j
+            print(f"[Worker] batch write FAILED (attempt {attempt_no}) — "
+                  f"{len(parsed_files)} file(s) at stake; waited {delay:.1f}s, "
+                  f"reconnecting and retrying", file=sys.stderr)
+            shared_neo4j = _ensure_neo4j_alive(shared_neo4j)
+            if shared_neo4j is None:
+                print("[Worker] no graph connection could be re-established — "
+                      "stopping the retries", file=sys.stderr)
+                return False
+            return True
+
+        result, _write_attempts = run_with_retry(
+            _attempt_batch_write,
+            # Success = concepts were created AND no fatal errors
+            lambda r: r['concepts_created'] > 0,
+            backoff_delays(retry_attempts()),
+            before_retry=_reconnect_before_retry,
+        )
+        _write_errors = result['errors']
+        neo4j_succeeded = result['concepts_created'] > 0
+
+        if neo4j_succeeded and _write_attempts > 1:
+            print(f"[Worker] batch write RECOVERED on attempt {_write_attempts} — "
+                  f"{len(parsed_files)} file(s) saved from the dead-letter queue",
+                  file=sys.stderr)
+
+        # Create REQUIRES_EVOLUTION for SOUP concepts (incomplete — not projected)
+        for c in all_concepts:
+            if c.get('is_soup') and shared_neo4j:
+                soup_reason = c.get('soup_reason', 'Chain incomplete')
+                try:
+                    shared_neo4j.execute_query(
+                        """MATCH (n:Wiki {n: $name})
+                        MERGE (re:Wiki {n: "Requires_Evolution", c: "requires_evolution"})
+                        MERGE (n)-[r:REQUIRES_EVOLUTION]->(re)
+                        SET r.reason = $reason, r.ts = datetime()""",
+                        {'name': c['name'], 'reason': soup_reason}
+                    )
+                    print(f"[Worker] SOUP: {c['name']} -> REQUIRES_EVOLUTION", file=sys.stderr)
+                except Exception as e:
+                    print(f"[Worker] SOUP REQUIRES_EVOLUTION failed for {c['name']}: {e}", file=sys.stderr)
+
+        # Write target_descs — cached descriptions from EC desc= on +{} claims
+        for c in all_concepts:
+            td = c.get('target_descs', {})
+            if td and shared_neo4j:
+                for target_name, target_desc in td.items():
+                    try:
+                        shared_neo4j.execute_query(
+                            # FRONTIER SIGNAL (Isaac 2026-06-19): a cell is still on the
+                            # metacompilation FRONTIER (an unfilled auto-stub) only when there
+                            # is NOTHING AFTER the auto-created string — i.e. it STARTS WITH the
+                            # 'AUTO CREATED' marker AND still ENDS WITH 'Not yet fully defined.'
+                            # (the marker's last sentence). Once a cell is FILLED (real content
+                            # appended after the marker), it no longer ends with that sentence,
+                            # so it is NOT frontier and must NOT be clobbered. The marker stays
+                            # as the birth-record (referenced-into-existence) — filled-ness is
+                            # the STRUCTURAL signal (content-after-marker), not the marker itself.
+                            """MERGE (n:Wiki {n: $name})
+                            SET n.d = CASE
+                                WHEN n.d IS NULL OR n.d = '' OR (n.d STARTS WITH 'AUTO CREATED' AND n.d ENDS WITH 'Not yet fully defined.')
+                                THEN $desc ELSE n.d END,
+                                n.t = datetime()""",
+                            {'name': target_name, 'desc': target_desc}
+                        )
+                    except Exception as e:
+                        print(f"[Worker] target_desc write failed for {target_name}: {e}", file=sys.stderr)
+
+    elif not shared_neo4j:
+        # States only what THIS site knows. It used to say "files stay in queue" — a claim about
+        # the files' FATE, which is decided two phases below and which, until issue 280, decided
+        # the opposite in the same iteration. The site that does not decide the fate no longer
+        # asserts it; Phase 3 announces it, because Phase 3 is what determines it.
+        print("[Worker] ERROR: no Neo4j connection — nothing will be attempted this batch", file=sys.stderr)
+
+    # REFACTOR-PLAN [SOMA-UNIFICATION 2026-06-16] — THE SOLE LIVE CALLER of the carton
+    #   ontology fabricator. journal Scalable_Publishing_Giint_Architecture_Soma_Unification_Removal (14:10).
+    #   CHANGE: the ensure_ontology_completeness call below fabricates the project/feature/component
+    #   _Unnamed mereology skeletons — that gap is now computed by SOMA's gnosys-vault GIINT
+    #   presence d-chains (PROVEN LIVE, FIX-4), so this fabrication is REDUNDANT.
+    #   ENACT (once verified): comment-out the ensure_ontology_completeness block; REPLACE with a
+    #   DIRECT call to ontology_graphs._auto_create_task_hypercluster for giint_task concepts ONLY
+    #   (Task-HC creation has NO SOMA replacement — the one piece that must stay). Keep Phase 2.5a
+    #   (release_effect dispatch) + 2.5c (PBML) untouched. Then delete the skip_ontology_healing parse (L~409).
+    # Phase 2.5: GIINT _Unnamed fabrication DISABLED 2026-06-16 (SOMA-unification).
+    #   The old ensure_ontology_completeness call here fabricated project/feature/component
+    #   _Unnamed mereology skeletons. That gap is now COMPUTED by SOMA's gnosys-vault GIINT
+    #   presence d-chains (PROVEN LIVE, FIX-4) and surfaced as unmet_requirement in the verdict,
+    #   not fabricated over → fabrication REMOVED (replace-before-remove satisfied).
+    #   RE-HOMED here: Task-HC creation for giint_task (NO SOMA equivalent) via a direct
+    #   _auto_create_task_hypercluster call. journal Soma_Unification_Removal.
+    if all_concepts and neo4j_succeeded:
+        try:
+            from carton_mcp.ontology_graphs import _auto_create_task_hypercluster
+            for c in all_concepts:
+                if c.get("skip_ontology_healing", False):
+                    continue
+                rels = c.get("relationships", {})
+                if isinstance(rels, list):
+                    rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
+                c_isa = [t.lower() for t in rels.get("is_a", [])]
+                # giint_task Task-HC creation has NO SOMA equivalent → keep (re-homed direct call).
+                # _auto_create_task_hypercluster is idempotent (_concept_exists guard) + ignores rels.
+                if "giint_task" in c_isa:
+                    hc = _auto_create_task_hypercluster(c.get("name", ""), rels, shared_neo4j)
+                    if hc:
+                        print(f"[Worker] Task-HC: {c.get('name','')} → {hc}", file=sys.stderr)
+        except Exception as ont_err:
+            print(f"[Worker] Task-HC creation error: {ont_err}", file=sys.stderr)
+
+    # Phase 2.5a: Auto-crystallize valid concepts (SOMA decided).
+    # Doc 28 fix: route projection on is_system_type + is_a, not the
+    # legacy YOUKNOW is_code + gen_target. SOMA does not emit gen_target;
+    # is_system_type=True means CODE + all d-chains pass (fully admitted),
+    # so projection d-chains are free to fire. The concept's is_a tells
+    # us which projector to dispatch.
+    #
+    # is_code (structure valid, d-chains pending) still removes
+    # REQUIRES_EVOLUTION — the SOUP→CODE promotion is independent of
+    # whether projection fires this round.
+    if all_concepts and neo4j_succeeded:
+        for c in all_concepts:
+            if (c.get("is_code") or c.get("is_system_type")) and shared_neo4j:
+                try:
+                    shared_neo4j.execute_query(
+                        """MATCH (s:Wiki {n: $name})-[r:REQUIRES_EVOLUTION]->(re)
+                        DELETE r""",
+                        {'name': c['name']}
+                    )
+                    print(f"[Worker] SOUP→CODE: {c['name']} REQUIRES_EVOLUTION removed", file=sys.stderr)
+                except Exception as e:
+                    print(f"[Worker] REQUIRES_EVOLUTION removal failed for {c['name']}: {e}", file=sys.stderr)
+        # RELEASE-LAW dispatch (FIX-5 step 3) — SOMA surfaced
+        # release_effect(handler, arg) facts in the verdict for the
+        # projection d-chains (dchain_skill_project / dchain_rule_project);
+        # add_concept_tool parsed them into c["release_effects"]. SOMA does
+        # NOT run them (it is the inner reflection — it cannot act outward
+        # mid-process; it releases the verdict UP). WE — the outer Python
+        # layer that called /event — import + run each handler now, AFTER
+        # the neo4j write, so the projector can read the concept off our
+        # shared connection. This REPLACES the prior hardcoded is_a routing:
+        # the d-chain decides WHAT projects; the daemon just dispatches
+        # whatever handler each fact names (universal — no domain knowledge).
+        # GATED on is_system_type: a SOUP/CODE skill is still in d-chain
+        # scope so SOMA surfaces its release_effect, but an incomplete
+        # concept must NOT project.
+        #
+        # GRADE-EXEMPT effects (2026-08-20, e2e run-11 cascade): the gate above
+        # exists for PROJECTORS — handlers that render the concept's OWN content
+        # to files (dchain_skill_project / dchain_rule_project), where an
+        # incomplete (SOUP/CODE) concept must not project. A cascade-COMPLETION
+        # effect is a different kind: its firing condition is fully encoded in
+        # its d-chain premise (the giint readiness cascade concludes only when
+        # every level marked giint_level_ready), and the EVENT concept's verdict
+        # grade says nothing about that condition — a giint project INSTANCE
+        # grades CODE by construction ("N d-chain(s) pending"), so gating its
+        # stamp on is_system_type silently dropped it forever (measured: all 4
+        # cascade marks persisted in tenant soma_triples, giint_ready stamp never
+        # dispatched, requirement-6 stalled). Effects named here dispatch at any
+        # grade; the d-chain premise IS their gate.
+        _GRADE_EXEMPT_EFFECTS = {
+            # canonical (2026-08-20): store-side handler in the store's own
+            # package, so the lean BOX worker (the remote-enqueue drainer,
+            # which can never install llm_intelligence) can dispatch it.
+            "carton_mcp.giint_effects:stamp_giint_project_ready",
+            # legacy path — store rows registered before the move still name it;
+            # llm_intelligence.projects keeps a thin delegate under this name.
+            "llm_intelligence.projects:stamp_giint_project_ready",
+            # issue #148: the carton_task kanban-card sync. A task INSTANCE
+            # never grades is_system_type (it grades soup/code), so gating
+            # this on the grade drops it forever — the same measured GIINT
+            # cascade failure. Its d-chain premise (code_gap) IS the gate;
+            # the handler is env-gated + never-raising on its own.
+            "carton_mcp.substrate_projector:sync_task_kanban_card",
+            # issue #712: the doc-mirror board's build-freed ratchet. A lane
+            # TRANSITION instance grades soup/code and never is_system_type, exactly
+            # like the card above, so gating it on the grade would drop it forever.
+            # Its d-chain premise — the non-build lanes listed positively, with
+            # code_gap first so an incomplete transition skips — IS the gate.
+            "carton_mcp.doc_mirror_kanban_effects:ratchet_on_build_freed",
+            # card 780: LFPOOP join A. Each partial (call graph, rollup wiring, ring
+            # set) is a vaulted-type INSTANCE that grades code, never is_system_type;
+            # its d-chain premise (code_gap) IS the gate.
+            "carton_mcp.lfpoop_join_effects:write_rollup_wiring",
+            "carton_mcp.lfpoop_join_effects:write_learned_ring_set",
+            "carton_mcp.lfpoop_join_effects:write_ab3_states",
+        }
+        import importlib as _importlib
+        _eff_seen = set()
+        for c in all_concepts:
+            for eff in (c.get("release_effects") or []):
+                handler = (eff.get("handler") or "").strip()
+                if (not c.get("is_system_type")
+                        and handler not in _GRADE_EXEMPT_EFFECTS):
+                    continue
+                # arg = the CartON neo4j node name (c.name). SOMA's
+                # release_effect arg is the SOMA-normalized (lowercase_
+                # underscore) form of THIS SAME concept — it does NOT match
+                # the Title_Case neo4j node the projector reads via
+                # get_concept_content. This queue file is for exactly one
+                # concept and its release_effects all pertain to it, so c.name
+                # is the correct, resolvable node name. (The eff.arg is kept in
+                # the verdict only as a human-readable trace of which concept.)
+                arg = c.get("name", "").strip()
+                if not handler or not arg or (handler, arg) in _eff_seen:
+                    continue
+                _eff_seen.add((handler, arg))
+                try:
+                    mod_path, fn_name = handler.split(":", 1)
+                    fn = getattr(_importlib.import_module(mod_path), fn_name)
+                    res = fn(arg, shared_connection=shared_neo4j)
+                    print(f"[Worker] 🔮 release_effect {handler}({arg}) → {res}", file=sys.stderr)
+                    # NOTE: the worker-loop neo4j handle is shared_neo4j (NOT
+                    # shared_connection — the old is_a-routing code referenced an
+                    # undefined `shared_connection` here, a latent NameError that
+                    # never fired because that path apparently never ran live).
+                    log_system_event(shared_neo4j, "release_effect_dispatched", f"{handler}({arg}) → {res}", "soma_release")
+                except Exception as e:
+                    print(f"[Worker] release_effect dispatch failed {handler}({arg}): {e}", file=sys.stderr)
+
+    # Phase 2.5d: SOMA authorization-typed request PARK (the carton brain, passive leg).
+    # add_concept_tool parsed SOMA's soma_requests= block into c["fillable_requests"]
+    # (typed by WHO is authorized to fill: human_* / system_deduction / …). Durably PARK
+    # each so it survives restarts and waits for its filler — the durable suspension the
+    # request/resume protocol needs (a human answers later as a NEW SOMA event → SOMA
+    # re-derives → the parked chain advances; re-derivation IS the resume). The ACTIVE fill
+    # (manufacture an LLM expert, POST the answer back, re-derive) runs through
+    # soma_sdk.resolve() + default_fillers when a reachable SOMA_URL + an llm_call are
+    # wired; until then this PARK leg alone runs and nothing is dropped. Logic lives in the
+    # library (soma_fillers.park_fillable_requests); the daemon just dispatches + logs.
+    if all_concepts and neo4j_succeeded:
+        try:
+            from carton_mcp.soma_fillers import park_fillable_requests
+            _parked = park_fillable_requests(all_concepts)
+            for _rid in _parked:
+                print(f"[Worker] 🧠 soma_request parked → {_rid}", file=sys.stderr)
+            if _parked and shared_neo4j:
+                log_system_event(shared_neo4j, "soma_requests_parked",
+                                 f"{len(_parked)} parked", "soma_request")
+        except Exception as e:
+            print(f"[Worker] soma_request park error: {e}", file=sys.stderr)
+
+    # Phase 2.5e: CARTON-BUNDLE-BACK — realize SOMA's DEDUCED composed triples into the KG.
+    # add_concept_tool parsed SOMA's composed= verdict section into c["composed_triples"]
+    # ([{concept, prop, value}]). SOMA's backward-chain compose (L3a) found these matches in
+    # the store and DEDUCED graph additions the user never stated (e.g. SOMA inferred
+    # spaghetti's cuisine is italian from its ingredients). SOMA is the INNER reflection: it
+    # releases the deductions UP and never touches carton's KG. WE — the outer layer — MERGE
+    # each as a directed :PROP edge here (AFTER the node write), or carton stays dumb (Isaac:
+    # "that's literally SOMA's job"). The logic lives in the library
+    # (soma_fillers.realize_composed_triples, unit-testable via an injected execute); the
+    # daemon just dispatches + logs (mirrors Phase 2.5d / park_fillable_requests).
+    if all_concepts and neo4j_succeeded and shared_neo4j:
+        try:
+            from carton_mcp.soma_fillers import realize_composed_triples
+            _realized = realize_composed_triples(all_concepts, shared_neo4j.execute_query)
+            for (_s, _r, _v) in _realized:
+                print(f"[Worker] 🧬 composed (SOMA-deduced) → ({_s})-[:{_r}]->({_v})", file=sys.stderr)
+            if _realized:
+                log_system_event(shared_neo4j, "soma_composed_realized",
+                                 f"{len(_realized)} deduced triples realized into KG", "soma_compose")
+        except Exception as e:
+            print(f"[Worker] composed realize error: {e}", file=sys.stderr)
+
+    # Phase 2.5f: L3b PURE-MEREO SUGGESTION PARK (the review queue, passive leg).
+    # add_concept_tool parsed SOMA's compose_suggestions= block into c["compose_suggestions"]
+    # (a unique admissible candidate for a still-empty slot with NO authorizing d-chain).
+    # SOMA did NOT compose it (that is L3a); it SUGGESTS it. We durably PARK each for review
+    # (mints a stable run-id for the L3c reviewer event). INERT — parking only, no graph
+    # mutation. Logic in the library (soma_fillers.park_compose_suggestions); daemon
+    # dispatches + logs (mirrors Phase 2.5d / 2.5e).
+    if all_concepts and neo4j_succeeded:
+        try:
+            from carton_mcp.soma_fillers import park_compose_suggestions
+            _sg_parked = park_compose_suggestions(all_concepts)
+            for _rid in _sg_parked:
+                print(f"[Worker] 🔎 compose-suggestion parked for review → {_rid}", file=sys.stderr)
+            if _sg_parked and shared_neo4j:
+                log_system_event(shared_neo4j, "compose_suggestions_parked",
+                                 f"{len(_sg_parked)} parked for review", "soma_suggestion")
+        except Exception as e:
+            print(f"[Worker] compose-suggestion park error: {e}", file=sys.stderr)
+
+    # Phase 2.5b REMOVED 2026-05-12: legacy rule bypass path that
+    # gated on substring(is_a, "claude_code_rule") and bypassed YOUKNOW
+    # d-chain validation. Rules now flow through Phase 2.5a via the
+    # gen_target="rule_file" branch, gated by is_code AND gen_target
+    # like skills. validate_system_type._infer_from_context fills the
+    # required Claude_Code_Rule fields (has_scope, has_name, has_content)
+    # before structural validation passes.
+
+    # Phase 2.5c: PBML auto-lane-move — detect phase-completion concepts → GIINT update_task_status
+    if all_concepts and neo4j_succeeded:
+        try:
+            # The move itself lives in llm_intelligence.pbml_lane so this daemon
+            # and the WakingDreamer odyssey tick share ONE implementation. The
+            # tick exists because under a tenant lane the dispatching worker is
+            # the BOX worker, which is lean BY RULING and hits the ImportError
+            # branch below forever — so the ecosystem-side tick is the lane that
+            # actually runs there. Only the graph access differs between the two
+            # callers, which is why the module takes an injected query function.
+            from llm_intelligence.pbml_lane import apply_pbml_move, match_trigger
+            for c in all_concepts:
+                trigger = match_trigger(c)
+                if not trigger:
+                    continue
+                move = apply_pbml_move(c, shared_neo4j.execute_query)
+                if not move.get("moved"):
+                    print(f"[Worker] PBML lane move skipped for {c.get('name','')}: {move.get('reason')}", file=sys.stderr)
+                    continue
+                print(f"[Worker] 🔄 PBML auto-move: {move['trigger']} → {move['task_id']} in {move['project_id']}: {move.get('treekanban_sync', {})}", file=sys.stderr)
+                if move.get("archived_card"):
+                    print(f"[Worker] 🏁 PBML archive: card #{move['archived_card']} moved to archive", file=sys.stderr)
+                if move.get("archive_error"):
+                    print(f"[Worker] PBML archive move failed: {move['archive_error']}", file=sys.stderr)
+                # Odyssey ML trigger: done_signal fires the full ML pipeline.
+                # Deliberately NOT inside pbml_lane — the two callers fire odyssey
+                # at different points in their own flow, so each owns its trigger.
+                if trigger == "done_signal":
+                    try:
+                        from odyssey.utils import dispatch_chain as odyssey_dispatch_chain
+                        concept_name = c.get("name", "")
+                        # Fire in background thread to not block daemon
+                        _odyssey_thread = threading.Thread(
+                            target=odyssey_dispatch_chain,
+                            args=(concept_name,),
+                            daemon=True,
+                            name=f"odyssey_{concept_name[:40]}",
+                        )
+                        _odyssey_thread.start()
+                        print(f"[Worker] 🔬 Odyssey ML chain triggered for {concept_name}", file=sys.stderr)
+                    except ImportError:
+                        print("[Worker] Odyssey not installed, skipping ML verification", file=sys.stderr)
+                    except Exception as ody_err:
+                        print(f"[Worker] Odyssey trigger failed: {ody_err}", file=sys.stderr)
+        except ImportError:
+            print("[Worker] GIINT not available, skipping PBML auto-lane-move", file=sys.stderr)
+        except Exception as pbml_err:
+            print(f"[Worker] PBML auto-lane-move error: {pbml_err}", file=sys.stderr)
+
+    # Phase 2.5d: Resolve _Unnamed stubs when real concept fills the slot
+    # TEMPORARY — moves to SOMA Prolog when YOUKNOW integrates into SOMA.
+    if all_concepts and neo4j_succeeded and shared_neo4j:
+        for c in all_concepts:
+            rels = c.get("relationships", {})
+            if isinstance(rels, list):
+                rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
+            part_of_targets = rels.get("part_of", [])
+            is_a_types = [t for t in rels.get("is_a", [])]
+            concept_name = c.get("name", "")
+            if not part_of_targets or not is_a_types:
+                continue
+            for parent_name in part_of_targets:
+                for is_a_type in is_a_types:
+                    unnamed_name = f"{is_a_type}_Unnamed"
+                    try:
+                        result = shared_neo4j.execute_query(
+                            "MATCH (p:Wiki {n: $parent})-[r]->(stub:Wiki {n: $stub}) "
+                            "RETURN type(r) AS rel_type LIMIT 1",
+                            {'parent': parent_name, 'stub': unnamed_name}
+                        )
+                        if not result:
+                            continue
+                        rel_type = result[0]['rel_type']
+                        shared_neo4j.execute_query(
+                            f"MATCH (p:Wiki {{n: $parent}})-[old:{rel_type}]->(stub:Wiki {{n: $stub}}) "
+                            f"DELETE old WITH p MATCH (real:Wiki {{n: $real}}) "
+                            f"CREATE (p)-[:{rel_type}]->(real)",
+                            {'parent': parent_name, 'stub': unnamed_name, 'real': concept_name}
+                        )
+                        shared_neo4j.execute_query(
+                            "MATCH (stub:Wiki {n: $stub}), (real:Wiki {n: $real}) "
+                            "SET stub.d = 'RESOLVED: evolved into ' + $real "
+                            "MERGE (stub)-[:EVOLVED_TO]->(real) "
+                            "MERGE (real)-[:EVOLVED_FROM]->(stub)",
+                            {'stub': unnamed_name, 'real': concept_name}
+                        )
+                        print(f"[Worker] stub resolved: {unnamed_name} -> {concept_name} (parent: {parent_name}, rel: {rel_type})", file=sys.stderr)
+                    except Exception as stub_err:
+                        print(f"[Worker] Stub resolution failed for {concept_name}: {stub_err}", file=sys.stderr)
+
+    # Phase 2.5b: Create wiki files for ChromaDB indexing (only if Neo4j succeeded)
+    if all_concepts and neo4j_succeeded:
+        wiki_result = create_wiki_files_for_concepts(all_concepts)
+        if wiki_result['errors']:
+            print(f"[Worker] Wiki file errors: {wiki_result['errors'][:3]}", file=sys.stderr)
+        # Targeted RAG sync: only ingest files we just wrote (no 188k scan)
+        hdd = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
+        written_paths = []
+        for c in all_concepts:
+            n = c.get('name', '').replace(' ', '_')
+            p = os.path.join(hdd, 'wiki', 'concepts', n, f'{n}_itself.md')
+            if os.path.exists(p):
+                written_paths.append(p)
+        if written_paths:
+            sync_rag_incremental(changed_files=written_paths)
+
+    # Phase 2m: TIMELINE MERGES, AFTER THE CONCEPT WRITE AND NEVER BESIDE IT.
+    #
+    # A merge names two nodes: the placeholder session_start minted when the window
+    # OPENED, and the real Conversation node precompact mints when it CLOSED. The
+    # second is an ordinary concept dropped in the same queue run, so it exists only
+    # once the batch write above has run. Dispatching the merge in the parse phase —
+    # which is what this code did until 2026-09-16 — asks it to find a node this very
+    # batch has not written yet, on every single compaction.
+    #
+    # It is deliberately NOT gated on neo4j_succeeded: a batch holding only merge
+    # files parses no concepts at all, so neo4j_succeeded is False while the targets
+    # landed in some earlier batch and the merges are perfectly runnable.
+    #
+    # The failure text is unchanged and still accurate — it is the string the
+    # timeline-merge dev-flow rule documents — but it should now be reachable only
+    # for the cases it actually describes: a target whose own concept dead-lettered,
+    # or a retry of a merge older than its conversation.
+    for _merge_file, _merge_data in merge_files:
+        if _process_timeline_merge(_merge_data, shared_neo4j):
+            _merge_file.unlink(missing_ok=True)
+        else:
+            failed_files.append((_merge_file, (
+                "timeline merge failed: the merge target conversation does not "
+                "exist yet, or one of the placeholder's edges could not be moved "
+                "onto it. Retryable once the real conversation node lands."), None))
+
+    # Phase 3: Move files based on Neo4j result — THREE outcomes, never two.
+    #
+    # ⛔ THIS BLOCK USED TO ASK ONE QUESTION, `did the write succeed`, AND TREAT
+    # EVERY NO AS THE SAME NO (issue 280). With no connection at all, Phase 2's
+    # `if all_concepts and shared_neo4j` is false, so the retry lane — including
+    # the reconnect that is the half which actually recovers — never runs:
+    # _write_attempts stays 0 and _write_errors stays empty. This block then
+    # condemned every parsed file with `batch write to the graph failed (unknown)
+    # after 0 attempt(s)`, in the SAME batch iteration in which the line one phase
+    # earlier printed `files stay in queue`. Both cannot be true and the log was
+    # the one that was wrong. Measured on the live pile before the fix.
+    #
+    # The decision lives in carton_deadletter.batch_disposition, as a PURE
+    # function, so the three-way rule is driven by a test with no graph at all;
+    # drain_once is what lets a test drive the filing around it too.
+    _disposition = batch_disposition(neo4j_succeeded, _write_attempts)
+    if _disposition == PROCESSED:
+        processed_dir = queue_dir / 'processed'
+        processed_dir.mkdir(exist_ok=True)
+        for queue_file in parsed_files:
+            try:
+                queue_file.rename(processed_dir / queue_file.name)
+                processed += 1
+            except Exception as e:
+                print(f"[Worker] Failed to move {queue_file.name}: {e}", file=sys.stderr)
+    elif _disposition == REQUEUE:
+        # NOTHING WAS ATTEMPTED. There was no graph connection, so the write was
+        # never tried and these payloads have no failure of their own to report.
+        # They STAY IN THE QUEUE, which is what the message printed one phase
+        # earlier already promised, and the next tick retries them once
+        # _ensure_neo4j_alive re-establishes the connection at the top of the
+        # batch. A payload that was never attempted is not a defective payload.
+        #
+        # THE COST, stated here rather than discovered later: while the store
+        # stays down the queue IS the retry buffer, by design, and it grows
+        # without bound. That is the deliberate trade — an unbounded queue is
+        # recoverable and a dead-lettered payload filed under a reason that says
+        # nothing was tried is not.
+        if parsed_files:
+            print(f"[Worker] no graph connection — {len(parsed_files)} file(s) STAY "
+                  f"IN THE QUEUE for the next tick; nothing was attempted, so "
+                  f"nothing is dead-lettered", file=sys.stderr)
+    else:
+        # Neo4j failed after every retry — dead-letter the parsed files WITH the
+        # store's own error text. These payloads are not defective; they were
+        # standing in a batch whose write failed, and the recorded reason is what
+        # lets a later reader tell those two cases apart at all.
+        if parsed_files:
+            _reason = batch_failure_reason(_write_errors, _write_attempts)
+            print(f"[Worker] Neo4j write failed after {_write_attempts} attempt(s) — "
+                  f"dead-lettering {len(parsed_files)} file(s), each carrying the reason",
+                  file=sys.stderr)
+            failed_files.extend(
+                (f, _reason, _write_attempts) for f in parsed_files)
+
+    # Move every failed file, EACH CARRYING ITS OWN REASON.
+    # This replaces a bare rename that recorded nothing: a payload landed in
+    # failed/ with no trace of why, so a transient rejection and a permanently
+    # malformed one were indistinguishable forever after.
+    if failed_files:
+        failed_dir = queue_dir / 'failed'
+        for queue_file, reason, attempts in failed_files:
+            if dead_letter(queue_file, failed_dir, reason, attempts=attempts):
+                failed += 1
+
+
+    return {'connection': shared_neo4j, 'files': len(batch_files), 'processed': processed,
+            'failed': failed}
+
+
 def worker_daemon():
     """
     Main daemon loop.
@@ -2093,611 +2719,15 @@ def worker_daemon():
             # queue is empty. Exception-safe internally; can NEVER kill this loop.
             _sync_active_hypercluster(shared_neo4j)
 
-            # Get all JSON files in queue directory
-            queue_files = sorted(queue_dir.glob('*.json'))
+            # One batch: parse → write → effects → merges → file. The whole drain is
+            # drain_once, so a test runs exactly what this loop runs.
+            _drained = drain_once(queue_dir, shared_neo4j)
+            shared_neo4j = _drained['connection']
 
-            if queue_files:
-                # Health check Neo4j before each batch — reconnect if stale
-                shared_neo4j = _ensure_neo4j_alive(shared_neo4j)
-
-                # TRUE UNWIND: Parse batch of files into flat concept list
-                batch_files = queue_files[:UNWIND_BATCH_SIZE]
-                print(f"[Worker] UNWIND batch: {len(batch_files)} files (queue has {len(queue_files)} total)", file=sys.stderr)
-
-                # Phase 1: Parse all files into flat concept array
-                all_concepts = []
-                parsed_files = []  # Track which files parsed successfully
-                failed_files = []  # Track parse failures
-                # TIMELINE MERGES ARE COLLECTED HERE AND RUN AFTER THE CONCEPT WRITE (Phase 2m).
-                # Executing them inline in this parse phase IS the defect — see Phase 2m below.
-                merge_files = []
-
-                for queue_file in batch_files:
-                    # #198: the four-required-rels observation validation, LIVE
-                    # on the UNWIND lane as a LOUD DEAD-LETTER. The old validator
-                    # only existed in the dead process_queue_file path, so the
-                    # live lane validated nothing. A failing observation file is
-                    # annotated with the named reason (error_message — the key
-                    # check_failed_observations/retry_failed_observations already
-                    # read) and moved to failed/; the drain NEVER crashes.
-                    try:
-                        with open(queue_file) as _vf:
-                            _vdata = json.load(_vf)
-                    except Exception:
-                        _vdata = None  # unreadable files fall through to parse, which dead-letters them
-                    if _vdata is not None:
-                        _verrors = observation_validation_errors(_vdata)
-                        if _verrors:
-                            _vreason = "; ".join(_verrors)
-                            print(f"[Worker] VALIDATION dead-letter {queue_file.name}: {_vreason}", file=sys.stderr)
-                            # The reason travels WITH the file to the mover, which records it.
-                            # The wording is unchanged from when this branch annotated inline,
-                            # because it is the string the #198 rule documents.
-                            failed_files.append((
-                                queue_file,
-                                f"observation validation failed (issue #198): {_vreason}",
-                                None))
-                            continue
-                    concepts = parse_queue_file_to_concepts(queue_file)
-                    if concepts:
-                        all_concepts.extend(concepts)
-                        parsed_files.append(queue_file)
-                        continue
-                    # Empty parse: check for a TIMELINE-MERGE file (no concept
-                    # payload, so the parse legitimately returns []). Its handler
-                    # previously lived only in the dead process_queue_file path,
-                    # which made EVERY merge file dead-letter unprocessed (found
-                    # 2026-07-19, issue-61 triage). Route it to the live handler.
-                    try:
-                        with open(queue_file) as _qf:
-                            merge_data = json.load(_qf)
-                    except Exception:
-                        merge_data = None
-                    if merge_data and merge_data.get('timeline_merge'):
-                        # DEFERRED TO PHASE 2m — never run here. The merge's target conversation
-                        # is a CONCEPT queued by the same precompact run, and every concept in
-                        # this batch is only ACCUMULATED in this phase: it does not exist in the
-                        # graph until the batch write below. Running the merge here therefore
-                        # found its target absent on every compaction, refused the delete (which
-                        # is correct — the placeholder's edges must never be destroyed with
-                        # nowhere to have moved them), and dead-lettered a file its own error text
-                        # calls retryable. Nothing retries a dead-lettered merge, so a transient
-                        # ordering failure became permanent loss of the conversation POSITION of
-                        # every journal entry in that window — the message ladder survived because
-                        # precompact writes it straight at the real node and never needs the merge.
-                        # Measured 2026-09-14, 2026-09-15 and 2026-09-16, three windows stranded.
-                        merge_files.append((queue_file, merge_data))
-                    else:
-                        failed_files.append((queue_file, (
-                            "the payload could not be parsed into any concept: it matches none of "
-                            "the queue's known shapes (raw_concept / concepts-list / observation / "
-                            "timeline_merge), or its JSON is unreadable."), None))
-
-                print(f"[Worker] Parsed {len(all_concepts)} concepts from {len(parsed_files)} files", file=sys.stderr)
-
-                # NOTE: Auto-linking is handled by background thread (linker_thread)
-                # Main loop just inserts fast, linker picks up unlinked nodes asynchronously
-
-                # Phase 2: UNWIND batch create in Neo4j (single batch operation)
-                neo4j_succeeded = False
-                _write_attempts = 0
-                _write_errors = []
-                if all_concepts and shared_neo4j:
-                    # RETRY WITH BACKOFF BEFORE CONDEMNING THE BATCH.
-                    #
-                    # A failure here does not lose ONE payload — it dead-letters every payload
-                    # parsed in the same batch (see the `failed_files.extend` below), up to
-                    # UNWIND_BATCH_SIZE of them. So a momentary store outage cost up to 2000
-                    # payloads at once, each filed as permanently broken, with nothing recording
-                    # that they were only standing next to a failed write.
-                    #
-                    # The reconnect between attempts is the half that actually recovers: the
-                    # common failure is a connection that went stale under the transaction, and
-                    # replacing it is what makes the next attempt succeed. Re-running the write is
-                    # safe because the node UNWIND is a MERGE and the append path already
-                    # de-duplicates, so a retry after a failed attempt cannot double-write.
-                    def _attempt_batch_write():
-                        r = batch_create_concepts_neo4j(all_concepts, shared_neo4j)
-                        print(f"[Worker] UNWIND result: {r['concepts_created']} concepts, {r['relationships_created']} rels", file=sys.stderr)
-                        if r['errors']:
-                            print(f"[Worker] UNWIND errors: {r['errors'][:3]}", file=sys.stderr)
-                        return r
-
-                    def _reconnect_before_retry(attempt_no, delay, _r):
-                        # Replacing the connection is the half that actually recovers.
-                        nonlocal shared_neo4j
-                        print(f"[Worker] batch write FAILED (attempt {attempt_no}) — "
-                              f"{len(parsed_files)} file(s) at stake; waited {delay:.1f}s, "
-                              f"reconnecting and retrying", file=sys.stderr)
-                        shared_neo4j = _ensure_neo4j_alive(shared_neo4j)
-                        if shared_neo4j is None:
-                            print("[Worker] no graph connection could be re-established — "
-                                  "stopping the retries", file=sys.stderr)
-                            return False
-                        return True
-
-                    result, _write_attempts = run_with_retry(
-                        _attempt_batch_write,
-                        # Success = concepts were created AND no fatal errors
-                        lambda r: r['concepts_created'] > 0,
-                        backoff_delays(retry_attempts()),
-                        before_retry=_reconnect_before_retry,
-                    )
-                    _write_errors = result['errors']
-                    neo4j_succeeded = result['concepts_created'] > 0
-
-                    if neo4j_succeeded and _write_attempts > 1:
-                        print(f"[Worker] batch write RECOVERED on attempt {_write_attempts} — "
-                              f"{len(parsed_files)} file(s) saved from the dead-letter queue",
-                              file=sys.stderr)
-
-                    # Create REQUIRES_EVOLUTION for SOUP concepts (incomplete — not projected)
-                    for c in all_concepts:
-                        if c.get('is_soup') and shared_neo4j:
-                            soup_reason = c.get('soup_reason', 'Chain incomplete')
-                            try:
-                                shared_neo4j.execute_query(
-                                    """MATCH (n:Wiki {n: $name})
-                                    MERGE (re:Wiki {n: "Requires_Evolution", c: "requires_evolution"})
-                                    MERGE (n)-[r:REQUIRES_EVOLUTION]->(re)
-                                    SET r.reason = $reason, r.ts = datetime()""",
-                                    {'name': c['name'], 'reason': soup_reason}
-                                )
-                                print(f"[Worker] SOUP: {c['name']} -> REQUIRES_EVOLUTION", file=sys.stderr)
-                            except Exception as e:
-                                print(f"[Worker] SOUP REQUIRES_EVOLUTION failed for {c['name']}: {e}", file=sys.stderr)
-
-                    # Write target_descs — cached descriptions from EC desc= on +{} claims
-                    for c in all_concepts:
-                        td = c.get('target_descs', {})
-                        if td and shared_neo4j:
-                            for target_name, target_desc in td.items():
-                                try:
-                                    shared_neo4j.execute_query(
-                                        # FRONTIER SIGNAL (Isaac 2026-06-19): a cell is still on the
-                                        # metacompilation FRONTIER (an unfilled auto-stub) only when there
-                                        # is NOTHING AFTER the auto-created string — i.e. it STARTS WITH the
-                                        # 'AUTO CREATED' marker AND still ENDS WITH 'Not yet fully defined.'
-                                        # (the marker's last sentence). Once a cell is FILLED (real content
-                                        # appended after the marker), it no longer ends with that sentence,
-                                        # so it is NOT frontier and must NOT be clobbered. The marker stays
-                                        # as the birth-record (referenced-into-existence) — filled-ness is
-                                        # the STRUCTURAL signal (content-after-marker), not the marker itself.
-                                        """MERGE (n:Wiki {n: $name})
-                                        SET n.d = CASE
-                                            WHEN n.d IS NULL OR n.d = '' OR (n.d STARTS WITH 'AUTO CREATED' AND n.d ENDS WITH 'Not yet fully defined.')
-                                            THEN $desc ELSE n.d END,
-                                            n.t = datetime()""",
-                                        {'name': target_name, 'desc': target_desc}
-                                    )
-                                except Exception as e:
-                                    print(f"[Worker] target_desc write failed for {target_name}: {e}", file=sys.stderr)
-
-                elif not shared_neo4j:
-                    # States only what THIS site knows. It used to say "files stay in queue" — a claim about
-                    # the files' FATE, which is decided two phases below and which, until issue 280, decided
-                    # the opposite in the same iteration. The site that does not decide the fate no longer
-                    # asserts it; Phase 3 announces it, because Phase 3 is what determines it.
-                    print("[Worker] ERROR: no Neo4j connection — nothing will be attempted this batch", file=sys.stderr)
-
-                # REFACTOR-PLAN [SOMA-UNIFICATION 2026-06-16] — THE SOLE LIVE CALLER of the carton
-                #   ontology fabricator. journal Scalable_Publishing_Giint_Architecture_Soma_Unification_Removal (14:10).
-                #   CHANGE: the ensure_ontology_completeness call below fabricates the project/feature/component
-                #   _Unnamed mereology skeletons — that gap is now computed by SOMA's gnosys-vault GIINT
-                #   presence d-chains (PROVEN LIVE, FIX-4), so this fabrication is REDUNDANT.
-                #   ENACT (once verified): comment-out the ensure_ontology_completeness block; REPLACE with a
-                #   DIRECT call to ontology_graphs._auto_create_task_hypercluster for giint_task concepts ONLY
-                #   (Task-HC creation has NO SOMA replacement — the one piece that must stay). Keep Phase 2.5a
-                #   (release_effect dispatch) + 2.5c (PBML) untouched. Then delete the skip_ontology_healing parse (L~409).
-                # Phase 2.5: GIINT _Unnamed fabrication DISABLED 2026-06-16 (SOMA-unification).
-                #   The old ensure_ontology_completeness call here fabricated project/feature/component
-                #   _Unnamed mereology skeletons. That gap is now COMPUTED by SOMA's gnosys-vault GIINT
-                #   presence d-chains (PROVEN LIVE, FIX-4) and surfaced as unmet_requirement in the verdict,
-                #   not fabricated over → fabrication REMOVED (replace-before-remove satisfied).
-                #   RE-HOMED here: Task-HC creation for giint_task (NO SOMA equivalent) via a direct
-                #   _auto_create_task_hypercluster call. journal Soma_Unification_Removal.
-                if all_concepts and neo4j_succeeded:
-                    try:
-                        from carton_mcp.ontology_graphs import _auto_create_task_hypercluster
-                        for c in all_concepts:
-                            if c.get("skip_ontology_healing", False):
-                                continue
-                            rels = c.get("relationships", {})
-                            if isinstance(rels, list):
-                                rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
-                            c_isa = [t.lower() for t in rels.get("is_a", [])]
-                            # giint_task Task-HC creation has NO SOMA equivalent → keep (re-homed direct call).
-                            # _auto_create_task_hypercluster is idempotent (_concept_exists guard) + ignores rels.
-                            if "giint_task" in c_isa:
-                                hc = _auto_create_task_hypercluster(c.get("name", ""), rels, shared_neo4j)
-                                if hc:
-                                    print(f"[Worker] Task-HC: {c.get('name','')} → {hc}", file=sys.stderr)
-                    except Exception as ont_err:
-                        print(f"[Worker] Task-HC creation error: {ont_err}", file=sys.stderr)
-
-                # Phase 2.5a: Auto-crystallize valid concepts (SOMA decided).
-                # Doc 28 fix: route projection on is_system_type + is_a, not the
-                # legacy YOUKNOW is_code + gen_target. SOMA does not emit gen_target;
-                # is_system_type=True means CODE + all d-chains pass (fully admitted),
-                # so projection d-chains are free to fire. The concept's is_a tells
-                # us which projector to dispatch.
-                #
-                # is_code (structure valid, d-chains pending) still removes
-                # REQUIRES_EVOLUTION — the SOUP→CODE promotion is independent of
-                # whether projection fires this round.
-                if all_concepts and neo4j_succeeded:
-                    for c in all_concepts:
-                        if (c.get("is_code") or c.get("is_system_type")) and shared_neo4j:
-                            try:
-                                shared_neo4j.execute_query(
-                                    """MATCH (s:Wiki {n: $name})-[r:REQUIRES_EVOLUTION]->(re)
-                                    DELETE r""",
-                                    {'name': c['name']}
-                                )
-                                print(f"[Worker] SOUP→CODE: {c['name']} REQUIRES_EVOLUTION removed", file=sys.stderr)
-                            except Exception as e:
-                                print(f"[Worker] REQUIRES_EVOLUTION removal failed for {c['name']}: {e}", file=sys.stderr)
-                    # RELEASE-LAW dispatch (FIX-5 step 3) — SOMA surfaced
-                    # release_effect(handler, arg) facts in the verdict for the
-                    # projection d-chains (dchain_skill_project / dchain_rule_project);
-                    # add_concept_tool parsed them into c["release_effects"]. SOMA does
-                    # NOT run them (it is the inner reflection — it cannot act outward
-                    # mid-process; it releases the verdict UP). WE — the outer Python
-                    # layer that called /event — import + run each handler now, AFTER
-                    # the neo4j write, so the projector can read the concept off our
-                    # shared connection. This REPLACES the prior hardcoded is_a routing:
-                    # the d-chain decides WHAT projects; the daemon just dispatches
-                    # whatever handler each fact names (universal — no domain knowledge).
-                    # GATED on is_system_type: a SOUP/CODE skill is still in d-chain
-                    # scope so SOMA surfaces its release_effect, but an incomplete
-                    # concept must NOT project.
-                    #
-                    # GRADE-EXEMPT effects (2026-08-20, e2e run-11 cascade): the gate above
-                    # exists for PROJECTORS — handlers that render the concept's OWN content
-                    # to files (dchain_skill_project / dchain_rule_project), where an
-                    # incomplete (SOUP/CODE) concept must not project. A cascade-COMPLETION
-                    # effect is a different kind: its firing condition is fully encoded in
-                    # its d-chain premise (the giint readiness cascade concludes only when
-                    # every level marked giint_level_ready), and the EVENT concept's verdict
-                    # grade says nothing about that condition — a giint project INSTANCE
-                    # grades CODE by construction ("N d-chain(s) pending"), so gating its
-                    # stamp on is_system_type silently dropped it forever (measured: all 4
-                    # cascade marks persisted in tenant soma_triples, giint_ready stamp never
-                    # dispatched, requirement-6 stalled). Effects named here dispatch at any
-                    # grade; the d-chain premise IS their gate.
-                    _GRADE_EXEMPT_EFFECTS = {
-                        # canonical (2026-08-20): store-side handler in the store's own
-                        # package, so the lean BOX worker (the remote-enqueue drainer,
-                        # which can never install llm_intelligence) can dispatch it.
-                        "carton_mcp.giint_effects:stamp_giint_project_ready",
-                        # legacy path — store rows registered before the move still name it;
-                        # llm_intelligence.projects keeps a thin delegate under this name.
-                        "llm_intelligence.projects:stamp_giint_project_ready",
-                        # issue #148: the carton_task kanban-card sync. A task INSTANCE
-                        # never grades is_system_type (it grades soup/code), so gating
-                        # this on the grade drops it forever — the same measured GIINT
-                        # cascade failure. Its d-chain premise (code_gap) IS the gate;
-                        # the handler is env-gated + never-raising on its own.
-                        "carton_mcp.substrate_projector:sync_task_kanban_card",
-                        # issue #712: the doc-mirror board's build-freed ratchet. A lane
-                        # TRANSITION instance grades soup/code and never is_system_type, exactly
-                        # like the card above, so gating it on the grade would drop it forever.
-                        # Its d-chain premise — the non-build lanes listed positively, with
-                        # code_gap first so an incomplete transition skips — IS the gate.
-                        "carton_mcp.doc_mirror_kanban_effects:ratchet_on_build_freed",
-                        # card 780: LFPOOP join A. Each partial (call graph, rollup wiring, ring
-                        # set) is a vaulted-type INSTANCE that grades code, never is_system_type;
-                        # its d-chain premise (code_gap) IS the gate.
-                        "carton_mcp.lfpoop_join_effects:write_rollup_wiring",
-                        "carton_mcp.lfpoop_join_effects:write_learned_ring_set",
-                        "carton_mcp.lfpoop_join_effects:write_ab3_states",
-                    }
-                    import importlib as _importlib
-                    _eff_seen = set()
-                    for c in all_concepts:
-                        for eff in (c.get("release_effects") or []):
-                            handler = (eff.get("handler") or "").strip()
-                            if (not c.get("is_system_type")
-                                    and handler not in _GRADE_EXEMPT_EFFECTS):
-                                continue
-                            # arg = the CartON neo4j node name (c.name). SOMA's
-                            # release_effect arg is the SOMA-normalized (lowercase_
-                            # underscore) form of THIS SAME concept — it does NOT match
-                            # the Title_Case neo4j node the projector reads via
-                            # get_concept_content. This queue file is for exactly one
-                            # concept and its release_effects all pertain to it, so c.name
-                            # is the correct, resolvable node name. (The eff.arg is kept in
-                            # the verdict only as a human-readable trace of which concept.)
-                            arg = c.get("name", "").strip()
-                            if not handler or not arg or (handler, arg) in _eff_seen:
-                                continue
-                            _eff_seen.add((handler, arg))
-                            try:
-                                mod_path, fn_name = handler.split(":", 1)
-                                fn = getattr(_importlib.import_module(mod_path), fn_name)
-                                res = fn(arg, shared_connection=shared_neo4j)
-                                print(f"[Worker] 🔮 release_effect {handler}({arg}) → {res}", file=sys.stderr)
-                                # NOTE: the worker-loop neo4j handle is shared_neo4j (NOT
-                                # shared_connection — the old is_a-routing code referenced an
-                                # undefined `shared_connection` here, a latent NameError that
-                                # never fired because that path apparently never ran live).
-                                log_system_event(shared_neo4j, "release_effect_dispatched", f"{handler}({arg}) → {res}", "soma_release")
-                            except Exception as e:
-                                print(f"[Worker] release_effect dispatch failed {handler}({arg}): {e}", file=sys.stderr)
-
-                # Phase 2.5d: SOMA authorization-typed request PARK (the carton brain, passive leg).
-                # add_concept_tool parsed SOMA's soma_requests= block into c["fillable_requests"]
-                # (typed by WHO is authorized to fill: human_* / system_deduction / …). Durably PARK
-                # each so it survives restarts and waits for its filler — the durable suspension the
-                # request/resume protocol needs (a human answers later as a NEW SOMA event → SOMA
-                # re-derives → the parked chain advances; re-derivation IS the resume). The ACTIVE fill
-                # (manufacture an LLM expert, POST the answer back, re-derive) runs through
-                # soma_sdk.resolve() + default_fillers when a reachable SOMA_URL + an llm_call are
-                # wired; until then this PARK leg alone runs and nothing is dropped. Logic lives in the
-                # library (soma_fillers.park_fillable_requests); the daemon just dispatches + logs.
-                if all_concepts and neo4j_succeeded:
-                    try:
-                        from carton_mcp.soma_fillers import park_fillable_requests
-                        _parked = park_fillable_requests(all_concepts)
-                        for _rid in _parked:
-                            print(f"[Worker] 🧠 soma_request parked → {_rid}", file=sys.stderr)
-                        if _parked and shared_neo4j:
-                            log_system_event(shared_neo4j, "soma_requests_parked",
-                                             f"{len(_parked)} parked", "soma_request")
-                    except Exception as e:
-                        print(f"[Worker] soma_request park error: {e}", file=sys.stderr)
-
-                # Phase 2.5e: CARTON-BUNDLE-BACK — realize SOMA's DEDUCED composed triples into the KG.
-                # add_concept_tool parsed SOMA's composed= verdict section into c["composed_triples"]
-                # ([{concept, prop, value}]). SOMA's backward-chain compose (L3a) found these matches in
-                # the store and DEDUCED graph additions the user never stated (e.g. SOMA inferred
-                # spaghetti's cuisine is italian from its ingredients). SOMA is the INNER reflection: it
-                # releases the deductions UP and never touches carton's KG. WE — the outer layer — MERGE
-                # each as a directed :PROP edge here (AFTER the node write), or carton stays dumb (Isaac:
-                # "that's literally SOMA's job"). The logic lives in the library
-                # (soma_fillers.realize_composed_triples, unit-testable via an injected execute); the
-                # daemon just dispatches + logs (mirrors Phase 2.5d / park_fillable_requests).
-                if all_concepts and neo4j_succeeded and shared_neo4j:
-                    try:
-                        from carton_mcp.soma_fillers import realize_composed_triples
-                        _realized = realize_composed_triples(all_concepts, shared_neo4j.execute_query)
-                        for (_s, _r, _v) in _realized:
-                            print(f"[Worker] 🧬 composed (SOMA-deduced) → ({_s})-[:{_r}]->({_v})", file=sys.stderr)
-                        if _realized:
-                            log_system_event(shared_neo4j, "soma_composed_realized",
-                                             f"{len(_realized)} deduced triples realized into KG", "soma_compose")
-                    except Exception as e:
-                        print(f"[Worker] composed realize error: {e}", file=sys.stderr)
-
-                # Phase 2.5f: L3b PURE-MEREO SUGGESTION PARK (the review queue, passive leg).
-                # add_concept_tool parsed SOMA's compose_suggestions= block into c["compose_suggestions"]
-                # (a unique admissible candidate for a still-empty slot with NO authorizing d-chain).
-                # SOMA did NOT compose it (that is L3a); it SUGGESTS it. We durably PARK each for review
-                # (mints a stable run-id for the L3c reviewer event). INERT — parking only, no graph
-                # mutation. Logic in the library (soma_fillers.park_compose_suggestions); daemon
-                # dispatches + logs (mirrors Phase 2.5d / 2.5e).
-                if all_concepts and neo4j_succeeded:
-                    try:
-                        from carton_mcp.soma_fillers import park_compose_suggestions
-                        _sg_parked = park_compose_suggestions(all_concepts)
-                        for _rid in _sg_parked:
-                            print(f"[Worker] 🔎 compose-suggestion parked for review → {_rid}", file=sys.stderr)
-                        if _sg_parked and shared_neo4j:
-                            log_system_event(shared_neo4j, "compose_suggestions_parked",
-                                             f"{len(_sg_parked)} parked for review", "soma_suggestion")
-                    except Exception as e:
-                        print(f"[Worker] compose-suggestion park error: {e}", file=sys.stderr)
-
-                # Phase 2.5b REMOVED 2026-05-12: legacy rule bypass path that
-                # gated on substring(is_a, "claude_code_rule") and bypassed YOUKNOW
-                # d-chain validation. Rules now flow through Phase 2.5a via the
-                # gen_target="rule_file" branch, gated by is_code AND gen_target
-                # like skills. validate_system_type._infer_from_context fills the
-                # required Claude_Code_Rule fields (has_scope, has_name, has_content)
-                # before structural validation passes.
-
-                # Phase 2.5c: PBML auto-lane-move — detect phase-completion concepts → GIINT update_task_status
-                if all_concepts and neo4j_succeeded:
-                    try:
-                        # The move itself lives in llm_intelligence.pbml_lane so this daemon
-                        # and the WakingDreamer odyssey tick share ONE implementation. The
-                        # tick exists because under a tenant lane the dispatching worker is
-                        # the BOX worker, which is lean BY RULING and hits the ImportError
-                        # branch below forever — so the ecosystem-side tick is the lane that
-                        # actually runs there. Only the graph access differs between the two
-                        # callers, which is why the module takes an injected query function.
-                        from llm_intelligence.pbml_lane import apply_pbml_move, match_trigger
-                        for c in all_concepts:
-                            trigger = match_trigger(c)
-                            if not trigger:
-                                continue
-                            move = apply_pbml_move(c, shared_neo4j.execute_query)
-                            if not move.get("moved"):
-                                print(f"[Worker] PBML lane move skipped for {c.get('name','')}: {move.get('reason')}", file=sys.stderr)
-                                continue
-                            print(f"[Worker] 🔄 PBML auto-move: {move['trigger']} → {move['task_id']} in {move['project_id']}: {move.get('treekanban_sync', {})}", file=sys.stderr)
-                            if move.get("archived_card"):
-                                print(f"[Worker] 🏁 PBML archive: card #{move['archived_card']} moved to archive", file=sys.stderr)
-                            if move.get("archive_error"):
-                                print(f"[Worker] PBML archive move failed: {move['archive_error']}", file=sys.stderr)
-                            # Odyssey ML trigger: done_signal fires the full ML pipeline.
-                            # Deliberately NOT inside pbml_lane — the two callers fire odyssey
-                            # at different points in their own flow, so each owns its trigger.
-                            if trigger == "done_signal":
-                                try:
-                                    from odyssey.utils import dispatch_chain as odyssey_dispatch_chain
-                                    concept_name = c.get("name", "")
-                                    # Fire in background thread to not block daemon
-                                    _odyssey_thread = threading.Thread(
-                                        target=odyssey_dispatch_chain,
-                                        args=(concept_name,),
-                                        daemon=True,
-                                        name=f"odyssey_{concept_name[:40]}",
-                                    )
-                                    _odyssey_thread.start()
-                                    print(f"[Worker] 🔬 Odyssey ML chain triggered for {concept_name}", file=sys.stderr)
-                                except ImportError:
-                                    print("[Worker] Odyssey not installed, skipping ML verification", file=sys.stderr)
-                                except Exception as ody_err:
-                                    print(f"[Worker] Odyssey trigger failed: {ody_err}", file=sys.stderr)
-                    except ImportError:
-                        print("[Worker] GIINT not available, skipping PBML auto-lane-move", file=sys.stderr)
-                    except Exception as pbml_err:
-                        print(f"[Worker] PBML auto-lane-move error: {pbml_err}", file=sys.stderr)
-
-                # Phase 2.5d: Resolve _Unnamed stubs when real concept fills the slot
-                # TEMPORARY — moves to SOMA Prolog when YOUKNOW integrates into SOMA.
-                if all_concepts and neo4j_succeeded and shared_neo4j:
-                    for c in all_concepts:
-                        rels = c.get("relationships", {})
-                        if isinstance(rels, list):
-                            rels = {r.get("relationship", ""): r.get("related", []) for r in rels if isinstance(r, dict)}
-                        part_of_targets = rels.get("part_of", [])
-                        is_a_types = [t for t in rels.get("is_a", [])]
-                        concept_name = c.get("name", "")
-                        if not part_of_targets or not is_a_types:
-                            continue
-                        for parent_name in part_of_targets:
-                            for is_a_type in is_a_types:
-                                unnamed_name = f"{is_a_type}_Unnamed"
-                                try:
-                                    result = shared_neo4j.execute_query(
-                                        "MATCH (p:Wiki {n: $parent})-[r]->(stub:Wiki {n: $stub}) "
-                                        "RETURN type(r) AS rel_type LIMIT 1",
-                                        {'parent': parent_name, 'stub': unnamed_name}
-                                    )
-                                    if not result:
-                                        continue
-                                    rel_type = result[0]['rel_type']
-                                    shared_neo4j.execute_query(
-                                        f"MATCH (p:Wiki {{n: $parent}})-[old:{rel_type}]->(stub:Wiki {{n: $stub}}) "
-                                        f"DELETE old WITH p MATCH (real:Wiki {{n: $real}}) "
-                                        f"CREATE (p)-[:{rel_type}]->(real)",
-                                        {'parent': parent_name, 'stub': unnamed_name, 'real': concept_name}
-                                    )
-                                    shared_neo4j.execute_query(
-                                        "MATCH (stub:Wiki {n: $stub}), (real:Wiki {n: $real}) "
-                                        "SET stub.d = 'RESOLVED: evolved into ' + $real "
-                                        "MERGE (stub)-[:EVOLVED_TO]->(real) "
-                                        "MERGE (real)-[:EVOLVED_FROM]->(stub)",
-                                        {'stub': unnamed_name, 'real': concept_name}
-                                    )
-                                    print(f"[Worker] stub resolved: {unnamed_name} -> {concept_name} (parent: {parent_name}, rel: {rel_type})", file=sys.stderr)
-                                except Exception as stub_err:
-                                    print(f"[Worker] Stub resolution failed for {concept_name}: {stub_err}", file=sys.stderr)
-
-                # Phase 2.5b: Create wiki files for ChromaDB indexing (only if Neo4j succeeded)
-                if all_concepts and neo4j_succeeded:
-                    wiki_result = create_wiki_files_for_concepts(all_concepts)
-                    if wiki_result['errors']:
-                        print(f"[Worker] Wiki file errors: {wiki_result['errors'][:3]}", file=sys.stderr)
-                    # Targeted RAG sync: only ingest files we just wrote (no 188k scan)
-                    hdd = os.getenv('HEAVEN_DATA_DIR', '/tmp/heaven_data')
-                    written_paths = []
-                    for c in all_concepts:
-                        n = c.get('name', '').replace(' ', '_')
-                        p = os.path.join(hdd, 'wiki', 'concepts', n, f'{n}_itself.md')
-                        if os.path.exists(p):
-                            written_paths.append(p)
-                    if written_paths:
-                        sync_rag_incremental(changed_files=written_paths)
-
-                # Phase 2m: TIMELINE MERGES, AFTER THE CONCEPT WRITE AND NEVER BESIDE IT.
-                #
-                # A merge names two nodes: the placeholder session_start minted when the window
-                # OPENED, and the real Conversation node precompact mints when it CLOSED. The
-                # second is an ordinary concept dropped in the same queue run, so it exists only
-                # once the batch write above has run. Dispatching the merge in the parse phase —
-                # which is what this code did until 2026-09-16 — asks it to find a node this very
-                # batch has not written yet, on every single compaction.
-                #
-                # It is deliberately NOT gated on neo4j_succeeded: a batch holding only merge
-                # files parses no concepts at all, so neo4j_succeeded is False while the targets
-                # landed in some earlier batch and the merges are perfectly runnable.
-                #
-                # The failure text is unchanged and still accurate — it is the string the
-                # timeline-merge dev-flow rule documents — but it should now be reachable only
-                # for the cases it actually describes: a target whose own concept dead-lettered,
-                # or a retry of a merge older than its conversation.
-                for _merge_file, _merge_data in merge_files:
-                    if _process_timeline_merge(_merge_data, shared_neo4j):
-                        _merge_file.unlink(missing_ok=True)
-                    else:
-                        failed_files.append((_merge_file, (
-                            "timeline merge failed: the merge target conversation does not "
-                            "exist yet, or one of the placeholder's edges could not be moved "
-                            "onto it. Retryable once the real conversation node lands."), None))
-
-                # Phase 3: Move files based on Neo4j result — THREE outcomes, never two.
-                #
-                # ⛔ THIS BLOCK USED TO ASK ONE QUESTION, `did the write succeed`, AND TREAT
-                # EVERY NO AS THE SAME NO (issue 280). With no connection at all, Phase 2's
-                # `if all_concepts and shared_neo4j` is false, so the retry lane — including
-                # the reconnect that is the half which actually recovers — never runs:
-                # _write_attempts stays 0 and _write_errors stays empty. This block then
-                # condemned every parsed file with `batch write to the graph failed (unknown)
-                # after 0 attempt(s)`, in the SAME batch iteration in which the line one phase
-                # earlier printed `files stay in queue`. Both cannot be true and the log was
-                # the one that was wrong. Measured on the live pile before the fix.
-                #
-                # The decision now lives in carton_deadletter.batch_disposition, as a PURE
-                # function, and that is not ceremony: this block sits inside a loop that
-                # starts chroma servers and never returns, so nothing can call it — the
-                # suite says so in its own words — which is exactly how a two-state
-                # disposition survived here unexamined. A pure decision is the first version
-                # of this rule that can be driven by a test at all.
-                _disposition = batch_disposition(neo4j_succeeded, _write_attempts)
-                if _disposition == PROCESSED:
-                    processed_dir = queue_dir / 'processed'
-                    processed_dir.mkdir(exist_ok=True)
-                    for queue_file in parsed_files:
-                        try:
-                            queue_file.rename(processed_dir / queue_file.name)
-                            processed_count += 1
-                        except Exception as e:
-                            print(f"[Worker] Failed to move {queue_file.name}: {e}", file=sys.stderr)
-                elif _disposition == REQUEUE:
-                    # NOTHING WAS ATTEMPTED. There was no graph connection, so the write was
-                    # never tried and these payloads have no failure of their own to report.
-                    # They STAY IN THE QUEUE, which is what the message printed one phase
-                    # earlier already promised, and the next tick retries them once
-                    # _ensure_neo4j_alive re-establishes the connection at the top of the
-                    # batch. A payload that was never attempted is not a defective payload.
-                    #
-                    # THE COST, stated here rather than discovered later: while the store
-                    # stays down the queue IS the retry buffer, by design, and it grows
-                    # without bound. That is the deliberate trade — an unbounded queue is
-                    # recoverable and a dead-lettered payload filed under a reason that says
-                    # nothing was tried is not.
-                    if parsed_files:
-                        print(f"[Worker] no graph connection — {len(parsed_files)} file(s) STAY "
-                              f"IN THE QUEUE for the next tick; nothing was attempted, so "
-                              f"nothing is dead-lettered", file=sys.stderr)
-                else:
-                    # Neo4j failed after every retry — dead-letter the parsed files WITH the
-                    # store's own error text. These payloads are not defective; they were
-                    # standing in a batch whose write failed, and the recorded reason is what
-                    # lets a later reader tell those two cases apart at all.
-                    if parsed_files:
-                        _reason = batch_failure_reason(_write_errors, _write_attempts)
-                        print(f"[Worker] Neo4j write failed after {_write_attempts} attempt(s) — "
-                              f"dead-lettering {len(parsed_files)} file(s), each carrying the reason",
-                              file=sys.stderr)
-                        failed_files.extend(
-                            (f, _reason, _write_attempts) for f in parsed_files)
-
-                # Move every failed file, EACH CARRYING ITS OWN REASON.
-                # This replaces a bare rename that recorded nothing: a payload landed in
-                # failed/ with no trace of why, so a transient rejection and a permanently
-                # malformed one were indistinguishable forever after.
-                if failed_files:
-                    failed_dir = queue_dir / 'failed'
-                    for queue_file, reason, attempts in failed_files:
-                        if dead_letter(queue_file, failed_dir, reason, attempts=attempts):
-                            failed_count += 1
-
+            if _drained['files']:
+                processed_count += _drained['processed']
+                failed_count += _drained['failed']
                 print(f"[Worker] Batch done. Total: {processed_count} processed, {failed_count} failed", file=sys.stderr)
-
             else:
                 # Queue is empty - commit and push if we processed anything new
                 # NOTE: Git operations DISABLED in daemon - use nightly cron instead

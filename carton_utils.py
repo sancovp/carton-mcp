@@ -514,17 +514,19 @@ def _emit_property_trail(concept_name, changed_props, connection):
 def _validate_property_value(key, value):
     """Return None if `value` is an acceptable property value, else an error string.
     Accepts str/int/float/bool and FLAT lists of those. Refuses dicts (nested objects)
-    and lists containing non-scalars — the caller must flatten or json.dumps it."""
+    and lists containing non-scalars — the caller JSON-encodes it and stores the string.
+    None never reaches here: set_concept_properties treats it as "unset this key"."""
     if isinstance(value, bool) or isinstance(value, (str, int, float)):
         return None
     if isinstance(value, list):
         for i, item in enumerate(value):
             if not (isinstance(item, bool) or isinstance(item, (str, int, float))):
-                return (f"list value for {key!r} has non-scalar element at index {i} "
-                        f"({type(item).__name__}); flatten it or json.dumps it yourself")
+                return (f"list value for {key!r} has a non-scalar element at index {i} "
+                        f"({type(item).__name__}); a property is a scalar or a flat list of "
+                        f"scalars — JSON-encode the value (json.dumps) and store the string")
         return None
-    return (f"value for {key!r} is {type(value).__name__}; only str/int/float/bool "
-            f"or flat lists of those are allowed — flatten it or json.dumps it yourself")
+    return (f"value for {key!r} is {type(value).__name__}; a property is str/int/float/bool "
+            f"or a flat list of those — JSON-encode the value (json.dumps) and store the string")
 
 
 def set_concept_properties(concept_name, properties, mode="merge", shared_connection=None):
@@ -542,8 +544,12 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
     Reserved keys (n, d, t, c, linked, score, source, timeline_linked, odyssey_linked,
     system_generated, last_modified) are REFUSED — they are managed fields, never user data.
 
-    Value types: str/int/float/bool and flat lists of those. A dict value (nested object)
-    is REFUSED — flatten it or json.dumps it yourself.
+    Value types: str/int/float/bool and flat lists of those. A None value in "merge" means
+    UNSET that key: it is removed, reported in removed_keys, and the rest of the call goes
+    ahead — the same thing neo4j's own `SET c += {k: null}` does, so "this field has no
+    value" leaves no stale value behind. A dict value (nested object), or a list holding one,
+    REFUSES the whole call with a message to JSON-encode it: a property is a flat value, and
+    an encoded string read back as a string is honest where a silent encode is not.
 
     Returns {success, concept, updated_keys, refused_keys, removed_keys, error}.
     """
@@ -606,17 +612,23 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
         return {"success": True, "concept": resolved_name, "updated_keys": [],
                 "refused_keys": refused, "removed_keys": removed, "error": None}
 
-    # mode == "merge": validate value types BEFORE writing (refuse the whole call on a bad value).
+    # mode == "merge": a None value UNSETS its key; every other value is validated BEFORE
+    # anything is written (refuse the whole call on a bad value).
+    unset = [k for k, v in candidates.items() if v is None]
+    candidates = {k: v for k, v in candidates.items() if v is not None}
     for k, v in candidates.items():
         err = _validate_property_value(k, v)
         if err is not None:
             return {"success": False, "concept": concept_name, "updated_keys": [],
                     "refused_keys": refused, "removed_keys": [], "error": err}
 
+    if unset:
+        graph.remove_properties(resolved_name, unset)
+
     if not candidates:
         return {"success": True, "concept": resolved_name, "updated_keys": [],
-                "refused_keys": refused, "removed_keys": [],
-                "error": None if not refused else "only reserved keys given; nothing set"}
+                "refused_keys": refused, "removed_keys": unset,
+                "error": None if (unset or not refused) else "only reserved keys given; nothing set"}
 
     # Asked of the connection (the neo4j backend issues the same parameterized `SET c += $props`).
     # On a schema-full backend the scratch-lane keys have no columns and land in the overflow
@@ -637,7 +649,7 @@ def set_concept_properties(concept_name, properties, mode="merge", shared_connec
 
     return {"success": True, "concept": resolved_name,
             "updated_keys": list(candidates.keys()),
-            "refused_keys": refused, "removed_keys": [], "error": None,
+            "refused_keys": refused, "removed_keys": unset, "error": None,
             "trail": trail_status}
 
 
