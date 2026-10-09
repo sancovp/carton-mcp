@@ -12,7 +12,7 @@ this repo, or from PYTHONPATH.
     t_a_concepts_list_entry_lands_every_concept_with_its_properties
     t_b_fifty_entries_enqueued_in_one_second_drain_in_enqueue_order
     t_c_the_queue_name_never_goes_backwards_in_a_process
-    t_d_queued_says_where_each_name_is
+    t_d_queue_status_says_where_each_name_is
     t_e_none_unsets_a_property_and_a_dict_is_refused_with_how_to_store_it
     t_f_drain_once_is_the_whole_drain_and_a_test_can_call_it
 """
@@ -23,7 +23,6 @@ import shutil
 import sys
 import tempfile
 import time
-import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TMP = tempfile.mkdtemp(prefix="universal_write_")
@@ -32,7 +31,7 @@ os.environ.update({
     "HEAVEN_ALLOW_STDOUT": "1",
     "CHROMA_DAEMON_PORT": "9",  # the drain's RAG sync must reach nothing: discard port, nothing listens
 })
-for _k in ("KUZU_QUERY_URL", "CARTON_KEY", "CARTON_QUERY_GATE", "CARTON_EXTRA_ROUTES", "NEO4J_URI"):
+for _k in ("CARTON_URL", "CARTON_KEY", "CARTON_CALL_GATE", "NEO4J_URI"):
     os.environ.pop(_k, None)
 _HF = os.path.join(HERE, "..", "..", "base", "heaven-framework")
 if os.path.isdir(_HF):
@@ -45,7 +44,7 @@ sys.modules["carton_mcp"] = _pkg
 _spec.loader.exec_module(_pkg)
 
 from carton_mcp import observation_worker_daemon as owd  # noqa: E402
-from carton_mcp import kuzu_query_endpoint as ep  # noqa: E402
+from carton_mcp.add_concept_tool import queue_status, write_queue_entry  # noqa: E402
 from heaven_base.tool_utils.neo4j_utils import KnowledgeGraphBuilder  # noqa: E402
 
 PASS, FAIL = [], []
@@ -99,7 +98,7 @@ def t_a_concepts_list_entry_lands_every_concept_with_its_properties():
          "relationships": [{"relationship": "is_a", "related": ["Uw_Thing"]}],
          "properties": {"uw_role": "two", "uw_rank": "2"}, "desc_update_mode": "replace"},
     ], "source": "uw_test"}
-    name = ep.enqueue(entry, "_list")
+    name = write_queue_entry(entry, "_list")
     rows = owd.parse_queue_file_to_concepts(queue_dir() / name)
     got = {r["name"]: r.get("properties") for r in rows}
     assert got == {"Uw_List_One": {"uw_role": "one", "uw_rank": "1"},
@@ -126,7 +125,7 @@ def t_a_concepts_list_entry_lands_every_concept_with_its_properties():
 def t_b_fifty_entries_enqueued_in_one_second_drain_in_enqueue_order():
     fresh()
     time.sleep(1.02 - (time.time() % 1))  # start just after a second turns, so all fifty share it
-    names = [ep.enqueue({"raw_concept": True, "concept_name": f"Uw_Seq_{i:02d}", "description": f"#{i}",
+    names = [write_queue_entry({"raw_concept": True, "concept_name": f"Uw_Seq_{i:02d}", "description": f"#{i}",
                          "relationships": [], "properties": {"uw_seq": f"{i:02d}"}}, "_seq")
              for i in range(50)]
     seconds = {n[:15] for n in names}
@@ -153,41 +152,23 @@ def t_c_the_queue_name_never_goes_backwards_in_a_process():
     assert leftovers == [], f"a half-written entry was left behind: {leftovers}"
 
 
-class _NoStore:
-    def execute(self, query, params):
-        return []
-
-
-def _post(url, path, body):
-    req = urllib.request.Request(url + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode())
-
-
-def t_d_queued_says_where_each_name_is():
+def t_d_queue_status_says_where_each_name_is():
+    """`queue_status` is the SDK's answer to "did my entry land": waiting = the top-level backlog, and
+    per name queued · processed · failed · absent — read only, and only plain .json names inside the
+    queue dir and its two subdirs. Reached in-process: the box's door is the SDK's operations."""
     fresh()
-    server, _ = ep.serve_in_thread(_NoStore(), port=18833, host="127.0.0.1", key="")
-    url = "http://127.0.0.1:18833"
-    try:
-        a = _post(url, "/enqueue", {"entry": {"raw_concept": True, "concept_name": "Uw_Q_A"}})["result"]
-        b = _post(url, "/enqueue", {"entry": {"raw_concept": True, "concept_name": "Uw_Q_B"}})["result"]
-        c = _post(url, "/enqueue", {"entry": {"raw_concept": True, "concept_name": "Uw_Q_C"}})["result"]
-        for sub, name in (("processed", b), ("failed", c)):
-            (queue_dir() / sub).mkdir(exist_ok=True)
-            (queue_dir() / name).rename(queue_dir() / sub / name)
-        ans = _post(url, "/queued", {"names": [a, b, c, "never_enqueued.json", "../graph.json",
-                                               "processed"]})
-        assert ans["ok"], ans
-        assert ans["result"]["waiting"] == 1, ans
-        assert ans["result"]["names"] == {a: "queued", b: "processed", c: "failed",
-                                          "never_enqueued.json": "absent", "../graph.json": "absent",
-                                          "processed": "absent"}, ans
-        bare = _post(url, "/queued", {})
-        assert bare == {"ok": True, "result": {"waiting": 1}}, bare
-    finally:
-        server.shutdown()
-        server.server_close()
+    a = write_queue_entry({"raw_concept": True, "concept_name": "Uw_Q_A"})
+    b = write_queue_entry({"raw_concept": True, "concept_name": "Uw_Q_B"})
+    c = write_queue_entry({"raw_concept": True, "concept_name": "Uw_Q_C"})
+    for sub, name in (("processed", b), ("failed", c)):
+        (queue_dir() / sub).mkdir(exist_ok=True)
+        (queue_dir() / name).rename(queue_dir() / sub / name)
+    ans = queue_status([a, b, c, "never_enqueued.json", "../graph.json", "processed"])
+    assert ans["waiting"] == 1, ans
+    assert ans["names"] == {a: "queued", b: "processed", c: "failed",
+                            "never_enqueued.json": "absent", "../graph.json": "absent",
+                            "processed": "absent"}, ans
+    assert queue_status() == {"waiting": 1}, queue_status()
 
 
 def t_e_none_unsets_a_property_and_a_dict_is_refused_with_how_to_store_it():
@@ -212,10 +193,10 @@ def t_f_drain_once_is_the_whole_drain_and_a_test_can_call_it():
     fresh()
     empty = owd.drain_once(queue_dir(), graph())
     assert (empty["files"], empty["processed"], empty["failed"]) == (0, 0, 0), empty
-    a = ep.enqueue({"raw_concept": True, "concept_name": "Uw_Drain_One", "description": "one",
+    a = write_queue_entry({"raw_concept": True, "concept_name": "Uw_Drain_One", "description": "one",
                     "relationships": [{"relationship": "is_a", "related": ["Uw_Thing"]}],
                     "properties": {"uw_k": "v1"}}, "_d")
-    b = ep.enqueue({"concepts": [{"name": "Uw_Drain_Two", "description": "two",
+    b = write_queue_entry({"concepts": [{"name": "Uw_Drain_Two", "description": "two",
                                   "relationships": [{"relationship": "is_a", "related": ["Uw_Thing"]}],
                                   "properties": {"uw_k": "v2"}}]}, "_d")
     bad = queue_dir() / (b[:-5] + "_zz.json")
@@ -225,7 +206,7 @@ def t_f_drain_once_is_the_whole_drain_and_a_test_can_call_it():
     assert (res["files"], res["processed"], res["failed"]) == (3, 2, 1), res
     for n, v in (("Uw_Drain_One", "v1"), ("Uw_Drain_Two", "v2")):
         assert props_of(n, ["uw_k"]) == {"uw_k": v}, n
-    status = ep.handle(None, "/queued", {"names": [a, b, bad.name]})["result"]
+    status = queue_status([a, b, bad.name])
     assert status == {"waiting": 0, "names": {a: "processed", b: "processed", bad.name: "failed"}}, status
     assert owd.drain_once(queue_dir(), graph())["files"] == 0
 

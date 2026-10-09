@@ -51,10 +51,12 @@ read 0 of 21 nodes with `canonical_intent` two minutes after landing and 21 of 2
 
 - **Measure write lag on the GRAPH:** the entry's own authored stamp (the `_YYYY_MM_DDTHH_MM_SS` its name
   ends with) against its landing `t`. Never from a file count under `carton_queue`: a drained payload
-  stays there, in `processed/` or `failed/`. The backlog is the top-level `*.json` only — the box
-  endpoint's `/queued` answers it as `waiting`.
-- **Ask whether ONE entry landed:** `POST /queued {"names": [<the name /enqueue answered>]}` →
-  `queued` · `processed` · `failed` · `absent`. `processed` means the batch holding it was written.
+  stays there, in `processed/` or `failed/`. The backlog is the top-level `*.json` only —
+  `add_concept_tool.queue_status()` answers it as `waiting`, on the machine whose worker drains it.
+- **Ask whether ONE entry landed:** on the box, `queue_status([<the entry's name>])` → `queued` ·
+  `processed` · `failed` · `absent`; `processed` means the batch holding it was written. Off the box,
+  read the concept back through `query_wiki_graph` after the next drain, bounded, and report what has
+  not landed as unlanded, never as absent.
 - **Never order by `t` alone** where writes from one batch must stay in sequence: ties are a batch, so
   break them by the authored stamp, then the name. A tied `t` also hides a batch-mate from any
   `n.t < x` search.

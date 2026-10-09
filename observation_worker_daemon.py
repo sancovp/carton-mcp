@@ -2660,46 +2660,35 @@ def worker_daemon():
     # Create shared Neo4j connection for entire daemon lifetime
     shared_neo4j = _create_shared_neo4j()
 
-    # THE WORKER SERVES THE GRAPH, AND ON EVERY BACKEND.
+    # THE WORKER IS CARTON'S SERVER. It owns the graph file and drains the queue, so it is the
+    # one process every SDK operation must run in — and it serves them: `POST /call
+    # {operation, params}` behind the account's key (carton_api). A tenant's MCP, on their own
+    # machine, calls every tool here; Ribcage and every other program call the same door. The
+    # operations are the MCP's tools, loaded from server_fastmcp into THIS process; its graph
+    # connection resolves to this worker's own store (one embedded store per path per process,
+    # graph_store.embedded_store), so a served `get_concept` and the drain share one handle.
     #
-    # On kuzu it MUST: the engine is embedded and one process owns the file — a second read-write
-    # open is refused by the lock, and a second read_only open (ladybug) is served a stale snapshot —
-    # so unless this is running, nothing else in the box can read the live graph at all. It is started
-    # here, right after the connection exists, because that connection IS what it serves.
+    # It serves on every backend: on kuzu nothing else can open the file, and on neo4j a box
+    # without it would come up healthy, publish a port and answer nothing — the API is the
+    # box's only service surface.
     #
-    # ⛔ IT NO LONGER SKIPS ON NEO4J, and that is the load-bearing half of removing the MCP
-    # server from the box. This block used to be gated on `GRAPH_BACKEND == kuzu`, with the
-    # stated reason that on neo4j the default path stayed byte-identical — true and harmless
-    # while the MCP server was the box's network surface. It is not harmless now: the MCP is
-    # gone (there is no agent in a box to use it; MCPs run on the tenant's own machine and CALL
-    # IN), so this endpoint is the ONLY service surface a box has. Gated on kuzu, a neo4j box
-    # would come up healthy, publish a port, and answer nothing at all.
-    #
-    # It works on both because it is store-agnostic BY CONSTRUCTION: it exposes exactly the four
-    # methods `GraphStore` defines, and `Neo4jStore` and `KuzuStore` both implement them. There
-    # is no dialect knowledge here to be wrong about either engine.
-    #
-    # FAIL-OPEN BY DESIGN: an endpoint that will not bind must never stop the queue drain — the
-    # box keeps ingesting, and says loudly that nothing can read it.
-    _kuzu_endpoint = None
+    # FAIL-OPEN BY DESIGN: a server that will not bind must never stop the queue drain — the box
+    # keeps ingesting, and says loudly that nothing can reach it.
+    _carton_api_server = None
     try:
-        from carton_mcp.kuzu_query_endpoint import serve_in_thread, DEFAULT_PORT, required_key
-        _kuzu_port = int(os.getenv("KUZU_QUERY_PORT", DEFAULT_PORT))
-        _kuzu_endpoint, _ = serve_in_thread(shared_neo4j._store, _kuzu_port)
-        # REPORT WHAT IT ACTUALLY DID. This line used to say 127.0.0.1 unconditionally,
-        # which becomes a lie the moment CARTON_QUERY_HOST is set — and the one thing an
-        # operator needs from this log is whether the graph is now reachable from off-box
-        # and whether it is gated.
-        _kuzu_host = os.getenv("CARTON_QUERY_HOST", "127.0.0.1")
+        from carton_mcp import carton_api
+        _api_port = int(os.getenv("CARTON_PORT", carton_api.DEFAULT_PORT))
+        _carton_api_server, _ = carton_api.serve_in_thread(_api_port)
+        _api_host = os.getenv("CARTON_HOST", "127.0.0.1")
         _backend = (os.getenv("GRAPH_BACKEND") or "neo4j").strip().lower()
-        print(f"[Worker] graph query endpoint on {_kuzu_host}:{_kuzu_port} "
-              f"(backend: {_backend}; auth: {'ON' if required_key() else 'off — local only'}; "
-              f"this process owns the database file)", file=sys.stderr)
+        print(f"[Worker] carton api on {_api_host}:{_api_port} — the SDK's operations on POST /call "
+              f"(backend: {_backend}; auth: {'ON' if carton_api.required_key() else 'off — loopback only'}; "
+              f"this process owns the graph)", file=sys.stderr)
     except Exception as exc:
         traceback.print_exc()
-        print(f"[Worker] WARNING: graph query endpoint did not start ({exc}). The queue drain "
-              f"continues, but NOTHING CAN READ THE GRAPH until it does — this endpoint is the "
-              f"box's only service surface.", file=sys.stderr)
+        print(f"[Worker] WARNING: carton api did not start ({exc}). The queue drain continues, "
+              f"but NOTHING CAN REACH CARTON until it does — the api is the box's only service "
+              f"surface.", file=sys.stderr)
 
     # Start background linker thread
     linker_stop_event = threading.Event()

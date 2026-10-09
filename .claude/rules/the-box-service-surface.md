@@ -1,83 +1,55 @@
-Isaac verbatim: **"the saas is hit *FROM* an MCP. it CANNOT HAVE MCPS. THERE IS NO AGENT TO USE THEM."**
-and **"MCPS ARE RUN BY USERS LOCALLY, ON THEIR LAPTOPS AND DESKTOPS, NOT WHERE THE SAAS SERVICE THEY HIT
-IS."**
-
-A tenant puts their user and key in their MCP SETTINGS. Their MCP runs on their own machine, reads
-`CARTON_USER` and `CARTON_KEY` from env, and calls IN to their box. The box checks the key and returns
-ROWS. Nothing is negotiated, minted or stored — that is the entire protocol.
+The hosted CartON is hit FROM an MCP; it serves no MCP. An MCP server exists to be driven by an agent, and a box
+has none: the MCP runs on the tenant's own machine, and every one of its tools is `call_carton(<tool>, <its
+arguments>)` plus the rendering of the answer. What the box serves is CARTON'S SDK — the SDK's operations, which are
+the MCP's tool list by name — on ONE door:
 
 ```
-tenant's laptop                                  their carton box
-  MCP (stdio) → KuzuHttpStore ── Bearer key ──→ kuzu_query_endpoint (:8192)
-                                                   /query /set_properties
-                                                   /remove_properties
-                                                   /find_by_properties
-                                                   /enqueue /queued /health
+tenant's machine                                     their carton box (the worker, which owns the graph file)
+  MCP tool  ── call_carton(op, params) ──►  POST /call {"operation", "params"}   → {"ok", "result"}
+  Ribcage · SOMA · any program ──────────►  GET  /health
+                        Bearer CARTON_KEY, X-Carton-User                          knowledge/carton-mcp/carton_api.py
 ```
+
+`carton_api.CartonOperation` names the operations; `server_fastmcp.py` registers each beside its tool with
+`@operation(name)` — the same signature, no rendering — and `carton_api.operations()` refuses to serve if the
+enum, the registered operations and the tool list disagree. A read operation answers the SDK's data
+(`query_wiki_graph` answers the facade's envelope: rows with their null columns); a write answers the SDK's text.
+The rendering (`_fmt`, the overflow file, the reminders) is the tool's, on the caller's side.
 
 | component | status | note |
 |---|---|---|
-| `kuzu_query_endpoint.py` | **THE SERVICE SURFACE** | real routes, real rows. `required_key()` demands `CARTON_KEY` when set and checks it **before the body is read**; unset = the old private in-box wire, byte-identical. `serve_in_thread` **REFUSES TO START** on a non-local bind with no key |
-| `KuzuHttpStore` (heaven-framework `graph_store.py`) | **THE CLIENT** | sends `Authorization: Bearer` + `X-Carton-User` from env, headers attached only when configured. Constructed with NO ARGUMENTS is the real path — that is how MCP settings deliver credentials |
-| the worker (`observation_worker_daemon`) | **SERVES IT, ON EVERY BACKEND** | it owns the graph, so it serves the endpoint whatever `GRAPH_BACKEND` is: a neo4j box without it would come up healthy and answer nothing. The endpoint is store-agnostic by construction — the four `GraphStore` methods, which both stores implement, plus the queue's two routes, which touch no store |
-| `carton_transport.py` | the transport law, all that outlived the gateway | stdio only; `sse` refused (Mar 13 2026 broken pipes); `http`/`streamable-http` refused **by name as REMOVED**, never downgraded. 14/14 |
-| `network_gateway.py` | **DELETED** | it made carton's MCP server LISTEN so something could dial in. Nothing could: a box has no agent |
-| `[program:carton-mcp]` in the box | **DELETED** | see `application/carton-saas/box/supervisord.conf`, which carries the reasoning where an operator will meet it |
+| `carton_api.py` — `call_carton` · `execute` · `serve_in_thread` · `CartonOperation` | **THE DOOR AND THE CALL** | `call_carton` runs in-process with no `CARTON_URL` and POSTs `/call` with one; `execute` validates params exactly as the MCP validates a tool's arguments, then runs the operation; `serve_in_thread` REFUSES TO START on a non-local bind with no key, checks the key before reading the body, refuses an unknown operation by name (400), answers an operation's own failure as a 400 carrying its message, and refuses through the operator's gate with 402 |
+| `server_fastmcp.py` | **THE OPERATIONS AND THE TOOLS** | every `@mcp.tool()` body is `call_carton` + a render; every `@_carton_api.operation(name)` is the function behind it. With `CARTON_URL` set the module opens no graph connection and starts no worker |
+| the worker (`observation_worker_daemon`) | **SERVES IT, ON EVERY BACKEND** | it owns the graph file and drains the queue, so it is where every operation runs; it imports the operations into its own process, whose graph connection is the one embedded store per path (`graph_store.embedded_store`) |
+| `graph_store.py` | the store, private to the worker's process | `KuzuStore` only; a second process never opens the file and never reaches it over the wire |
+| `carton_transport.py` | the transport law | stdio only; `sse` refused; `http`/`streamable-http` refused by name as removed |
+| the metering | the operator's, through `CARTON_CALL_GATE` | `application/carton-saas/metering/call_gate.py` — `gate(operation, params)`: `add_concept` of a NEW concept at the limit → 402; edits and every other operation pass. Never in the published package |
 
-`kuzu_query_endpoint.py` IS the service surface. `required_key()` demands `CARTON_KEY` when set and
-checks it BEFORE the body is read; unset means the old private in-box wire, byte-identical.
-`serve_in_thread` REFUSES TO START on a non-local bind with no key.
+Env — the client: `CARTON_URL` · `CARTON_KEY` · `CARTON_USER` · `CARTON_TIMEOUT_S`. The server: `CARTON_HOST`
+(127.0.0.1 unless the box is opened) · `CARTON_PORT` (8192) · `CARTON_KEY` · `CARTON_CALL_GATE`.
 
-`KuzuHttpStore` (heaven-framework `graph_store.py`) IS the client. It sends `Authorization: Bearer` plus
-`X-Carton-User` from env, attaching the headers only when configured. Construct it with NO ARGUMENTS —
-that is the real path, and it is how MCP settings deliver credentials.
+Never give the box a second door: no route beside `/call` and `/health`, no Cypher pipe, no operation that is not a
+tool of the MCP. A product on top of CartON (a board, a card) is concepts and properties written through
+`add_concept` and `set_properties`. Never restore an MCP server, a network MCP transport or a graph socket in the box.
 
-The worker (`observation_worker_daemon`) serves the endpoint ON EVERY BACKEND, because it owns the graph.
-Do not gate that start on `GRAPH_BACKEND=kuzu`: with the MCP removed, a neo4j box would come up healthy
-and answer nothing. The endpoint is store-agnostic by construction — the four `GraphStore` methods
-(`/query`, `/set_properties`, `/remove_properties`, `/find_by_properties`), which both stores implement,
-plus the queue's two routes, which touch no store, plus `/health`. Add no other core route: a
-product-specific route goes through the `CARTON_EXTRA_ROUTES` hook.
+Never put logic in a tool: a tool is `call_carton(<tool>, <args>)` and a render. A new capability is a new SDK
+function, registered as an operation beside its tool, named in `CartonOperation`.
 
-THE QUEUE'S TWO ROUTES. `/enqueue {entry, suffix}` writes one entry into THIS box's queue and answers its
-filename; the name sorts in enqueue order and the file appears whole (`add_concept_tool.write_queue_entry`),
-so entries posted one after another drain one after another. The write is asynchronous, so `/enqueue`'s
-answer says nothing about landing: `/queued {names}` does — `{"waiting": N}` plus, per name, `queued` (not
-drained) · `processed` (written to the graph) · `failed` (dead-lettered, the reason inside the file) ·
-`absent` (never enqueued here). `/queued` is read-only and answers only for plain `.json` names inside the
-queue dir and its `processed/` and `failed/`.
+Dev-flow, and NEVER edit one place only. Touching `carton_api` (`execute` · `call_carton` · `serve_in_thread` ·
+`load_gate` · `CartonOperation`), a tool or its operation in `server_fastmcp.py`, `add_concept_tool.submit_queue_entry`,
+or the worker's server start → edit them coherently, then the gate: `python3 test_carton_api.py` (9/9 — client
+against server over a REAL socket, never two mocks agreeing; the enum = the registry = the tools; a real
+`add_concept` over the wire writes the SERVER's queue and `query_wiki_graph` answers rows) AND `python3
+test_carton_transport.py` (14/14) AND, for the queue or the drain, `python3 test_queue_submit.py` (5/5) AND
+`python3 test_universal_write.py` (6/6 — write → drain → graph on a real embedded graph) AND
+`python3 application/carton-saas/metering/test_call_gate.py` (9/9). "It imported" is not the gate.
 
-`carton_transport.py` carries the transport law: stdio only. `sse` is refused. `http` and
-`streamable-http` are refused BY NAME AS REMOVED, never downgraded.
+Installed-package law: a source edit reaches nothing running without `pip install --no-deps` (carton-mcp AND
+heaven-framework), and the box needs its image REBUILT with `box/build-carton-box.sh`, which stages a small tree
+rather than streaming the whole monorepo root.
 
-Never restore `network_gateway.py` or `[program:carton-mcp]` in the box. The gateway made carton's MCP
-server LISTEN so something could dial in, and nothing could: a box has no agent.
-
-Never use the MCP surface as a data plane. Every tool return goes through `server_fastmcp._fmt`, which
-TRUNCATES at 10,000 chars into a file INSIDE the container that the caller cannot open, DROPS null
-columns (`_present` in `carton_render.py`), and lays the rows out as prose for an agent — one record per
-block, every repeated sequence rewritten as an `@N` ref (`carton_render.render_answer` through
-`answer_refs.encode_refs`). That is
-correct for an agent reading prose and silently wrong for anything reading rows: a board served through
-it is partial and says nothing.
-
-Dev-flow, and NEVER edit one place only. Touching `kuzu_query_endpoint` (`handle` / `enqueue` /
-`required_key` / `_authorized` / `serve_in_thread`), `add_concept_tool.write_queue_entry` or
-`queue_status`, the `KuzuHttpStore` credential half, or the worker's endpoint start →
-edit them coherently, then the gate: `python3 test_query_endpoint_auth.py` (7/7 — client against server
-over a REAL socket, never two mocks agreeing) AND `python3 test_kuzu_query_endpoint.py` (7/7) AND `python3
-test_carton_transport.py` (14/14) AND, for the queue's routes or the drain, `python3 test_queue_submit.py`
-(4/4) AND `python3 test_universal_write.py` (6/6 — enqueue → drain → graph on a real embedded graph).
-"It imported" is not the gate.
-
-Changing the transport laws → `carton_transport.py` plus the one call in `server_fastmcp.main()`.
-
-Installed-package law: a source edit reaches nothing running without `pip install --no-deps` (carton-mcp
-AND heaven-framework), and the box needs its image REBUILT with `box/build-carton-box.sh`, which stages a
-small tree rather than streaming the whole monorepo root.
-
-Prove it end to end with a BOX, never a loopback: bring one up as its OWN compose project (`docker
-compose -p <name>`, the provisioner pattern — never disturb a running `box-*`) with
-`CARTON_QUERY_HOST=0.0.0.0`, a `CARTON_KEY` and a published query port, then drive it from outside with
-`KuzuHttpStore()` and no arguments. Assert a NULL COLUMN SURVIVES — the thing the MCP surface would have
-dropped, which is the whole reason this surface exists rather than that one.
+Prove it end to end with a BOX, never a loopback: bring one up as its OWN compose project (`docker compose -p
+<name>`, the provisioner pattern — never disturb a running `box-*`) with `CARTON_HOST=0.0.0.0`, a `CARTON_KEY` and a
+published port, then drive it from outside with `call_carton` and the credentials in the environment
+(`box/smoke/box_smoke_client.py`). Assert a NULL COLUMN SURVIVES in `query_wiki_graph`'s rows and that
+`query_wiki_graph` refuses a write verb — the two facts that make this door the SDK and not a pipe.

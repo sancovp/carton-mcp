@@ -1,50 +1,36 @@
-The node-quota gate is one self-contained module, `carton_quota.py`, plus ONE guarded call at the top of
-`add_concept_tool_func` — after the empty-relationships check, BEFORE the optional-fields merge and the
-queue write. It does NOT touch the guarded optional-fields capability; domain, subdomain, personal_domain
-and produces stay untouched.
+The node quota is the OPERATOR'S, never the package's: `application/carton-saas/metering/carton_quota.py`
+(`check_quota` · `quota_limit` · the TTL-cached count) and `call_gate.py` (`gate(operation, params)`), reached by
+CartON's API through `CARTON_CALL_GATE=call_gate:gate` in the box's worker env. Nothing in this package meters; a
+limit a tenant can read, unset or edit is not a limit.
 
-## States
+NO-OP UNLESS `CARTON_MAX_NODES` IS SET. Unset means no gate, no import, zero queries. A quota never appears uninvited.
 
-| component | status | note |
-|---|---|---|
-| `carton_quota.py` | **BUILT + 8/8 tests + LIVE-VERIFIED 2026-07-10** | pure logic, injectable count/exists fns; TTL-cached count (default 60s, `CARTON_QUOTA_TTL_S`). **The envelope law (the box smoke's catch):** `query_wiki_graph` returns `{'success':…,'data':[rows]}` — `_rows()` unwraps and **fails LOUD on a failed query** (a meter that can't count must never fail-open into 'unlimited'). Live 6/6: refused-at-quota with the exact message through the real MCP surface · refinement passed · freed+TTL-refresh passed (`application/carton-saas/box/smoke/`) |
-| `add_concept_tool.py` wiring | EDITED (one call, after the empty-relationships check, BEFORE the optional-fields merge and the queue write) | does NOT touch the guarded optional-fields capability (domain/subdomain/personal_domain/produces untouched) |
-| live E2E (real server, real neo4j, real MCP surface) | **VERIFIED 2026-07-10 (6/6)** | `application/carton-saas/box/smoke/` — against a throwaway Community neo4j on 7688. The standing warning holds forever: NEVER set `CARTON_MAX_NODES` on Isaac's live carton (his graph exceeds any test limit; it would start rejecting real writes) |
-| daemon-side stub drift | NAMED, accepted | auto-created relationship-target stubs bypass the chokepoint; front door blocks all deliberate growth; the BLACKBOX nightly gauge shows true counts. Daemon-side enforcement = a separate capability with its own dev-flow if ever needed |
+REFUSE GROWTH, NOT REFINEMENT. The gate fires on `add_concept` only. At or over quota, an `add_concept` of an
+EXISTING concept still passes — `add_concept` is also the update path — and `set_properties` and every read pass at
+any size; only a NEW concept raises `QuotaExceeded`, answered as 402 with the limit, the count and the upgrade path.
 
-NO-OP UNLESS `CARTON_MAX_NODES` IS SET. Unset means byte-identical behaviour and zero queries. A quota
-never appears uninvited.
-
-REFUSE GROWTH, NOT REFINEMENT. At or over quota, EXISTING concepts still edit — `add_concept` is also the
-update path — and only NEW nodes raise `QuotaExceeded`, with an actionable message naming the limit, the
-count and the upgrade path. The existence query runs only on the rare over-quota branch.
-
-THE LIVE PATH IS THE ENFORCED PATH. Rejection fires before the queue write, so it provably never reaches
-the graph. Never enforce on a derived view.
+THE LIVE PATH IS THE ENFORCED PATH. The refusal fires at the door, before the operation runs, so it provably never
+reaches the queue or the graph. Never enforce on a derived view.
 
 ENFORCEMENT READS THE LIVE COUNT; BLACKBOX ONLY OBSERVES. Never conflate the two lanes.
 
-BE LOUD ON GARBAGE. A non-integer or negative `CARTON_MAX_NODES` raises; a broken limit must never
-silently mean unlimited.
+BE LOUD ON GARBAGE. A non-integer or negative `CARTON_MAX_NODES` raises; a broken limit must never silently mean
+unlimited. The count reads `query_wiki_graph`'s envelope and FAILS LOUD on a failed query: a meter that cannot count
+must never fail open into "unlimited".
 
-THE ENVELOPE LAW: `query_wiki_graph` returns `{'success':…,'data':[rows]}`, so `_rows()` unwraps it and
-FAILS LOUD on a failed query. A meter that cannot count must never fail-open into "unlimited".
+⚠ NEVER set `CARTON_MAX_NODES` on the owner's own carton. The live graph exceeds any test limit and it would start
+refusing real writes.
 
-⚠ NEVER set `CARTON_MAX_NODES` on Isaac's live carton. His graph exceeds any test limit and it would
-start rejecting real writes.
+Dev-flow, and NEVER edit one place only. Touching `check_quota` / `quota_limit` / the TTL cache (default 60s,
+`CARTON_QUOTA_TTL_S`), or `call_gate.gate` → edit the metering module and the gate coherently, then the gate:
+`python3 application/carton-saas/metering/test_carton_quota.py` all green AND `python3
+application/carton-saas/metering/test_call_gate.py` (9/9 — the API refuses a new concept 402 at the limit, passes an
+existing one and every other operation, and passes everything with no limit set) AND `py_compile` on both files.
 
-Dev-flow, and NEVER edit one place only. Touching `check_quota` / `quota_limit` / the TTL cache (default
-60s, `CARTON_QUOTA_TTL_S`), or the one call site in `add_concept_tool_func` → edit `carton_quota.py` and
-the call site coherently, then the gate: `python3 test_carton_quota.py` all green AND `python3
-test_network_gateway.py` still green AND `py_compile` on both edited files.
+Installed-package law: the metering ships in the box image (`box/Dockerfile` COPYs it to `/opt/metering`); a source
+edit reaches a box only through `box/build-carton-box.sh` and a redeploy.
 
-If your change goes anywhere NEAR the optional-fields params or `merge_optional_domain_fields`, STOP:
-that is the `edit-add-concept-optional-fields` dev-flow, non-negotiable.
-
-Installed-package law: source edits change nothing running without `pip install --no-deps` and a restart.
-
-Known bound, named and accepted: daemon-side auto-created relationship-target stubs bypass the
-chokepoint. The front door blocks all deliberate growth, and the BLACKBOX nightly gauge shows true
-counts. Daemon-side enforcement is a separate capability with its own dev-flow if ever needed.
-
-Read the `understand-carton-mcp-rules` skill for the history behind this rule.
+Known bound, named and accepted: the observation queue's own writers (`add_observation_batch`,
+`observe_from_identity_pov`) reach the graph through `add_observation`, not through `add_concept`, so concepts
+written that way are not metered at the door; a tier's limit means nothing for them until that path is gated too
+(CartON SaaS's board, § THE BUILD).

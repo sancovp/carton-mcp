@@ -70,7 +70,7 @@ def main():
         # The refusal has to leave the reader somewhere to go, or they will simply
         # unset the variable and wonder why their remote graph is empty.
         check(f"{value}'s refusal names the surface that replaced it",
-              msg is not None and "KUZU_QUERY_URL" in msg, (msg or "")[:90])
+              msg is not None and "CARTON_URL" in msg and "/call" in msg, (msg or "")[:90])
 
     print("== an unknown value errors rather than falling through ==")
     msg = refusal({"CARTON_TRANSPORT": "carrier-pigeon"})

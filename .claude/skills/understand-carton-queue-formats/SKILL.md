@@ -14,15 +14,15 @@ when there was no graph connection to try. `drain_once(queue_dir, connection)` i
 
 ## Write an entry through the write path, never by hand
 
-- In process: `add_concept_tool.submit_queue_entry(entry, suffix)` — it POSTs to the box's `/enqueue`
-  when `KUZU_QUERY_URL` names one, and otherwise calls `write_queue_entry`.
-- A program off the box: `POST /enqueue {"entry": {...}, "suffix": "_x"}` on the box's query endpoint,
-  with its bearer key. The answer is the filename.
+- The write path is `add_concept` — CartON's SDK, called in process on the box or through the box's door
+  (`carton_api.call_carton("add_concept", {...})` with `CARTON_URL` + `CARTON_KEY`). The operation runs
+  on the box and writes the entry into the box's own queue through `add_concept_tool.submit_queue_entry`,
+  which is `write_queue_entry`: nothing off the box ever writes a queue file.
 - `write_queue_entry` names the file `YYYYmmdd_HHMMSS_ffffff_<uuid8><suffix>.json` from a stamp the
   process never lets go backwards, so entries written one after another drain in that order. It writes
   under a `.part` name and renames, so the worker never reads half a file.
-- Whether an entry has landed: `POST /queued {"names": [...]}` → `queued` · `processed` · `failed` ·
-  `absent`, plus `waiting` (the top-level backlog). Read the graph only after `processed`.
+- Whether an entry has landed, on the box: `add_concept_tool.queue_status([...])` → `queued` · `processed`
+  · `failed` · `absent`, plus `waiting` (the top-level backlog). Read the graph only after `processed`.
 
 ## The three formats
 

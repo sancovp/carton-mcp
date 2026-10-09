@@ -91,24 +91,24 @@ and research loops.
 
 **Local (default):** stdio transport. Point your MCP client at the server; nothing else to run.
 
-**Hosted (the carton box):** the box has no MCP server. Its service surface is the graph query endpoint the
-worker serves (`kuzu_query_endpoint.py`, 8192) behind `CARTON_KEY`; your MCP runs on your own machine with
-`KUZU_QUERY_URL`, `CARTON_USER` and `CARTON_KEY` set and calls in (`KuzuHttpStore`). The transport laws, held in
-`carton_transport.py`: stdio only; `sse` refused; `http`/`streamable-http` refused by name as removed. The endpoint
+**Hosted (the carton box):** the box has no MCP server. It serves CartON's SDK — these same tools, as operations —
+on one door, `POST /call {operation, params}` (`carton_api.py`, 8192) behind `CARTON_KEY`. Your MCP runs on your
+own machine with `CARTON_URL`, `CARTON_USER` and `CARTON_KEY` set, and every tool becomes
+`call_carton(<tool>, <args>)` plus its rendering; a program calls the same door. The transport laws, held in
+`carton_transport.py`: stdio only; `sse` refused; `http`/`streamable-http` refused by name as removed. The API
 refuses to start on a non-local bind without a key.
 
-**Metering:** set `CARTON_MAX_NODES` and the quota gate (`carton_quota.py`) enforces at the write
-chokepoint, before anything reaches the queue. It **refuses growth, not refinement** — at quota,
-existing concepts still edit; only new nodes are rejected, with an actionable message. Unset, it is
-a byte-identical no-op that runs zero queries.
+**Metering:** the operator's, never this package's — a box sets `CARTON_CALL_GATE` to its metering module
+(`application/carton-saas/metering/call_gate.py`), which refuses a NEW concept at `CARTON_MAX_NODES` with 402 and
+lets edits and every other operation through. Unset, there is no gate and no import.
 
 ## Architecture
 
 ```
 Agent (any MCP client)
-        │  stdio  ·  or bearer-gated streamable HTTP
+        │  stdio — the MCP on the agent's machine; hosted, every tool is call_carton → the box's POST /call
         ▼
-   Carton MCP  ──  quota gate  ──  state-machine gates  ──  inference layer
+   Carton MCP  ──  state-machine gates  ──  inference layer
         │
         ├── Neo4j (:Wiki namespace)  — structure, relationships, traversal
         ├── Chroma                    — semantic retrieval

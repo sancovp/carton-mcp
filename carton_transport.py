@@ -5,15 +5,15 @@ streamable-HTTP listener (`BearerGateMiddleware` wrapping the SDK's `streamable_
 under uvicorn, fail-closed on `CARTON_API_KEY`) whose one purpose was to let something dial
 INTO a carton MCP server running inside a hosted box.
 
-Isaac ruled that shape out, verbatim: **MCPS ARE RUN BY USERS LOCALLY, ON THEIR LAPTOPS AND
-DESKTOPS, NOT WHERE THE SAAS SERVICE THEY HIT IS.** An MCP server exists to be driven by an
-agent; a tenant's box contains no agent, so a listener there had no caller. The tenant runs
-carton's MCP on their own machine and it CALLS IN to the box's graph query endpoint
-(`kuzu_query_endpoint.py` — real routes, a key from their MCP settings, rows back).
+An MCP server exists to be driven by an agent; a tenant's box contains no agent, so a listener
+there had no caller. The tenant runs carton's MCP on their own machine, and every one of its
+tools is `call_carton(<tool>, <args>)` to the box's one door — CartON's SDK on `POST /call`
+(`carton_api.py` — the operations by name, a key from their MCP settings, the operations'
+own results back).
 
 ⚠ AND THE BOX'S HTTP LISTENER IS A DIFFERENT LISTENER. "The SaaS listens on HTTP" is correct
-and unchanged — that is the query endpoint. The box had TWO listeners and only one of them
-was ever the service.
+and unchanged — that is the SDK's door. The box had TWO listeners and only one of them was
+ever the service.
 
 WHAT SURVIVED, AND WHY IT IS NOT MERELY A LEFTOVER: the transport decision predates the
 gateway and protects the LOCAL path, which is the path actually used. `resolve_transport` is
@@ -61,8 +61,8 @@ def resolve_transport(env=None) -> str:
             f"CARTON_TRANSPORT={transport!r} refers to the network gateway, which has been "
             "REMOVED: an MCP server is driven by an agent, and there is no agent in a hosted "
             "box, so nothing ever dialled it. Run carton on stdio where your agent is, and "
-            "point it at a remote graph with GRAPH_BACKEND=kuzu + KUZU_QUERY_URL + "
-            "CARTON_USER/CARTON_KEY — that is the surface a box actually serves."
+            "point it at your box with CARTON_URL + CARTON_KEY (+ CARTON_USER) — every tool "
+            "then calls the SDK the box serves on POST /call, which is the one door a box has."
         )
     if transport != STDIO:
         raise RuntimeError(

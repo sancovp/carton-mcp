@@ -597,9 +597,12 @@ def local_soma_pids(port: int) -> list:
         port: The port the SOMA URL names.
 
     Returns:
-        list: The pids as strings, excluding this process; empty when none serves that port.
+        list: The pids as strings, excluding this process; empty when none serves that port —
+        and empty on a host without /proc (macOS), where nothing can be read.
     """
     pids = []
+    if not os.path.isdir("/proc"):
+        return pids
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or entry == str(os.getpid()):
             continue
@@ -881,17 +884,13 @@ def write_queue_entry(entry: dict, suffix: str = "") -> str:
 
 
 def submit_queue_entry(entry: dict, suffix: str = "") -> str:
-    """Queue one entry and return its filename.
+    """Queue one entry on THIS machine and return its filename.
 
-    REMOTE when KUZU_QUERY_URL names a carton box: the entry is POSTed and the BOX writes
-    it, because the queue belongs to the machine whose worker drains it. Writing it here
-    would leave a file on the caller's own disk that nothing ever reads, and still report
-    success. LOCAL when the url is empty — the owner/self-hosted case, `write_queue_entry`.
+    The queue belongs to the machine whose worker drains it, and the only machine that runs this
+    code is that one: a caller off the box never reaches here — it calls `add_concept` on CartON's
+    server (`carton_api.call_carton`), and the server's own `add_concept` writes the entry into the
+    box's queue through this function.
     """
-    url = (os.getenv("KUZU_QUERY_URL") or "").strip()
-    if url:
-        from heaven_base.tool_utils.graph_store import KuzuHttpStore
-        return KuzuHttpStore(url)._post("/enqueue", {"entry": entry, "suffix": suffix})
     return write_queue_entry(entry, suffix)
 
 

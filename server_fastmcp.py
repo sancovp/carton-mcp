@@ -84,17 +84,26 @@ def _dedup_desc(text: str) -> str:
 
 _OVERFLOW_THRESHOLD = 10000  # chars before file overflow kicks in
 _OVERFLOW_DIR = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data")) / "query_overflow"
+# The overflow file is written where the AGENT is. In the process that serves CartON's API (the
+# worker in a box) this is False: the whole text travels to the caller, whose MCP proxy applies the
+# rule on its own disk (carton_api.proxy_tools) — a file inside the box is one the agent cannot open.
+WRITE_OVERFLOW_FILES = True
+
+
+def overflow_to_file(text: str) -> str:
+    """The MCP's overflow rule: past 10k chars the text goes to a file beside the agent and the
+    answer carries its head and the path."""
+    if not WRITE_OVERFLOW_FILES or len(text) <= _OVERFLOW_THRESHOLD:
+        return text
+    _OVERFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    overflow_file = _OVERFLOW_DIR / f"overflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    overflow_file.write_text(text)
+    return f"{text[:_OVERFLOW_THRESHOLD]}\n\n... Full results ({len(text)} chars) at: {overflow_file}"
+
 
 def _fmt(data) -> str:
     """Format data as compact string. No JSON bloat. Overflows to file if > 10k chars."""
-    result = _fmt_inner(data)
-    if len(result) > _OVERFLOW_THRESHOLD:
-        _OVERFLOW_DIR.mkdir(parents=True, exist_ok=True)
-        overflow_file = _OVERFLOW_DIR / f"overflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        overflow_file.write_text(result)
-        truncated = result[:_OVERFLOW_THRESHOLD]
-        return f"{truncated}\n\n... Full results ({len(result)} chars) at: {overflow_file}"
-    return result
+    return overflow_to_file(_fmt_inner(data))
 
 from .carton_render import render_answer
 
@@ -104,13 +113,14 @@ def _fmt_inner(data) -> str:
     canonical stripper and the paragraph dedup."""
     return render_answer(data, clean=lambda s: _dedup_desc(_strip_md(s)))
 
-# Create FastMCP server (the SDK class — UNTOUCHED; this is the stdio local
-# server exactly as before). There is no network branch any more: the bearer-gated
-# HTTP gateway that used to serve a carton MCP inside a hosted box is REMOVED, because
-# an MCP server is driven by an agent and a box contains none — see carton_transport.py,
-# which keeps the one thing that outlived it, the no-SSE law. Nothing blocking at
-# import (the transport rule's startup-timeout lesson).
+# Create FastMCP server (the SDK class — UNTOUCHED; this is the stdio local server). An MCP
+# server is driven by an agent and a box contains none, so there is no network MCP: hosted,
+# this MCP runs on the tenant's own machine and every tool below becomes
+# `call_carton(<tool>, <args>)` to the box (carton_api.proxy_tools, in main()). The box serves
+# the SDK — these same functions — on POST /call. carton_transport.py keeps the no-SSE law.
+# Nothing blocking at import (the transport rule's startup-timeout lesson).
 from .carton_transport import resolve_transport as _resolve_transport
+from carton_mcp import carton_api as _carton_api
 
 mcp = FastMCP("carton")
 
@@ -164,7 +174,15 @@ mcp.tool = _tool_stripped
 
 # Initialize shared Neo4j connection (lives for MCP lifetime)
 def _create_shared_neo4j():
-    """Create persistent Neo4j connection for MCP server lifetime."""
+    """Create persistent Neo4j connection for MCP server lifetime.
+
+    With `CARTON_URL` set this process is a CLIENT of a box: every tool is proxied to the box's
+    `/call` and nothing here touches a graph, so no connection is built — the same invariant the
+    box's design rests on (one process, the worker, holds the file).
+    """
+    if _carton_api.remote():
+        logger.info("CARTON_URL is set: this MCP calls CartON's server and holds no graph connection")
+        return None
     try:
         from heaven_base.tool_utils.neo4j_utils import KnowledgeGraphBuilder
         config = ConceptConfig()
@@ -524,8 +542,8 @@ def _check_observation_geometry(observation_data: dict) -> str | None:
     return None
 
 
-@mcp.tool()
-def add_concept(
+@_carton_api.operation("add_concept")
+def _op_add_concept(
     concept_name: str,
     is_a: List[str],
     part_of: List[str],
@@ -548,46 +566,7 @@ def add_concept(
     domain_part_of: Optional[str] = None,
     subdomain_about: Optional[str] = None,
 ) -> str:
-    """Add a new concept to the knowledge graph
-
-    Args:
-        concept_name: Name of the concept (will be normalized to Title_Case_With_Underscores)
-        is_a: REQUIRED. What category/type is this? e.g. ["Bug_Report"], ["Implementation_Status"]
-        part_of: REQUIRED. What contains this? e.g. ["GNOSYS_System"], ["Launch_Strategy"]
-        instantiates: REQUIRED. What pattern does this realize? e.g. ["Bug_Fix_Pattern"], ["Working_System_Pattern"]
-        produces: REQUIRED. What does this produce/output? e.g. ["Bug_Fix"], ["Compiled_Code"]. Empty list is a
-            valid list ([]) but the param itself must always be passed — same discipline as is_a/part_of/instantiates.
-        domain: REQUIRED (Isaac 2026-07-03: "we must know what it is in, period, every single thing" — enforced
-            HERE on the MCP tool, NOT on add_concept_tool_func, which keeps it optional for internal callers).
-            Free-form Title_Case string naming the broad real-world/system area this concept is about (e.g.
-            "Soma", "Carton_Schema", "Crystal_Ball"). Becomes a has_domain relationship.
-        subdomain: REQUIRED, same enforcement as domain. Narrower than domain (e.g. "Mereo_Validation" under
-            domain "Soma"). Becomes a has_subdomain relationship.
-        domain_about: OPTIONAL. When domain is not yet a domain node: what it is about. It is written first, is_a
-            Domain with has_about, part_of domain_part_of (card 726). Without it the domain lands as said and SOMA
-            grades it: a domain without has_about is not validly a Domain.
-        domain_part_of: OPTIONAL. The domain node that new domain is part of, reaching Health, Wealth, Social or
-            Spiritual.
-        subdomain_about: OPTIONAL. When subdomain is not yet a domain node: what it is about. It is written first, is_a
-            Domain with has_about, part_of domain.
-        personal_domain: REQUIRED, same enforcement as domain. Which strata of Isaac's life/work this concept
-            belongs to — ENUM, must be one of: paiab, sanctum, cave, misc, personal. Becomes a
-            has_personal_domain relationship (same predicate name add_observation_batch already uses).
-        concept: Full conceptual content explaining the entire concept, ideas, technical details, etc. Mentioning
-            other concept names auto-creates relates_to links. NEVER truncated or modified by D2 — D2 only reads
-            this to compute an informational [D2: ...] coverage tag on the response; it never gates the write.
-        relationships: OPTIONAL. Additional custom relationships beyond the required three. Each object must have format: {"relationship": "relation_type", "related": ["concept_name1", "concept_name2", ...]}. Use for has_*, depends_on, validates, etc.
-        desc_update_mode: How to update description if concept exists - "append" (default), "prepend", "replace", "path" (concept field is a file path — reads file content as description), or "edit" (surgical str-replace WITHIN the existing n.d: old_str_for_edit_case is found EXACTLY ONCE and replaced by the concept arg; the rest of n.d, including any CartonObj fence elsewhere, stays byte-identical; a per-node undo log is written; a 0-or->1 match fails gracefully leaving n.d unchanged)
-        old_str_for_edit_case: ONLY used when desc_update_mode == "edit": the exact substring of the existing n.d to replace with the concept arg.
-        hide_youknow: If False (default), SOMA validates and shows SOUP/ONT status. If True, skip validation - silent add.
-        clear_stash: If True, discard any stashed payload for this concept before processing. Use when a previous stash has stale/wrong values.
-        typed_values: OPTIONAL. List of [value, type] string pairs declaring programming types for relationship targets (e.g. [["Starsystem", "Domain"]] → SOMA receives tv('starsystem','domain')). Unknown values default to string_value.
-        properties: OPTIONAL. Dict of {key: value} NODE PROPERTIES to set on the concept (the scratch lane — status/order/gates/sm config/…). This is the SECOND meaning-channel beside relationships: relationships become graph edges, properties become neo4j node properties. Values are scalars (str/int/float/bool) or flat lists of those — NEVER nested objects or concept-refs (JSON-encode a nested value into a string); None unsets the key. Applied by the daemon via set_properties AFTER the node is written (same drain → no race; reserved/managed keys n/d/t/c/region/source/… are refused). Lets add_concept set BOTH edges and properties in one call (so you do not need a separate set_properties call).
-        soma_run_id: OPTIONAL. The run-id of a parked SOMA compose-SUGGESTION you are ACCEPTING with this add. SOMA's L3b surfaces a pure-mereo suggestion (a unique admissible candidate for a still-empty required slot) in the `compose_suggestions=` verdict block with a stable run-id (concept.prop.candidate). You ACCEPT it not via a separate RPC but by simply SAYING the fill — calling add_concept with the relationship that fills the slot — and passing soma_run_id so the parked review item is marked resolved (observation is the only operation; the add IS the compose, re-derivation resumes past the gap). Omit to add normally. To REJECT a suggestion, just do not add it.
-
-    Returns:
-        Formatted result showing success/failure of file and Neo4j operations
-    """
+    """The operation behind the `add_concept` tool — runs where the graph is; the tool renders its answer."""
     # Shape gate (inert unless CARTON_NAME_EXPECTATIONS is set): if the agent fumbled a name whose
     # partials we already know for sure, bounce a self-correction message back as the NORMAL result.
     rej = _check_name_expectations(concept_name)
@@ -683,6 +662,102 @@ def add_concept(
 
 
 @mcp.tool()
+def add_concept(
+    concept_name: str,
+    is_a: List[str],
+    part_of: List[str],
+    instantiates: List[str],
+    produces: List[str],
+    domain: str,
+    subdomain: str,
+    personal_domain: str,
+    concept: str = None,
+    relationships: Optional[List[ConceptRelationship]] = None,
+    desc_update_mode: str = "append",
+    hide_youknow: bool = False,
+    clear_stash: bool = False,
+    source: str = "agent",
+    typed_values: Optional[List[List[str]]] = None,
+    old_str_for_edit_case: Optional[str] = None,
+    properties: Optional[dict] = None,
+    soma_run_id: Optional[str] = None,
+    domain_about: Optional[str] = None,
+    domain_part_of: Optional[str] = None,
+    subdomain_about: Optional[str] = None,
+) -> str:
+    """Add a new concept to the knowledge graph
+
+    Args:
+        concept_name: Name of the concept (will be normalized to Title_Case_With_Underscores)
+        is_a: REQUIRED. What category/type is this? e.g. ["Bug_Report"], ["Implementation_Status"]
+        part_of: REQUIRED. What contains this? e.g. ["GNOSYS_System"], ["Launch_Strategy"]
+        instantiates: REQUIRED. What pattern does this realize? e.g. ["Bug_Fix_Pattern"], ["Working_System_Pattern"]
+        produces: REQUIRED. What does this produce/output? e.g. ["Bug_Fix"], ["Compiled_Code"]. Empty list is a
+            valid list ([]) but the param itself must always be passed — same discipline as is_a/part_of/instantiates.
+        domain: REQUIRED (Isaac 2026-07-03: "we must know what it is in, period, every single thing" — enforced
+            HERE on the MCP tool, NOT on add_concept_tool_func, which keeps it optional for internal callers).
+            Free-form Title_Case string naming the broad real-world/system area this concept is about (e.g.
+            "Soma", "Carton_Schema", "Crystal_Ball"). Becomes a has_domain relationship.
+        subdomain: REQUIRED, same enforcement as domain. Narrower than domain (e.g. "Mereo_Validation" under
+            domain "Soma"). Becomes a has_subdomain relationship.
+        domain_about: OPTIONAL. When domain is not yet a domain node: what it is about. It is written first, is_a
+            Domain with has_about, part_of domain_part_of (card 726). Without it the domain lands as said and SOMA
+            grades it: a domain without has_about is not validly a Domain.
+        domain_part_of: OPTIONAL. The domain node that new domain is part of, reaching Health, Wealth, Social or
+            Spiritual.
+        subdomain_about: OPTIONAL. When subdomain is not yet a domain node: what it is about. It is written first, is_a
+            Domain with has_about, part_of domain.
+        personal_domain: REQUIRED, same enforcement as domain. Which strata of Isaac's life/work this concept
+            belongs to — ENUM, must be one of: paiab, sanctum, cave, misc, personal. Becomes a
+            has_personal_domain relationship (same predicate name add_observation_batch already uses).
+        concept: Full conceptual content explaining the entire concept, ideas, technical details, etc. Mentioning
+            other concept names auto-creates relates_to links. NEVER truncated or modified by D2 — D2 only reads
+            this to compute an informational [D2: ...] coverage tag on the response; it never gates the write.
+        relationships: OPTIONAL. Additional custom relationships beyond the required three. Each object must have format: {"relationship": "relation_type", "related": ["concept_name1", "concept_name2", ...]}. Use for has_*, depends_on, validates, etc.
+        desc_update_mode: How to update description if concept exists - "append" (default), "prepend", "replace", "path" (concept field is a file path — reads file content as description), or "edit" (surgical str-replace WITHIN the existing n.d: old_str_for_edit_case is found EXACTLY ONCE and replaced by the concept arg; the rest of n.d, including any CartonObj fence elsewhere, stays byte-identical; a per-node undo log is written; a 0-or->1 match fails gracefully leaving n.d unchanged)
+        old_str_for_edit_case: ONLY used when desc_update_mode == "edit": the exact substring of the existing n.d to replace with the concept arg.
+        hide_youknow: If False (default), SOMA validates and shows SOUP/ONT status. If True, skip validation - silent add.
+        clear_stash: If True, discard any stashed payload for this concept before processing. Use when a previous stash has stale/wrong values.
+        typed_values: OPTIONAL. List of [value, type] string pairs declaring programming types for relationship targets (e.g. [["Starsystem", "Domain"]] → SOMA receives tv('starsystem','domain')). Unknown values default to string_value.
+        properties: OPTIONAL. Dict of {key: value} NODE PROPERTIES to set on the concept (the scratch lane — status/order/gates/sm config/…). This is the SECOND meaning-channel beside relationships: relationships become graph edges, properties become neo4j node properties. Values are scalars (str/int/float/bool) or flat lists of those — NEVER nested objects or concept-refs (JSON-encode a nested value into a string); None unsets the key. Applied by the daemon via set_properties AFTER the node is written (same drain → no race; reserved/managed keys n/d/t/c/region/source/… are refused). Lets add_concept set BOTH edges and properties in one call (so you do not need a separate set_properties call).
+        soma_run_id: OPTIONAL. The run-id of a parked SOMA compose-SUGGESTION you are ACCEPTING with this add. SOMA's L3b surfaces a pure-mereo suggestion (a unique admissible candidate for a still-empty required slot) in the `compose_suggestions=` verdict block with a stable run-id (concept.prop.candidate). You ACCEPT it not via a separate RPC but by simply SAYING the fill — calling add_concept with the relationship that fills the slot — and passing soma_run_id so the parked review item is marked resolved (observation is the only operation; the add IS the compose, re-derivation resumes past the gap). Omit to add normally. To REJECT a suggestion, just do not add it.
+
+    Returns:
+        Formatted result showing success/failure of file and Neo4j operations
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("add_concept", {"concept_name": concept_name, "is_a": is_a, "part_of": part_of, "instantiates": instantiates, "produces": produces, "domain": domain, "subdomain": subdomain, "personal_domain": personal_domain, "concept": concept, "relationships": relationships, "desc_update_mode": desc_update_mode, "hide_youknow": hide_youknow, "clear_stash": clear_stash, "source": source, "typed_values": typed_values, "old_str_for_edit_case": old_str_for_edit_case, "properties": properties, "soma_run_id": soma_run_id, "domain_about": domain_about, "domain_part_of": domain_part_of, "subdomain_about": subdomain_about})))
+
+
+@_carton_api.operation("edit_carton_obj")
+def _op_edit_carton_obj(concept_name: str, kvobj_name: str, key_path: str, op: str, value: str = None) -> dict:
+    """The operation behind the `edit_carton_obj` tool — runs where the graph is; answers the library's result."""
+    from carton_mcp import carton_kv as _ckv
+
+    interpreted = None
+    if op in ("set", "append"):
+        if value is None:
+            return {"success": False, "error": f"op '{op}' requires a value"}
+        v = value.strip()
+        if _ckv.is_title_underscore(v):
+            interpreted = {"$ref": v}                       # bare ref
+        else:
+            try:
+                interpreted = json.loads(value)             # JSON literal/structure
+            except (json.JSONDecodeError, ValueError):
+                interpreted = value                         # plain literal string
+    return _edit_carton_obj_lib(concept_name, kvobj_name, key_path, op, interpreted, shared_connection=_neo4j_conn)
+
+
+def _render_edit_carton_obj(result: dict, concept_name: str, kvobj_name: str, key_path: str, op: str, value=None) -> str:
+    if not result.get("success"):
+        return f"❌ {result.get('error', 'edit_carton_obj failed')}"
+    if op == "get":
+        return f"✅ {concept_name}.{kvobj_name}[{key_path}] = {json.dumps(result['value'])}"
+    return (f"✅ queued {op} on {concept_name}.{kvobj_name}[{key_path}] "
+            f"(queue file {result['queued']}); the daemon will apply the n.d replace.")
+
+
+@mcp.tool()
 def edit_carton_obj(
     concept_name: str,
     kvobj_name: str,
@@ -716,30 +791,30 @@ def edit_carton_obj(
         For get: the value at key_path. For set/append/remove: a queued confirmation
         (the daemon applies the n.d replace asynchronously).
     """
-    from carton_mcp import carton_kv as _ckv
+    return overflow_to_file(_render_edit_carton_obj(_carton_api.call_carton("edit_carton_obj", {"concept_name": concept_name, "kvobj_name": kvobj_name, "key_path": key_path, "op": op, "value": value}), **{"concept_name": concept_name, "kvobj_name": kvobj_name, "key_path": key_path, "op": op, "value": value}))
 
-    interpreted = None
-    if op in ("set", "append"):
-        if value is None:
-            return f"❌ op '{op}' requires a value"
-        v = value.strip()
-        if _ckv.is_title_underscore(v):
-            interpreted = {"$ref": v}                       # bare ref
-        else:
-            try:
-                interpreted = json.loads(value)             # JSON literal/structure
-            except (json.JSONDecodeError, ValueError):
-                interpreted = value                         # plain literal string
 
-    result = _edit_carton_obj_lib(
-        concept_name, kvobj_name, key_path, op, interpreted, shared_connection=_neo4j_conn
-    )
-    if not result.get("success"):
-        return f"❌ {result.get('error', 'edit_carton_obj failed')}"
-    if op == "get":
-        return f"✅ {concept_name}.{kvobj_name}[{key_path}] = {json.dumps(result['value'])}"
-    return (f"✅ queued {op} on {concept_name}.{kvobj_name}[{key_path}] "
-            f"(queue file {result['queued']}); the daemon will apply the n.d replace.")
+@_carton_api.operation("validate_carton_obj")
+def _op_validate_carton_obj(concept_name: str, kvobj_name: str) -> dict:
+    """The operation behind the `validate_carton_obj` tool — runs where the graph is."""
+    # via _graph_conn: validate_carton_obj takes `graph` as a REQUIRED positional and has no
+    # `or _get_module_connection()` fallback of its own, so handing it the raw import-time global
+    # makes this tool permanently unusable after one startup blip. See _graph_conn.
+    return _validate_carton_obj_lib(concept_name, kvobj_name, _graph_conn())
+
+
+def _render_validate_carton_obj(res: dict, concept_name: str, kvobj_name: str) -> str:
+    if not res.get("success"):
+        return f"❌ {res.get('error', 'validate_carton_obj failed')}"
+    head = "✅ VALID" if res["valid"] else "❌ INVALID"
+    schema_note = f" (schema {res['schema']})" if res.get("schema") else " (no schema attr)"
+    lines = [f"{head}: {concept_name}.{kvobj_name}{schema_note}"]
+    for e in res.get("errors", []):
+        lines.append(f"  • bad key [{e['path']}]: {e['message']}")
+    for ref, sugg in res.get("unresolved_refs", {}).items():
+        dym = f" — did you mean: {', '.join(sugg)}" if sugg else " — no close matches found"
+        lines.append(f"  • unresolved ref '{ref}'{dym}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -760,21 +835,13 @@ def validate_carton_obj(concept_name: str, kvobj_name: str) -> str:
         A VALID/INVALID report listing any bad keys (schema violations) and unresolved refs
         (with did-you-mean suggestions).
     """
-    # via _graph_conn: validate_carton_obj takes `graph` as a REQUIRED positional and has no
-    # `or _get_module_connection()` fallback of its own, so handing it the raw import-time global
-    # makes this tool permanently unusable after one startup blip. See _graph_conn.
-    res = _validate_carton_obj_lib(concept_name, kvobj_name, _graph_conn())
-    if not res.get("success"):
-        return f"❌ {res.get('error', 'validate_carton_obj failed')}"
-    head = "✅ VALID" if res["valid"] else "❌ INVALID"
-    schema_note = f" (schema {res['schema']})" if res.get("schema") else " (no schema attr)"
-    lines = [f"{head}: {concept_name}.{kvobj_name}{schema_note}"]
-    for e in res.get("errors", []):
-        lines.append(f"  • bad key [{e['path']}]: {e['message']}")
-    for ref, sugg in res.get("unresolved_refs", {}).items():
-        dym = f" — did you mean: {', '.join(sugg)}" if sugg else " — no close matches found"
-        lines.append(f"  • unresolved ref '{ref}'{dym}")
-    return "\n".join(lines)
+    return overflow_to_file(_render_validate_carton_obj(_carton_api.call_carton("validate_carton_obj", {"concept_name": concept_name, "kvobj_name": kvobj_name}), **{"concept_name": concept_name, "kvobj_name": kvobj_name}))
+
+
+@_carton_api.operation("split_content_concept")
+def _op_split_content_concept(concept_name: str, raw_content: str) -> str:
+    """The operation behind the `split_content_concept` tool — runs where the graph is; the tool renders its answer."""
+    return _split_content_concept_lib(concept_name, raw_content, shared_connection=_neo4j_conn)
 
 
 @mcp.tool()
@@ -801,7 +868,22 @@ def split_content_concept(concept_name: str, raw_content: str) -> str:
         A queued-confirmation string; the daemon applies the writes asynchronously (verify via
         query_wiki_graph in a LATER turn, not the same turn's return value).
     """
-    return _split_content_concept_lib(concept_name, raw_content, shared_connection=_neo4j_conn)
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("split_content_concept", {"concept_name": concept_name, "raw_content": raw_content})))
+
+
+@_carton_api.operation("create_branching_sm")
+def _op_create_branching_sm(concept_name: str, state_machines: list, domain: str, subdomain: str,
+                            personal_domain: str, sm_chain_name: str = None,
+                            produces: Optional[List[str]] = None) -> dict:
+    """The operation behind the `create_branching_sm` tool — the SM factory, where the graph is."""
+    from carton_mcp.sm_gate import create_sm_chain_live
+    return create_sm_chain_live(concept_name, state_machines, sm_chain_name=sm_chain_name,
+                                domain=domain, subdomain=subdomain, personal_domain=personal_domain,
+                                produces=produces)
+
+
+def _render_create_branching_sm(result, **_params) -> str:
+    return _fmt(result)
 
 
 @mcp.tool()
@@ -846,11 +928,33 @@ def create_branching_sm(concept_name: str, state_machines: list, domain: str, su
         this file's shared `_fmt()` (every MCP tool in this server returns `str`; `_fmt()` is the
         established convention for rendering a library function's dict result as one).
     """
-    from carton_mcp.sm_gate import create_sm_chain_live
-    result = create_sm_chain_live(concept_name, state_machines, sm_chain_name=sm_chain_name,
-                                  domain=domain, subdomain=subdomain, personal_domain=personal_domain,
-                                  produces=produces)
-    return _fmt(result)
+    return overflow_to_file(_render_create_branching_sm(_carton_api.call_carton("create_branching_sm", {"concept_name": concept_name, "state_machines": state_machines, "domain": domain, "subdomain": subdomain, "personal_domain": personal_domain, "sm_chain_name": sm_chain_name, "produces": produces}), **{"concept_name": concept_name, "state_machines": state_machines, "domain": domain, "subdomain": subdomain, "personal_domain": personal_domain, "sm_chain_name": sm_chain_name, "produces": produces}))
+
+
+@_carton_api.operation("set_properties")
+def _op_set_properties(concept_name: str, properties: dict, mode: str = "merge") -> dict:
+    """The operation behind the `set_properties` tool — the SDK's property write, where the graph is."""
+    return _set_concept_properties_lib(concept_name, properties, mode=mode, shared_connection=_neo4j_conn)
+
+
+def _render_set_properties(res: dict, concept_name: str, **_params) -> str:
+    if not res.get("success"):
+        return f"❌ {res.get('error', 'set_properties failed')}"
+    parts = []
+    if res.get("updated_keys"):
+        parts.append(f"set {', '.join(res['updated_keys'])}")
+    if res.get("removed_keys"):
+        parts.append(f"removed {', '.join(res['removed_keys'])}")
+    if res.get("refused_keys"):
+        parts.append(f"REFUSED (reserved) {', '.join(res['refused_keys'])}")
+    if res.get("error"):
+        parts.append(res["error"])
+    body = "; ".join(parts) if parts else "no changes"
+    out = f"✅ {concept_name}: {body}"
+    # Append the property→SOMA trail status line (only present on merge-mode writes).
+    if res.get("trail"):
+        out += f"\ntrail: {res['trail']}"
+    return out
 
 
 @mcp.tool()
@@ -884,25 +988,24 @@ def set_properties(concept_name: str, properties: dict, mode: str = "merge") -> 
 
     Returns: a report of which keys were updated/removed and which were refused.
     """
-    res = _set_concept_properties_lib(
-        concept_name, properties, mode=mode, shared_connection=_neo4j_conn)
+    return overflow_to_file(_render_set_properties(_carton_api.call_carton("set_properties", {"concept_name": concept_name, "properties": properties, "mode": mode}), **{"concept_name": concept_name, "properties": properties, "mode": mode}))
+
+
+@_carton_api.operation("query_by_properties")
+def _op_query_by_properties(where: dict, limit: int = 25) -> dict:
+    """The operation behind the `query_by_properties` tool — the SDK's exact-match property read."""
+    # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
+    _sm_gate_check("query_by_properties", repr(where))
+    return _query_concepts_by_properties_lib(where, limit=limit, shared_connection=_neo4j_conn)
+
+
+def _render_query_by_properties(res: dict, **_params) -> str:
     if not res.get("success"):
-        return f"❌ {res.get('error', 'set_properties failed')}"
-    parts = []
-    if res.get("updated_keys"):
-        parts.append(f"set {', '.join(res['updated_keys'])}")
-    if res.get("removed_keys"):
-        parts.append(f"removed {', '.join(res['removed_keys'])}")
-    if res.get("refused_keys"):
-        parts.append(f"REFUSED (reserved) {', '.join(res['refused_keys'])}")
-    if res.get("error"):
-        parts.append(res["error"])
-    body = "; ".join(parts) if parts else "no changes"
-    out = f"✅ {concept_name}: {body}"
-    # Append the property→SOMA trail status line (only present on merge-mode writes).
-    if res.get("trail"):
-        out += f"\ntrail: {res['trail']}"
-    return out
+        return f"❌ {res.get('error', 'query_by_properties failed')}"
+    results = res.get("results", [])
+    if not results:
+        return "(no concepts match)"
+    return _fmt(results)
 
 
 @mcp.tool()
@@ -919,15 +1022,20 @@ def query_by_properties(where: dict, limit: int = 25) -> str:
 
     Returns: each matching concept's name plus the value of every key in `where`.
     """
-    # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
-    _sm_gate_check("query_by_properties", repr(where))
-    res = _query_concepts_by_properties_lib(where, limit=limit, shared_connection=_neo4j_conn)
+    return overflow_to_file(_render_query_by_properties(_carton_api.call_carton("query_by_properties", {"where": where, "limit": limit}), **{"where": where, "limit": limit}))
+
+
+@_carton_api.operation("remove_relationship")
+def _op_remove_relationship(source: str, rel_type: str, target: str) -> dict:
+    """The operation behind the `remove_relationship` tool — the SDK's one relationship delete."""
+    return _remove_concept_relationship_lib(source, rel_type, target, shared_connection=_neo4j_conn)
+
+
+def _render_remove_relationship(res: dict, source: str, rel_type: str, target: str) -> str:
     if not res.get("success"):
-        return f"❌ {res.get('error', 'query_by_properties failed')}"
-    results = res.get("results", [])
-    if not results:
-        return "(no concepts match)"
-    return _fmt(results)
+        return f"❌ {res.get('error', 'remove_relationship failed')}"
+    n = res.get("deleted_count", 0)
+    return f"✅ deleted {n} relationship(s): ({source})-[:{rel_type}]->({target})"
 
 
 @mcp.tool()
@@ -945,39 +1053,18 @@ def remove_relationship(source: str, rel_type: str, target: str) -> str:
 
     Returns: how many relationships were deleted (0 if that edge did not exist).
     """
-    res = _remove_concept_relationship_lib(
-        source, rel_type, target, shared_connection=_neo4j_conn)
-    if not res.get("success"):
-        return f"❌ {res.get('error', 'remove_relationship failed')}"
-    n = res.get("deleted_count", 0)
-    return f"✅ deleted {n} relationship(s): ({source})-[:{rel_type}]->({target})"
+    return overflow_to_file(_render_remove_relationship(_carton_api.call_carton("remove_relationship", {"source": source, "rel_type": rel_type, "target": target}), **{"source": source, "rel_type": rel_type, "target": target}))
 
 
-@mcp.tool()
-def add_document_concept(
+@_carton_api.operation("add_document_concept")
+def _op_add_document_concept(
     concept_name: str,
     description: str,
     canonical_path: str,
     template: str = None,
     relationships: Optional[List[ConceptRelationship]] = None
 ) -> str:
-    """Index a document in Carton with canonical path and optional template
-
-    Use this when you want Carton to act as a database/index for documents.
-    The description should be a SUMMARY, not the full content.
-    The canonical_path points to where the actual document lives.
-    The template specifies how to parse/render the document.
-
-    Args:
-        concept_name: Name of the document concept (will be normalized)
-        description: Summary of the document (not full content)
-        canonical_path: Absolute path to the actual document file
-        template: Optional metastack template name for parsing/rendering
-        relationships: Additional relationships for the concept
-
-    Returns:
-        Formatted result showing success/failure
-    """
+    """The operation behind the `add_document_concept` tool — runs where the graph is; the tool renders its answer."""
     # KNOWN BUG (found 2026-07-03, not yet fixed — Isaac: deprioritized for now): the `rels` list
     # built below carries only has_canonical_path / uses_template / is_a — no part_of,
     # has_personal_domain, or has_actual_domain. It is queued via add_observation() (fire-and-forget,
@@ -1041,6 +1128,34 @@ def add_document_concept(
         return f"❌ Error creating document concept: {str(e)}"
 
 
+@mcp.tool()
+def add_document_concept(
+    concept_name: str,
+    description: str,
+    canonical_path: str,
+    template: str = None,
+    relationships: Optional[List[ConceptRelationship]] = None
+) -> str:
+    """Index a document in Carton with canonical path and optional template
+
+    Use this when you want Carton to act as a database/index for documents.
+    The description should be a SUMMARY, not the full content.
+    The canonical_path points to where the actual document lives.
+    The template specifies how to parse/render the document.
+
+    Args:
+        concept_name: Name of the document concept (will be normalized)
+        description: Summary of the document (not full content)
+        canonical_path: Absolute path to the actual document file
+        template: Optional metastack template name for parsing/rendering
+        relationships: Additional relationships for the concept
+
+    Returns:
+        Formatted result showing success/failure
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("add_document_concept", {"concept_name": concept_name, "description": description, "canonical_path": canonical_path, "template": template, "relationships": relationships})))
+
+
 
 def _normalize_observation_domain_edges(observation_data: dict) -> None:
     """BOTH-EDGES NORMALIZATION (issue #198 data half, 2026-08-28), in place.
@@ -1079,25 +1194,9 @@ def _normalize_observation_domain_edges(observation_data: dict) -> None:
 
 
 
-@mcp.tool()
-def add_observation_batch(observation_data: dict, hide_youknow: bool = False) -> str:
-    """Create observation capturing complete cognitive state
-
-    Format example: {"insight_moment": [{"name": "Discord_Platform_Choice", "description": "Realized Discord is ideal for egregore launch", "relationships": [{"relationship": "is_a", "related": ["Platform_Decision"]}, {"relationship": "part_of", "related": ["Launch_Strategy"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Business_Strategy"]}]}], "struggle_point": [{"name": "Channel_Structure_Confusion", "description": "Struggled with organizing public vs private channels", "relationships": [{"relationship": "is_a", "related": ["Design_Challenge"]}, {"relationship": "part_of", "related": ["Discord_Architecture"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["System_Design"]}]}], "daily_action": [{"name": "Channel_Setup", "description": "Organized AI LAB Discord channels", "relationships": [{"relationship": "is_a", "related": ["Implementation_Task"]}, {"relationship": "part_of", "related": ["AI_LAB_Discord"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Infrastructure"]}]}], "implementation": [{"name": "AI_LAB_Discord", "description": "Discord server for frameworks and COGLOG", "relationships": [{"relationship": "is_a", "related": ["Discord_Server"]}, {"relationship": "part_of", "related": ["Isaac_Infrastructure"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Infrastructure"]}]}], "emotional_state": [{"name": "Clarity_About_Path", "description": "Feeling clear about release strategy", "relationships": [{"relationship": "is_a", "related": ["Emotional_State"]}, {"relationship": "part_of", "related": ["Development_Journey"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Personal_Development"]}]}], "confidence": 0.9}
-
-    Args:
-        observation_data: ALL FIVE TAGS REQUIRED (multiple concepts each with is_a, part_of, has_personal_domain, has_actual_domain relationships), confidence float. Personal domains (enum): paiab, sanctum, cave, misc, personal. Actual domains: flexible.
-
-        OPTIONAL desc_update_mode per concept:
-        - "append" (default): Add new description after existing
-        - "prepend": Add new description before existing
-        - "replace": Sink old version to _vN, use only new description
-
-        hide_youknow: If False (default), the queued concepts are validated via SOMA (POST localhost:8091/event), which returns each concept's SOUP/CODE/SYSTEM_TYPE/ONT region status and warns on issues. If True, skip SOMA validation - silent add. (Param name is vestigial: YOUKNOW was removed 2026-06-15; SOMA is the validator.)
-
-    Returns:
-        Summary
-    """
+@_carton_api.operation("add_observation_batch")
+def _op_add_observation_batch(observation_data: dict, hide_youknow: bool = False) -> str:
+    """The operation behind the `add_observation_batch` tool — runs where the graph is; the tool renders its answer."""
     try:
         # GEOMETRY CHECK (warn, don't block)
         geometry_warning = _check_observation_geometry(observation_data)
@@ -1130,27 +1229,30 @@ def add_observation_batch(observation_data: dict, hide_youknow: bool = False) ->
 
 
 @mcp.tool()
-def observe_from_identity_pov(observation_data: dict, agent_identity: str = None, hide_youknow: bool = False) -> str:
-    """Create observation from agent identity perspective
+def add_observation_batch(observation_data: dict, hide_youknow: bool = False) -> str:
+    """Create observation capturing complete cognitive state
 
-    Resolves agent identity via: env var AGENT_IDENTITY (takes priority) > agent_identity param.
-    Ensures {identity}_Collection exists, adds concepts as PART_OF that collection,
-    and transforms has_actual_domain to has_domain.
-
-    The agent identity collection follows the proper hierarchy:
-    - {AGENT_IDENTITY}_Collection IS_A Identity_Collection
-    - Identity_Collection IS_A Carton_Collection
-    - Concept PART_OF {AGENT_IDENTITY}_Collection
-
-    Same format as add_observation_batch.
+    Format example: {"insight_moment": [{"name": "Discord_Platform_Choice", "description": "Realized Discord is ideal for egregore launch", "relationships": [{"relationship": "is_a", "related": ["Platform_Decision"]}, {"relationship": "part_of", "related": ["Launch_Strategy"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Business_Strategy"]}]}], "struggle_point": [{"name": "Channel_Structure_Confusion", "description": "Struggled with organizing public vs private channels", "relationships": [{"relationship": "is_a", "related": ["Design_Challenge"]}, {"relationship": "part_of", "related": ["Discord_Architecture"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["System_Design"]}]}], "daily_action": [{"name": "Channel_Setup", "description": "Organized AI LAB Discord channels", "relationships": [{"relationship": "is_a", "related": ["Implementation_Task"]}, {"relationship": "part_of", "related": ["AI_LAB_Discord"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Infrastructure"]}]}], "implementation": [{"name": "AI_LAB_Discord", "description": "Discord server for frameworks and COGLOG", "relationships": [{"relationship": "is_a", "related": ["Discord_Server"]}, {"relationship": "part_of", "related": ["Isaac_Infrastructure"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Infrastructure"]}]}], "emotional_state": [{"name": "Clarity_About_Path", "description": "Feeling clear about release strategy", "relationships": [{"relationship": "is_a", "related": ["Emotional_State"]}, {"relationship": "part_of", "related": ["Development_Journey"]}, {"relationship": "has_personal_domain", "related": ["cave"]}, {"relationship": "has_actual_domain", "related": ["Personal_Development"]}]}], "confidence": 0.9}
 
     Args:
-        agent_identity: Identity name (used if AGENT_IDENTITY env var not set).
-        hide_youknow: If False (default), the queued concepts are validated via SOMA (POST localhost:8091/event), which returns each concept's SOUP/CODE/SYSTEM_TYPE/ONT region status and warns on issues. If True, skip SOMA validation. (Param name is vestigial: YOUKNOW was removed 2026-06-15; SOMA is the validator.)
+        observation_data: ALL FIVE TAGS REQUIRED (multiple concepts each with is_a, part_of, has_personal_domain, has_actual_domain relationships), confidence float. Personal domains (enum): paiab, sanctum, cave, misc, personal. Actual domains: flexible.
+
+        OPTIONAL desc_update_mode per concept:
+        - "append" (default): Add new description after existing
+        - "prepend": Add new description before existing
+        - "replace": Sink old version to _vN, use only new description
+
+        hide_youknow: If False (default), the queued concepts are validated via SOMA (POST localhost:8091/event), which returns each concept's SOUP/CODE/SYSTEM_TYPE/ONT region status and warns on issues. If True, skip SOMA validation - silent add. (Param name is vestigial: YOUKNOW was removed 2026-06-15; SOMA is the validator.)
 
     Returns:
         Summary
     """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("add_observation_batch", {"observation_data": observation_data, "hide_youknow": hide_youknow})))
+
+
+@_carton_api.operation("observe_from_identity_pov")
+def _op_observe_from_identity_pov(observation_data: dict, agent_identity: str = None, hide_youknow: bool = False) -> str:
+    """The operation behind the `observe_from_identity_pov` tool — runs where the graph is; the tool renders its answer."""
     import os
     from .add_concept_tool import normalize_concept_name
 
@@ -1257,6 +1359,31 @@ def observe_from_identity_pov(observation_data: dict, agent_identity: str = None
         return f"❌ Error: {str(e)}"
 
 
+@mcp.tool()
+def observe_from_identity_pov(observation_data: dict, agent_identity: str = None, hide_youknow: bool = False) -> str:
+    """Create observation from agent identity perspective
+
+    Resolves agent identity via: env var AGENT_IDENTITY (takes priority) > agent_identity param.
+    Ensures {identity}_Collection exists, adds concepts as PART_OF that collection,
+    and transforms has_actual_domain to has_domain.
+
+    The agent identity collection follows the proper hierarchy:
+    - {AGENT_IDENTITY}_Collection IS_A Identity_Collection
+    - Identity_Collection IS_A Carton_Collection
+    - Concept PART_OF {AGENT_IDENTITY}_Collection
+
+    Same format as add_observation_batch.
+
+    Args:
+        agent_identity: Identity name (used if AGENT_IDENTITY env var not set).
+        hide_youknow: If False (default), the queued concepts are validated via SOMA (POST localhost:8091/event), which returns each concept's SOUP/CODE/SYSTEM_TYPE/ONT region status and warns on issues. If True, skip SOMA validation. (Param name is vestigial: YOUKNOW was removed 2026-06-15; SOMA is the validator.)
+
+    Returns:
+        Summary
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("observe_from_identity_pov", {"observation_data": observation_data, "agent_identity": agent_identity, "hide_youknow": hide_youknow})))
+
+
 def _ensure_identity_collection_exists(collection_name: str, agent_identity: str):
     """Ensure the agent's identity collection exists with proper typing.
     
@@ -1316,8 +1443,8 @@ def _ensure_identity_collection_exists(collection_name: str, agent_identity: str
         # Don't fail the observation - the collection might just not have the IS_A yet
 
 
-@mcp.tool()
-def carton_management(
+@_carton_api.operation("carton_management")
+def _op_carton_management(
     restart_bg_server: bool = False,
     get_git_repo_url: bool = False,
     get_carton_dir: bool = False,
@@ -1331,31 +1458,19 @@ def carton_management(
     get_gps_status: bool = False,
     page: Optional[int] = None
 ) -> str:
-    """CartON management utility
-
-    Args:
-        restart_bg_server: Kill and restart observation worker daemon
-        get_git_repo_url: Return GitHub repository URL
-        get_carton_dir: Return carton queue directory path
-        get_carton_guide: Return CartON usage guide
-        get_requires_evolution_list: Return paginated list of concepts requiring evolution
-        sync_rag: Sync all concepts to ChromaRAG for semantic search
-        check_failed_observations: Check for failed observation files in queue
-        retry_failed_observations: Retry failed observations marked with "fixed": true
-        enable_gps: Enable GPS auto-injection hook
-        disable_gps: Disable GPS auto-injection hook
-        get_gps_status: Get current GPS hook status
-        page: Page number for requires_evolution_list (100 items per page, default: 1)
-
-    Returns:
-        Formatted string with requested information (one per line)
-    """
+    """The operation behind the `carton_management` tool — runs where the graph is; the tool renders its answer."""
     import subprocess
     import signal
 
     result_parts = []
 
-    if restart_bg_server:
+    if restart_bg_server and _carton_api.SERVING:
+        # This process IS the worker, serving CartON's API: killing every worker pid from inside
+        # one of its own requests would kill the answer too. In a box the supervisor restarts it.
+        result_parts.append("❌ restart_bg_server: this process is the worker serving CartON's API; "
+                            "restart it from its supervisor (supervisorctl restart carton-worker), "
+                            "never from inside its own request")
+    elif restart_bg_server:
         try:
             # THIN WRAPPER over carton_worker_control.restart_worker (issue #276). The
             # matching, the killing, the waiting and the verdict all live in the library;
@@ -1645,6 +1760,58 @@ CartON Usage Guide:
 
 
 @mcp.tool()
+def carton_management(
+    restart_bg_server: bool = False,
+    get_git_repo_url: bool = False,
+    get_carton_dir: bool = False,
+    get_carton_guide: bool = False,
+    get_requires_evolution_list: bool = False,
+    sync_rag: bool = False,
+    check_failed_observations: bool = False,
+    retry_failed_observations: bool = False,
+    enable_gps: bool = False,
+    disable_gps: bool = False,
+    get_gps_status: bool = False,
+    page: Optional[int] = None
+) -> str:
+    """CartON management utility
+
+    Args:
+        restart_bg_server: Kill and restart observation worker daemon
+        get_git_repo_url: Return GitHub repository URL
+        get_carton_dir: Return carton queue directory path
+        get_carton_guide: Return CartON usage guide
+        get_requires_evolution_list: Return paginated list of concepts requiring evolution
+        sync_rag: Sync all concepts to ChromaRAG for semantic search
+        check_failed_observations: Check for failed observation files in queue
+        retry_failed_observations: Retry failed observations marked with "fixed": true
+        enable_gps: Enable GPS auto-injection hook
+        disable_gps: Disable GPS auto-injection hook
+        get_gps_status: Get current GPS hook status
+        page: Page number for requires_evolution_list (100 items per page, default: 1)
+
+    Returns:
+        Formatted string with requested information (one per line)
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("carton_management", {"restart_bg_server": restart_bg_server, "get_git_repo_url": get_git_repo_url, "get_carton_dir": get_carton_dir, "get_carton_guide": get_carton_guide, "get_requires_evolution_list": get_requires_evolution_list, "sync_rag": sync_rag, "check_failed_observations": check_failed_observations, "retry_failed_observations": retry_failed_observations, "enable_gps": enable_gps, "disable_gps": disable_gps, "get_gps_status": get_gps_status, "page": page})))
+
+
+@_carton_api.operation("rename_concept")
+def _op_rename_concept(
+    old_concept_name: str,
+    new_concept_name: str,
+    reason: str = "Conceptual refinement"
+) -> str:
+    """The operation behind the `rename_concept` tool — runs where the graph is; the tool renders its answer."""
+    try:
+        result = rename_concept_func(old_concept_name, new_concept_name, reason)
+        return f"✅ {result}"
+    except Exception as e:
+        traceback.print_exc()
+        return f"❌ Error renaming concept: {str(e)}"
+
+
+@mcp.tool()
 def rename_concept(
     old_concept_name: str,
     new_concept_name: str,
@@ -1673,12 +1840,7 @@ def rename_concept(
     Returns:
         Summary of rename operation including relationship counts
     """
-    try:
-        result = rename_concept_func(old_concept_name, new_concept_name, reason)
-        return f"✅ {result}"
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error renaming concept: {str(e)}"
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("rename_concept", {"old_concept_name": old_concept_name, "new_concept_name": new_concept_name, "reason": reason})))
 
 
 # DEAD (carton audit 2026-06-19): stub that always raises NotImplementedError (meta-testing pattern never built) — commented out, not deleted, pending skill-candidate review.
@@ -1721,6 +1883,37 @@ def run_experiment(experiment_hypothesis: str, flight_config_name: str = None) -
     # Creates knowledge farming research chain
     raise NotImplementedError("Experiment runner not yet implemented. Will chain research through flight/waypoint/observation system.")
 
+@_carton_api.operation("query_wiki_graph")
+def _op_query_wiki_graph(cypher_query: str, parameters: dict = None) -> dict:
+    """The operation behind the `query_wiki_graph` tool — the SDK's read facade, where the graph is.
+
+    Answers the facade's envelope: `{"success": True, "data": [rows...], ...}` or `{"success": False,
+    "error": ...}`. A program reading rows gets them here, null columns included; the tool renders.
+    """
+    # SM-GATE (increment 2b): gate the raw cypher call (the call text IS the query, exactly as
+    # CCC gates query_database). No-op by default (gating off / actor unlocked).
+    _sm_gate_check("query_wiki_graph", cypher_query)
+    try:
+        return utils.query_wiki_graph(cypher_query, parameters)
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def _render_query_wiki_graph(result: dict, cypher_query: str, **_params) -> str:
+    if not result.get("success"):
+        return f"❌ {result.get('error')}"
+    data = result["data"]
+    formatted = _fmt(data)
+    # Warn if no results and query might have case mismatch
+    if not data or (isinstance(data, list) and len(data) == 0):
+        potential_names = re.findall(r"['\"]([A-Za-z_]+)['\"]", cypher_query)
+        has_lowercase = any(c.islower() for name in potential_names for c in name if c.isalpha())
+        if has_lowercase and potential_names:
+            formatted += "\n\n⚠️ REMINDER: CartON uses Title_Case for all concept names. Your query contains lowercase - try Title_Case (e.g., 'my_concept' → 'My_Concept')"
+    return formatted
+
+
 @mcp.tool()
 def query_wiki_graph(cypher_query: str, parameters: dict = None) -> str:
     """Execute arbitrary Cypher query on :Wiki namespace (read-only)
@@ -1757,53 +1950,11 @@ def query_wiki_graph(cypher_query: str, parameters: dict = None) -> str:
     Returns:
         JSON string with query results containing success status and data
     """
-    # SM-GATE (increment 2b): gate the raw cypher call (the call text IS the query, exactly as
-    # CCC gates query_database). No-op by default (gating off / actor unlocked).
-    _sm_gate_check("query_wiki_graph", cypher_query)
-    try:
-        result = utils.query_wiki_graph(cypher_query, parameters)
-        if result.get("success"):
-            data = result["data"]
-            formatted = _fmt(data)
-            # Warn if no results and query might have case mismatch
-            if not data or (isinstance(data, list) and len(data) == 0):
-                import re
-                # Check for potential case mismatch in concept names
-                potential_names = re.findall(r"['\"]([A-Za-z_]+)['\"]", cypher_query)
-                has_lowercase = any(c.islower() for name in potential_names for c in name if c.isalpha())
-                if has_lowercase and potential_names:
-                    formatted += "\n\n⚠️ REMINDER: CartON uses Title_Case for all concept names. Your query contains lowercase - try Title_Case (e.g., 'my_concept' → 'My_Concept')"
-            return formatted
-        else:
-            return f"❌ {result.get('error')}"
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error: {e}"
+    return overflow_to_file(_render_query_wiki_graph(_carton_api.call_carton("query_wiki_graph", {"cypher_query": cypher_query, "parameters": parameters}), **{"cypher_query": cypher_query, "parameters": parameters}))
 
-@mcp.tool()
-def query_cb_math(cb_command: str) -> str:
-    """Pass a Crystal Ball (CB) math / read query straight through to the CB shell and
-    return its rendered view. The CB shell ALREADY implements the math — this is a THIN
-    PASSTHROUGH, not a reimplementation. Use it to run the CB math over the (now unified)
-    coordinate space directly from CartON.
-
-    Examples:
-        query_cb_math("MySpace orbits")      — per-slot orbit decomposition (the "orbits of X")
-        query_cb_math("MySpace gram")        — pairwise member similarity (the neighborhood)
-        query_cb_math("algebra meta")        — Aut / Monster / fusion analysis of a space
-        query_cb_math("orgweb MyOrg 1.1.1")  — decode an org address across a family crossing
-        query_cb_math("mine view")           — observe the persisted mineSpace
-
-    READ-ONLY: mutating verbs (adopt/store/orgcompose/create/delete/rename/goldenize/mark/
-    lock-subspace/add/slots/attr) are REJECTED — use the dedicated tools/verbs for those.
-    The command is sent verbatim as {"input": cb_command} to /api/cb/flow (Bearer-authed
-    from the CB key file). Returns the shell's `view`, or a loud error string (never raises).
-
-    Args:
-        cb_command: a CB shell read/math command, e.g. "<Space> orbits" or "<Space> gram".
-    Returns:
-        The CB shell's rendered view string (or a loud error string on failure).
-    """
+@_carton_api.operation("query_cb_math")
+def _op_query_cb_math(cb_command: str) -> str:
+    """The operation behind the `query_cb_math` tool — runs where the graph is; the tool renders its answer."""
     import urllib.request as _u  # urllib not imported at module scope; json/os are (use globals)
     cmd = (cb_command or "").strip()
     if not cmd:
@@ -1838,6 +1989,51 @@ def query_cb_math(cb_command: str) -> str:
     except Exception as e:
         return f"❌ query_cb_math failed for {cb_command!r}: {e}"
 
+
+@mcp.tool()
+def query_cb_math(cb_command: str) -> str:
+    """Pass a Crystal Ball (CB) math / read query straight through to the CB shell and
+    return its rendered view. The CB shell ALREADY implements the math — this is a THIN
+    PASSTHROUGH, not a reimplementation. Use it to run the CB math over the (now unified)
+    coordinate space directly from CartON.
+
+    Examples:
+        query_cb_math("MySpace orbits")      — per-slot orbit decomposition (the "orbits of X")
+        query_cb_math("MySpace gram")        — pairwise member similarity (the neighborhood)
+        query_cb_math("algebra meta")        — Aut / Monster / fusion analysis of a space
+        query_cb_math("orgweb MyOrg 1.1.1")  — decode an org address across a family crossing
+        query_cb_math("mine view")           — observe the persisted mineSpace
+
+    READ-ONLY: mutating verbs (adopt/store/orgcompose/create/delete/rename/goldenize/mark/
+    lock-subspace/add/slots/attr) are REJECTED — use the dedicated tools/verbs for those.
+    The command is sent verbatim as {"input": cb_command} to /api/cb/flow (Bearer-authed
+    from the CB key file). Returns the shell's `view`, or a loud error string (never raises).
+
+    Args:
+        cb_command: a CB shell read/math command, e.g. "<Space> orbits" or "<Space> gram".
+    Returns:
+        The CB shell's rendered view string (or a loud error string on failure).
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("query_cb_math", {"cb_command": cb_command})))
+
+@_carton_api.operation("get_concept_network")
+def _op_get_concept_network(concept_name: str, depth: int = 1, rel_types: List[str] = None) -> dict:
+    """The operation behind the `get_concept_network` tool — the SDK's network read, where the graph is."""
+    # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
+    _sm_gate_check("get_concept_network", repr(concept_name))
+    try:
+        return utils.get_concept_network(concept_name, depth, rel_types)
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def _render_get_concept_network(result: dict, **_params) -> str:
+    if result.get("success"):
+        return _fmt(result)
+    return f"❌ {result.get('error')}"
+
+
 @mcp.tool()
 def get_concept_network(
     concept_name: str,
@@ -1860,45 +2056,12 @@ def get_concept_network(
     Returns:
         JSON string with concept network data including nodes, relationships, and metadata
     """
-    # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
-    _sm_gate_check("get_concept_network", repr(concept_name))
-    try:
-        result = utils.get_concept_network(concept_name, depth, rel_types)
-        if result.get("success"):
-            return _fmt(result)
-        else:
-            return f"❌ {result.get('error')}"
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error: {e}"
+    return overflow_to_file(_render_get_concept_network(_carton_api.call_carton("get_concept_network", {"concept_name": concept_name, "depth": depth, "rel_types": rel_types}), **{"concept_name": concept_name, "depth": depth, "rel_types": rel_types}))
 
-@mcp.tool()
-def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool = False, depth: int = 0,
+@_carton_api.operation("get_concept")
+def _op_get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool = False, depth: int = 0,
                 details: bool = False) -> TextContent:
-    """Get a concept: its name, description, properties, relationships and SOMA's live grade.
-
-    Args:
-        concept_name: Name of the concept to retrieve (exact match on n property)
-        refresh_code: STALE / NON-FUNCTIONAL residue. If True, calls the retired
-                      youknow_kernel OWL reasoner (refresh_code_reality) — the YOUKNOW
-                      OWL was removed as the authority 2026-06-15; SOMA (POST :8091/event)
-                      is now the validator/region authority and code-reality lives in
-                      context-alignment. Leave False; this branch queries a dead ontology
-                      and does not reflect current code state.
-        expand_refs: If True (with depth>0), expand bare refs inside the concept's CartonObj
-                      fences — replace each ref token in the RETURNED text with the referenced
-                      concept's description + relationships, recursive to `depth`, cycle-guarded.
-                      Render-only: the stored description is never changed.
-        depth: Ref-expansion depth. 0 (default) = raw tokens (unchanged). 1 = one hop,
-                      2 = recurse two levels, etc.
-        details: If True, also show SOMA's raw verdict for the concept's relationships: the
-                      event name, the d-chains fired and unmet, and every verdict block. Default False.
-
-    Returns:
-        Text: Name, Description with its coverage score, Props, Rels, then SOMA's grade line and
-        numbered information, the raw verdict when details is True, the SOMA help line, and the
-        DO lines last.
-    """
+    """The operation behind the `get_concept` tool — runs where the graph is; the tool renders its answer."""
     # SM-GATE (increment 2): if SM-gating is ON and this actor is locked at a step, this call must
     # be a legal move (match the step's required_pattern) or it raises GateRefusal (the regex IS the
     # instruction). No-op by default (gating off / actor unlocked) — get_concept is unchanged.
@@ -2077,28 +2240,39 @@ def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool
         traceback.print_exc()
         return TextContent(type="text", text=f"❌ Error: {str(e)}")
 
+
 @mcp.tool()
-def youknow_sparql(query: str) -> str:
-    """Run a SPARQL query against the SOMA OWL ontology (the total-runtime OWL).
-
-    Queries SOMA's OWL — the authority for typing/validation since YOUKNOW was retired
-    2026-06-15. Loads SOMA's three OWL files into one owlready2 world (soma.owl =
-    schema/class definitions, uarl.owl = foundation/core-sentence, starsystem.owl =
-    GIINT/Navy/Sanctum/Skills) and runs the SPARQL against that combined world. This is
-    the same OWL the SOMA validator (POST localhost:8091/event) reasons over.
-
-    This queries the ONTOLOGY, not the CartON Neo4j graph. Use this for:
-    - Checking OWL class restrictions ("what does GIINT_Deliverable require?")
-    - Exploring the foundation ontology structure (uarl) and domain ontologies (starsystem)
-
-    For CartON graph queries, use query_wiki_graph (Cypher) instead.
+def get_concept(concept_name: str, refresh_code: bool = False, expand_refs: bool = False, depth: int = 0,
+                details: bool = False) -> str:
+    """Get a concept: its name, description, properties, relationships and SOMA's live grade.
 
     Args:
-        query: SPARQL query string (SELECT, ASK, etc.)
+        concept_name: Name of the concept to retrieve (exact match on n property)
+        refresh_code: STALE / NON-FUNCTIONAL residue. If True, calls the retired
+                      youknow_kernel OWL reasoner (refresh_code_reality) — the YOUKNOW
+                      OWL was removed as the authority 2026-06-15; SOMA (POST :8091/event)
+                      is now the validator/region authority and code-reality lives in
+                      context-alignment. Leave False; this branch queries a dead ontology
+                      and does not reflect current code state.
+        expand_refs: If True (with depth>0), expand bare refs inside the concept's CartonObj
+                      fences — replace each ref token in the RETURNED text with the referenced
+                      concept's description + relationships, recursive to `depth`, cycle-guarded.
+                      Render-only: the stored description is never changed.
+        depth: Ref-expansion depth. 0 (default) = raw tokens (unchanged). 1 = one hop,
+                      2 = recurse two levels, etc.
+        details: If True, also show SOMA's raw verdict for the concept's relationships: the
+                      event name, the d-chains fired and unmet, and every verdict block. Default False.
 
     Returns:
-        JSON results from the SOMA OWL world
+        Text: Name, Description with its coverage score, Props, Rels, then SOMA's grade line and
+        numbered information, the raw verdict when details is True, the SOMA help line, and the
+        DO lines last.
     """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("get_concept", {"concept_name": concept_name, "refresh_code": refresh_code, "expand_refs": expand_refs, "depth": depth, "details": details})))
+
+@_carton_api.operation("youknow_sparql")
+def _op_youknow_sparql(query: str) -> str:
+    """The operation behind the `youknow_sparql` tool — runs where the graph is; the tool renders its answer."""
     try:
         import owlready2
     except ImportError:
@@ -2133,37 +2307,36 @@ def youknow_sparql(query: str) -> str:
 
 
 @mcp.tool()
-def get_history_info(
+def youknow_sparql(query: str) -> str:
+    """Run a SPARQL query against the SOMA OWL ontology (the total-runtime OWL).
+
+    Queries SOMA's OWL — the authority for typing/validation since YOUKNOW was retired
+    2026-06-15. Loads SOMA's three OWL files into one owlready2 world (soma.owl =
+    schema/class definitions, uarl.owl = foundation/core-sentence, starsystem.owl =
+    GIINT/Navy/Sanctum/Skills) and runs the SPARQL against that combined world. This is
+    the same OWL the SOMA validator (POST localhost:8091/event) reasons over.
+
+    This queries the ONTOLOGY, not the CartON Neo4j graph. Use this for:
+    - Checking OWL class restrictions ("what does GIINT_Deliverable require?")
+    - Exploring the foundation ontology structure (uarl) and domain ontologies (starsystem)
+
+    For CartON graph queries, use query_wiki_graph (Cypher) instead.
+
+    Args:
+        query: SPARQL query string (SELECT, ASK, etc.)
+
+    Returns:
+        JSON results from the SOMA OWL world
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("youknow_sparql", {"query": query})))
+
+
+@_carton_api.operation("get_history_info")
+def _op_get_history_info(
     info_type: str,
     id: str
 ) -> str:
-    """Query conversation history and summarizer outputs from typed CartON concepts
-
-    Traverses the typed conversation structure to reconstruct full content.
-    Use this instead of raw Cypher queries for history traversal.
-    Each summarizer level can use this to get what the previous level created.
-
-    Args:
-        info_type: Type of history to retrieve:
-            RAW DATA:
-            - "iteration": Single iteration with all messages and tool calls
-            - "conversation": All iterations in a conversation
-            - "session": All conversations in a starlog session
-            - "context_bundle": What was in context when a file was edited
-
-            SUMMARIZER OUTPUTS:
-            - "iteration_summary": Single iteration summary (L1 output)
-            - "all_iteration_summaries": All iteration summaries for a conversation (for L2)
-            - "phase": Single phase with its iteration summaries (L2 output)
-            - "all_phases": All phases for a conversation (for L5)
-            - "subphase": Single subphase (L3 output)
-            - "executive_summary": Executive summary for conversation (L5 output)
-
-        id: The concept name or conversation ID depending on info_type
-
-    Returns:
-        Formatted string with full content in sequence
-    """
+    """The operation behind the `get_history_info` tool — runs where the graph is; the tool renders its answer."""
     # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
     _sm_gate_check("get_history_info", repr(id))
     try:
@@ -2267,7 +2440,7 @@ def get_history_info(
 
             for iter_name in iterations:
                 # Recursively get each iteration
-                iter_content = get_history_info("iteration", iter_name)
+                iter_content = _op_get_history_info("iteration", iter_name)
                 lines.append(iter_content)
                 lines.append("---\n")
 
@@ -2521,6 +2694,57 @@ def get_history_info(
 
 
 @mcp.tool()
+def get_history_info(
+    info_type: str,
+    id: str
+) -> str:
+    """Query conversation history and summarizer outputs from typed CartON concepts
+
+    Traverses the typed conversation structure to reconstruct full content.
+    Use this instead of raw Cypher queries for history traversal.
+    Each summarizer level can use this to get what the previous level created.
+
+    Args:
+        info_type: Type of history to retrieve:
+            RAW DATA:
+            - "iteration": Single iteration with all messages and tool calls
+            - "conversation": All iterations in a conversation
+            - "session": All conversations in a starlog session
+            - "context_bundle": What was in context when a file was edited
+
+            SUMMARIZER OUTPUTS:
+            - "iteration_summary": Single iteration summary (L1 output)
+            - "all_iteration_summaries": All iteration summaries for a conversation (for L2)
+            - "phase": Single phase with its iteration summaries (L2 output)
+            - "all_phases": All phases for a conversation (for L5)
+            - "subphase": Single subphase (L3 output)
+            - "executive_summary": Executive summary for conversation (L5 output)
+
+        id: The concept name or conversation ID depending on info_type
+
+    Returns:
+        Formatted string with full content in sequence
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("get_history_info", {"info_type": info_type, "id": id})))
+
+
+@_carton_api.operation("list_missing_concepts")
+def _op_list_missing_concepts() -> dict:
+    """The operation behind the `list_missing_concepts` tool — where the graph is."""
+    try:
+        return utils.list_missing_concepts()
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def _render_list_missing_concepts(result: dict, **_params) -> str:
+    if result.get("success"):
+        return _fmt(result["data"])
+    return f"❌ {result.get('error')}"
+
+
+@mcp.tool()
 def list_missing_concepts() -> str:
     """List all missing concepts that are referenced but don't exist yet
     
@@ -2531,15 +2755,23 @@ def list_missing_concepts() -> str:
     Returns:
         JSON string with missing concepts and their inferred relationships from existing concepts
     """
+    return overflow_to_file(_render_list_missing_concepts(_carton_api.call_carton("list_missing_concepts", {})))
+
+@_carton_api.operation("create_missing_concepts")
+def _op_create_missing_concepts(concepts_data: list) -> dict:
+    """The operation behind the `create_missing_concepts` tool — where the graph is."""
     try:
-        result = utils.list_missing_concepts()
-        if result.get("success"):
-            return _fmt(result["data"])
-        else:
-            return f"❌ {result.get('error')}"
+        return utils.create_missing_concepts(concepts_data)
     except Exception as e:
         traceback.print_exc()
-        return f"❌ Error: {e}"
+        return {"success": False, "error": str(e)}
+
+
+def _render_create_missing_concepts(result: dict, **_params) -> str:
+    if result.get("success"):
+        return _fmt(result["data"])
+    return f"❌ {result.get('error')}"
+
 
 @mcp.tool()
 def create_missing_concepts(concepts_data: list) -> str:
@@ -2555,35 +2787,11 @@ def create_missing_concepts(concepts_data: list) -> str:
     Returns:
         JSON string with creation results showing success/failure for each concept
     """
-    try:
-        result = utils.create_missing_concepts(concepts_data)
-        if result.get("success"):
-            return _fmt(result["data"])
-        else:
-            return f"❌ {result.get('error')}"
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error: {e}"
+    return overflow_to_file(_render_create_missing_concepts(_carton_api.call_carton("create_missing_concepts", {"concepts_data": concepts_data}), **{"concepts_data": concepts_data}))
 
-@mcp.tool()
-def get_recent_concepts(n: int = 20, timeline: str = None) -> str:
-    """CartON timeline — most recent concept activity.
-
-    Shows concepts sorted by most recent activity (created or modified).
-    Each entry shows 'new' or 'mod' and the timestamp.
-
-    Args:
-        n: Number of entries (default: 20, max: 100)
-        timeline: Filter by timeline. Options:
-            - "chat": concepts created by agent/dragonbones during conversations
-            - "system": background system events (daemon, linker, projector)
-            - "odyssey": narrative/BML concepts (Episode, Journey, Epic, summaries)
-            - "overall": all timeline-linked concepts across all timelines
-            - None (default): no filter, shows all concepts
-
-    Returns:
-        Table of concept name | new/mod timestamp
-    """
+@_carton_api.operation("get_recent_concepts")
+def _op_get_recent_concepts(n: int = 20, timeline: str = None) -> str:
+    """The operation behind the `get_recent_concepts` tool — runs where the graph is; the tool renders its answer."""
     # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
     _sm_gate_check("get_recent_concepts", repr(timeline))
     try:
@@ -2650,6 +2858,44 @@ def get_recent_concepts(n: int = 20, timeline: str = None) -> str:
         traceback.print_exc()
         return f"❌ Error: {e}"
 
+
+@mcp.tool()
+def get_recent_concepts(n: int = 20, timeline: str = None) -> str:
+    """CartON timeline — most recent concept activity.
+
+    Shows concepts sorted by most recent activity (created or modified).
+    Each entry shows 'new' or 'mod' and the timestamp.
+
+    Args:
+        n: Number of entries (default: 20, max: 100)
+        timeline: Filter by timeline. Options:
+            - "chat": concepts created by agent/dragonbones during conversations
+            - "system": background system events (daemon, linker, projector)
+            - "odyssey": narrative/BML concepts (Episode, Journey, Epic, summaries)
+            - "overall": all timeline-linked concepts across all timelines
+            - None (default): no filter, shows all concepts
+
+    Returns:
+        Table of concept name | new/mod timestamp
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("get_recent_concepts", {"n": n, "timeline": timeline})))
+
+@_carton_api.operation("calculate_missing_concepts")
+def _op_calculate_missing_concepts() -> dict:
+    """The operation behind the `calculate_missing_concepts` tool — where the graph is."""
+    try:
+        return utils.calculate_missing_concepts()
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def _render_calculate_missing_concepts(result: dict, **_params) -> str:
+    if result.get("success"):
+        return _fmt(result["data"])
+    return f"❌ {result.get('error')}"
+
+
 @mcp.tool()
 def calculate_missing_concepts() -> str:
     """Scan all concepts, update missing_concepts.md, and commit to GitHub
@@ -2661,15 +2907,7 @@ def calculate_missing_concepts() -> str:
     Returns:
         JSON string with calculation results and list of missing concepts
     """
-    try:
-        result = utils.calculate_missing_concepts()
-        if result.get("success"):
-            return _fmt(result["data"])
-        else:
-            return f"❌ {result.get('error')}"
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error: {e}"
+    return overflow_to_file(_render_calculate_missing_concepts(_carton_api.call_carton("calculate_missing_concepts", {})))
 
 # # DISABLED 2026-07-04 (Isaac): unscoped full-graph O(n^2) SequenceMatcher scan (carton_utils.py:1807-1873,
 # untouched since the initial commit 317931f) hung 52min with zero output against the current graph size
@@ -2700,19 +2938,9 @@ def calculate_missing_concepts() -> str:
         # traceback.print_exc()
         # return f"❌ Error: {e}"
 
-@mcp.tool()
-def equip_frame(frame: str) -> str:
-    """Equip observation frame/lens determining observation structure
-
-    Frames define how to structure observations for different contexts (skill development,
-    task decomposition, meta-testing, health tracking, etc.). User-extensible via JSON file.
-
-    Args:
-        frame: Name of frame to equip (e.g., 'skill_development', 'meta_test', 'exercise')
-
-    Returns:
-        Frame-specific observation prompt/description
-    """
+@_carton_api.operation("equip_frame")
+def _op_equip_frame(frame: str) -> str:
+    """The operation behind the `equip_frame` tool — runs where the graph is; the tool renders its answer."""
     try:
         # Get frames path from env or use default
         # CONNECTS_TO: /tmp/heaven_data/carton_frames.json (read) — also accessed by summarizer_mcp.py
@@ -2748,6 +2976,22 @@ def equip_frame(frame: str) -> str:
     except Exception as e:
         traceback.print_exc()
         return f"❌ Error loading frame: {str(e)}"
+
+
+@mcp.tool()
+def equip_frame(frame: str) -> str:
+    """Equip observation frame/lens determining observation structure
+
+    Frames define how to structure observations for different contexts (skill development,
+    task decomposition, meta-testing, health tracking, etc.). User-extensible via JSON file.
+
+    Args:
+        frame: Name of frame to equip (e.g., 'skill_development', 'meta_test', 'exercise')
+
+    Returns:
+        Frame-specific observation prompt/description
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("equip_frame", {"frame": frame})))
 
 # CartON Knowledge Management Prompts
 @mcp.prompt()
@@ -3248,28 +3492,14 @@ _ALL_RAG_COLLECTIONS = [
     "observations",
 ]
 
-@mcp.tool()
-def chroma_query(
+@_carton_api.operation("chroma_query")
+def _op_chroma_query(
     query: str,
     collection_name: str = "carton_concepts",
     k: int = 10,
     max_tokens: int = 20000
 ) -> str:
-    """Query CartON concepts using semantic search via ChromaDB
-
-    Returns ranked concept names based on semantic similarity to the query.
-    Use this to discover which concepts are relevant to a topic, then use
-    get_concept() or get_concept_network() to retrieve structured knowledge.
-
-    Args:
-        query: Natural language query to search for
-        collection_name: ChromaDB collection name (default: carton_concepts)
-        k: Number of results to retrieve (default: 10)
-        max_tokens: Maximum tokens for results (default: 20000)
-
-    Returns:
-        Formatted string with ranked concept names and scores
-    """
+    """The operation behind the `chroma_query` tool — runs where the graph is; the tool renders its answer."""
     # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
     _sm_gate_check("chroma_query", repr(query))
     try:
@@ -3351,27 +3581,38 @@ def chroma_query(
         traceback.print_exc()
         return f"❌ Error querying ChromaRAG: {str(e)}"
 
+
 @mcp.tool()
-def query_graph_from_rag_result(
+def chroma_query(
+    query: str,
+    collection_name: str = "carton_concepts",
+    k: int = 10,
+    max_tokens: int = 20000
+) -> str:
+    """Query CartON concepts using semantic search via ChromaDB
+
+    Returns ranked concept names based on semantic similarity to the query.
+    Use this to discover which concepts are relevant to a topic, then use
+    get_concept() or get_concept_network() to retrieve structured knowledge.
+
+    Args:
+        query: Natural language query to search for
+        collection_name: ChromaDB collection name (default: carton_concepts)
+        k: Number of results to retrieve (default: 10)
+        max_tokens: Maximum tokens for results (default: 20000)
+
+    Returns:
+        Formatted string with ranked concept names and scores
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("chroma_query", {"query": query, "collection_name": collection_name, "k": k, "max_tokens": max_tokens})))
+
+@_carton_api.operation("query_graph_from_rag_result")
+def _op_query_graph_from_rag_result(
     n: int = 5,
     scopes: List[int] = [0, 1],
     max_results: int = 100
 ) -> str:
-    """Query graph for top N concepts from last RAG search with specified depth scopes
-
-    Fetches complete graph context for concepts from the last chroma_query() call.
-    Scope levels: 0=concept only, 1=1-hop network, 2=2-hop network
-
-    Deduplicates connected concepts across all source concepts globally.
-
-    Args:
-        n: Number of top concepts from last RAG query (default: 5)
-        scopes: Depth levels to fetch [0, 1, 2] (default: [0, 1])
-        max_results: Maximum items to return before pagination (default: 100)
-
-    Returns:
-        JSON string with concept graph data at requested scopes
-    """
+    """The operation behind the `query_graph_from_rag_result` tool — runs where the graph is; the tool renders its answer."""
     # SM-GATE (increment 2b): gate this retrieval call. No-op by default.
     _sm_gate_check("query_graph_from_rag_result", repr(n))
     try:
@@ -3488,6 +3729,30 @@ def query_graph_from_rag_result(
         traceback.print_exc()
         return f"❌ Error: {e}"
 
+
+@mcp.tool()
+def query_graph_from_rag_result(
+    n: int = 5,
+    scopes: List[int] = [0, 1],
+    max_results: int = 100
+) -> str:
+    """Query graph for top N concepts from last RAG search with specified depth scopes
+
+    Fetches complete graph context for concepts from the last chroma_query() call.
+    Scope levels: 0=concept only, 1=1-hop network, 2=2-hop network
+
+    Deduplicates connected concepts across all source concepts globally.
+
+    Args:
+        n: Number of top concepts from last RAG query (default: 5)
+        scopes: Depth levels to fetch [0, 1, 2] (default: [0, 1])
+        max_results: Maximum items to return before pagination (default: 100)
+
+    Returns:
+        JSON string with concept graph data at requested scopes
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("query_graph_from_rag_result", {"n": n, "scopes": scopes, "max_results": max_results})))
+
 # @mcp.tool()
 def DetectEvent_sync_needed(trigger: bool = True) -> str:
     """YOU MUST call this ONLY when other event detection tools tell you to (never independently)
@@ -3504,27 +3769,14 @@ def DetectEvent_sync_needed(trigger: bool = True) -> str:
         return f"CartON Prompt Chain Triggered! This prompt is for the caller, you reading this. Use add_concept to add this concept: Sync_{timestamp}, with your commit message as the concept arg."
     return ""
 
-@mcp.tool()
-def create_collection(
+@_carton_api.operation("create_collection")
+def _op_create_collection(
     collection_name: str,
     description: str,
     member_concepts: List[str],
     collection_type: str = "local"
 ) -> str:
-    """Create a new Carton_Collection with HAS_PART relationships
-
-    Collections are concepts that organize related concepts for context engineering.
-    Use this to group concepts needed for specific work contexts.
-
-    Args:
-        collection_name: Name of the collection (e.g., "OAuth_Implementation_Collection")
-        description: Description of what this collection contains and its purpose
-        member_concepts: List of concept names that are part of this collection
-        collection_type: Type of collection - "global", "local" (default), or "identity"
-
-    Returns:
-        Result of collection creation
-    """
+    """The operation behind the `create_collection` tool — runs where the graph is; the tool renders its answer."""
     try:
         # Bootstrap collection type system if not already done
         utils.bootstrap_collection_types()
@@ -3583,6 +3835,48 @@ def create_collection(
         traceback.print_exc()
         return f"❌ Error creating collection: {str(e)}"
 
+
+@mcp.tool()
+def create_collection(
+    collection_name: str,
+    description: str,
+    member_concepts: List[str],
+    collection_type: str = "local"
+) -> str:
+    """Create a new Carton_Collection with HAS_PART relationships
+
+    Collections are concepts that organize related concepts for context engineering.
+    Use this to group concepts needed for specific work contexts.
+
+    Args:
+        collection_name: Name of the collection (e.g., "OAuth_Implementation_Collection")
+        description: Description of what this collection contains and its purpose
+        member_concepts: List of concept names that are part of this collection
+        collection_type: Type of collection - "global", "local" (default), or "identity"
+
+    Returns:
+        Result of collection creation
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("create_collection", {"collection_name": collection_name, "description": description, "member_concepts": member_concepts, "collection_type": collection_type})))
+
+@_carton_api.operation("activate_collection")
+def _op_activate_collection(collection_name: str, depth: int = 1, hub_cap: int = 30,
+                            boundary_types: Optional[List[str]] = None) -> dict:
+    """The operation behind the `activate_collection` tool — the bounded walk, where the graph is."""
+    try:
+        return utils.get_collection_concepts(collection_name, max_depth=depth,
+                                             boundary_types=boundary_types, hub_cap=hub_cap)
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def _render_activate_collection(result: dict, **_params) -> str:
+    if result.get("success"):
+        return _fmt(result)
+    return f"❌ {result.get('error')}"
+
+
 @mcp.tool()
 def activate_collection(collection_name: str, depth: int = 1, hub_cap: int = 30,
                         boundary_types: Optional[List[str]] = None) -> str:
@@ -3610,19 +3904,7 @@ def activate_collection(collection_name: str, depth: int = 1, hub_cap: int = 30,
         Formatted string: truncation report first (only when non-zero), then the stopped
         members with reasons, then all member concepts with their descriptions
     """
-    try:
-        result = utils.get_collection_concepts(collection_name, max_depth=depth,
-                                               boundary_types=boundary_types,
-                                               hub_cap=hub_cap)
-
-        if result.get("success"):
-            return _fmt(result)
-        else:
-            return f"❌ {result.get('error')}"
-
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error: {e}"
+    return overflow_to_file(_render_activate_collection(_carton_api.call_carton("activate_collection", {"collection_name": collection_name, "depth": depth, "hub_cap": hub_cap, "boundary_types": boundary_types}), **{"collection_name": collection_name, "depth": depth, "hub_cap": hub_cap, "boundary_types": boundary_types}))
 
 # DISABLED 2026-09-14 on Isaac's instruction: this tool is NOT REAL and should not exist yet. It was never actually made as a decided capability, and it was being offered to the agent as THE navigation surface of the graph, which is not a thing anyone agreed it is. Commented out rather than deleted so the code is recoverable if it is ever genuinely designed. The pure half (carton_disclose.py) and its unit gate (test_carton_disclose.py) are left on disk untouched and are now unreferenced by the server.
 # @mcp.tool()
@@ -3675,23 +3957,12 @@ def activate_collection(collection_name: str, depth: int = 1, hub_cap: int = 30,
         # traceback.print_exc()
         # return f"❌ Error: {e}"
 
-@mcp.tool()
-def add_to_collection(
+@_carton_api.operation("add_to_collection")
+def _op_add_to_collection(
     collection_name: str,
     concept_names: List[str]
 ) -> str:
-    """Add concepts to an existing Carton_Collection
-
-    Creates HAS_PART relationships from the collection to the specified concepts,
-    and PART_OF relationships from concepts back to collection.
-
-    Args:
-        collection_name: Name of the collection to add concepts to
-        concept_names: List of concept names to add as members
-
-    Returns:
-        Result of adding concepts to collection
-    """
+    """The operation behind the `add_to_collection` tool — runs where the graph is; the tool renders its answer."""
     try:
         # Query to add HAS_PART and PART_OF relationships (both directions)
         # We use MERGE to avoid duplicate relationships
@@ -3751,6 +4022,42 @@ def add_to_collection(
         traceback.print_exc()
         return f"❌ Error adding to collection: {str(e)}"
 
+
+@mcp.tool()
+def add_to_collection(
+    collection_name: str,
+    concept_names: List[str]
+) -> str:
+    """Add concepts to an existing Carton_Collection
+
+    Creates HAS_PART relationships from the collection to the specified concepts,
+    and PART_OF relationships from concepts back to collection.
+
+    Args:
+        collection_name: Name of the collection to add concepts to
+        concept_names: List of concept names to add as members
+
+    Returns:
+        Result of adding concepts to collection
+    """
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("add_to_collection", {"collection_name": collection_name, "concept_names": concept_names})))
+
+@_carton_api.operation("list_collections")
+def _op_list_collections() -> dict:
+    """The operation behind the `list_collections` tool — where the graph is."""
+    try:
+        return utils.list_all_collections()
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def _render_list_collections(result: dict, **_params) -> str:
+    if result.get("success"):
+        return _fmt(result)
+    return f"❌ {result.get('error')}"
+
+
 @mcp.tool()
 def list_collections() -> str:
     """List all Carton_Collection concepts in the knowledge graph
@@ -3760,17 +4067,33 @@ def list_collections() -> str:
     Returns:
         JSON string with list of collections and their member counts
     """
-    try:
-        result = utils.list_all_collections()
+    return overflow_to_file(_render_list_collections(_carton_api.call_carton("list_collections", {})))
 
-        if result.get("success"):
-            return _fmt(result)
-        else:
-            return f"❌ {result.get('error')}"
+
+@_carton_api.operation("substrate_projector")
+def _op_substrate_projector(
+    substrate: dict = None,
+    target: str = None,
+    description_only: bool = True,
+    template: str = None,
+    get_instructions: bool = False
+) -> str:
+    """The operation behind the `substrate_projector` tool — runs where the graph is; the tool renders its answer."""
+    try:
+        from carton_mcp.substrate_projector import build_instructions, substrate_project
+
+        if get_instructions:
+            return build_instructions()
+
+        if substrate is None or target is None:
+            return "❌ Required: substrate (dict) and target (concept name). Use get_instructions=True for help."
+
+        result = substrate_project(substrate, target, description_only, template)
+        return f"✅ {result}"
 
     except Exception as e:
         traceback.print_exc()
-        return f"❌ Error: {e}"
+        return f"❌ Error: {str(e)}"
 
 
 @mcp.tool()
@@ -3791,21 +4114,7 @@ def substrate_projector(
                   If provided, renders concept through template before projecting
         get_instructions: If True, returns usage instructions
     """
-    try:
-        from carton_mcp.substrate_projector import build_instructions, substrate_project
-
-        if get_instructions:
-            return build_instructions()
-
-        if substrate is None or target is None:
-            return "❌ Required: substrate (dict) and target (concept name). Use get_instructions=True for help."
-
-        result = substrate_project(substrate, target, description_only, template)
-        return f"✅ {result}"
-
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ Error: {str(e)}"
+    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("substrate_projector", {"substrate": substrate, "target": target, "description_only": description_only, "template": template, "get_instructions": get_instructions})))
 
 
 def _ensure_daemon_running():
@@ -3824,8 +4133,17 @@ def _ensure_daemon_running():
 
 
 def main():
-    """Entry point for carton-mcp console script"""
-    _ensure_daemon_running()
+    """Entry point for carton-mcp console script.
+
+    `CARTON_URL` set: this MCP runs on the tenant's own machine and every tool becomes
+    `call_carton(<tool>, <args>)` to their box — the SDK runs there, the rendering here; no worker is
+    started on this machine. Unset: the self-hosted MCP, running the SDK in-process beside its own
+    worker.
+    """
+    if _carton_api.remote():
+        logger.info("carton MCP in client mode: every tool calls %s", os.environ["CARTON_URL"])
+    else:
+        _ensure_daemon_running()
     # Refuses 'sse' and the removed network transports; the only value it returns is stdio.
     # It is still CALLED rather than assumed, because that call is where those refusals live.
     mcp.run(transport=_resolve_transport())

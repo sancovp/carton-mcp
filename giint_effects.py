@@ -1,10 +1,9 @@
 """giint_effects — STORE-SIDE release-effect handlers for the GIINT readiness cascade.
 
 WHY THIS LIVES IN carton_mcp AND NOT IN llm_intelligence (e2e run-11, 2026-08-20):
-the giint write lane is remote-enqueue — `add_concept_tool.submit_queue_entry` POSTs
-every queue entry to the carton BOX's /enqueue whenever KUZU_QUERY_URL names a box,
-so the BOX's own observation_worker_daemon is the process that dispatches release
-effects for giint events. The box image is the LEAN 3-package shape BY RULING (the
+the giint write lane is a call on CartON's SDK at the box's door — `add_concept` runs
+IN the box and writes the box's own queue — so the BOX's own observation_worker_daemon
+is the process that dispatches release effects for giint events. The box image is the LEAN 3-package shape BY RULING (the
 2026-08-20 import-closure measurement: llm_intelligence transitively imports the
 entire ecosystem — cave, sanctuary_revolution, sdna, torch — so giint can never be
 installed in a tenant box). But the giint_ready stamp is not giint logic at all: it
