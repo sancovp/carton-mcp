@@ -177,17 +177,30 @@ def _as_result(value: Any) -> Any:
     return str(value)
 
 
+_meta_cache: Dict[str, Any] = {}
+
+
+def _meta(name: str, fn):
+    """The operation's own argument model — the same machinery the MCP builds a tool's schema with,
+    applied to the operation. An operation may take what its tool requires as optional (the SDK's
+    contract for programs, e.g. `add_concept`'s domains), so validation is against the operation."""
+    if name not in _meta_cache:
+        from mcp.server.fastmcp.utilities.func_metadata import func_metadata
+        _meta_cache[name] = func_metadata(fn)
+    return _meta_cache[name]
+
+
 def execute(operation: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """Run one operation IN THIS PROCESS: the params validated exactly as the MCP validates the
-    tool's arguments, then the operation's function. The server calls this for every `/call`; a
-    self-hosted `call_carton` calls it directly."""
+    """Run one operation IN THIS PROCESS: the params validated against the operation's own
+    signature exactly as the MCP validates a tool's arguments, then the operation's function. The
+    server calls this for every `/call`; a self-hosted `call_carton` calls it directly."""
     try:
         name = CartonOperation(operation).value
     except ValueError:
         raise CartonError(400, f"unknown operation {operation!r}; the operations are "
                                + ", ".join(op.value for op in CartonOperation)) from None
     fn = operations()[name]
-    meta = _tools()[name].fn_metadata
+    meta = _meta(name, fn)
     # A None is "not given": a tool's body forwards every argument, including the ones left at
     # their None default, and the MCP's argument model takes an omitted argument, not a null.
     given = {k: v for k, v in dict(params or {}).items() if v is not None}

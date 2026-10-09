@@ -38,11 +38,10 @@ it is used it caps the number of QUEUE FILES per iteration, not the number of co
    cannot log about itself, so the open is proven in a CHILD process first. 78 is EX_CONFIG and is
    listed in the box supervisord's `exitcodes`, so the program stays visibly EXITED instead of
    respawning.
-6. **Shared connection + query endpoint + linker thread** (`:1970-2016`) — `_create_shared_neo4j()`,
-   then `kuzu_query_endpoint.serve_in_thread(shared_neo4j._store, port)` **on every backend** (the
-   comment at `:1972-1991` records that this used to be gated on `GRAPH_BACKEND == kuzu` and that the
-   gate was removed because with the MCP server gone from the box this endpoint is the box's only
-   service surface), then a daemon `threading.Thread(target=linker_thread)`.
+6. **Shared connection + the SDK's door + linker thread** (`:1970-2016`) — `_create_shared_neo4j()`,
+   then `carton_api.serve_in_thread(port)` **on every backend**: the worker serves CartON's SDK
+   (`POST /call {operation, params}` behind `CARTON_KEY`) — with the MCP server gone from the box this
+   door is the box's only service surface — then a daemon `threading.Thread(target=linker_thread)`.
 
 **The batch write is `batch_create_concepts_neo4j` (`:307`)**, and it is where nearly all the graph
 semantics live. Order inside it is load-bearing:
@@ -148,7 +147,7 @@ Function-local: `heaven_base.tool_utils.neo4j_utils.KnowledgeGraphBuilder`; `hea
 network_edit_tool.EditHelper` + `heaven_base.baseheaventool.ToolError`; `carton_mcp.carton_kv.
 carry_forward_fences`; `carton_mcp.carton_utils.register_kv_schemas` / `set_concept_properties` /
 `CartOnUtils`; `carton_mcp.substrate_projector.compile_memory_tier`; `carton_mcp.chroma_client.
-chroma_index` / `chroma_route`; `carton_mcp.kuzu_query_endpoint.serve_in_thread`/`DEFAULT_PORT`/
+chroma_index` / `chroma_route`; `carton_mcp.carton_api.serve_in_thread`/`DEFAULT_PORT`/
 `required_key`; `carton_mcp.ontology_graphs._auto_create_task_hypercluster`; `carton_mcp.soma_fillers.
 park_fillable_requests` / `realize_composed_triples` / `park_compose_suggestions`;
 `llm_intelligence.pbml_lane.apply_pbml_move`/`match_trigger`; `odyssey.utils.dispatch_chain`.
@@ -244,7 +243,7 @@ CartON siblings: `add_concept_tool` (`normalize_concept_name`, `auto_link_descri
 `get_observation_queue_dir`, `_add_observation_worker`, `OBSERVATION_TAGS`), `carton_kv.
 carry_forward_fences`, `carton_utils` (`register_kv_schemas`, `set_concept_properties`, `CartOnUtils.
 get_all_concept_names`), `substrate_projector.compile_memory_tier`, `chroma_client` (`chroma_index`,
-`chroma_route`), `kuzu_query_endpoint` (`serve_in_thread`, `required_key`, `DEFAULT_PORT`),
+`chroma_route`), `carton_api` (`serve_in_thread`, `required_key`, `DEFAULT_PORT`),
 `ontology_graphs._auto_create_task_hypercluster`, `soma_fillers` (three functions).
 Cross-repo: `heaven_base.tools.network_edit_tool.EditHelper`, `llm_intelligence.pbml_lane`,
 `odyssey.utils.dispatch_chain`, and whatever module string a SOMA `release_effect` names (imported

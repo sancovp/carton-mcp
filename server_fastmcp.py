@@ -85,8 +85,9 @@ def _dedup_desc(text: str) -> str:
 _OVERFLOW_THRESHOLD = 10000  # chars before file overflow kicks in
 _OVERFLOW_DIR = Path(os.environ.get("HEAVEN_DATA_DIR", "/tmp/heaven_data")) / "query_overflow"
 # The overflow file is written where the AGENT is. In the process that serves CartON's API (the
-# worker in a box) this is False: the whole text travels to the caller, whose MCP proxy applies the
-# rule on its own disk (carton_api.proxy_tools) — a file inside the box is one the agent cannot open.
+# worker in a box) this is False: the whole text travels to the caller, whose TOOL applies the rule
+# on its own disk (`overflow_to_file` around the tool's result) — a file inside the box is one the
+# agent cannot open.
 WRITE_OVERFLOW_FILES = True
 
 
@@ -96,14 +97,17 @@ def overflow_to_file(text: str) -> str:
     if not WRITE_OVERFLOW_FILES or len(text) <= _OVERFLOW_THRESHOLD:
         return text
     _OVERFLOW_DIR.mkdir(parents=True, exist_ok=True)
-    overflow_file = _OVERFLOW_DIR / f"overflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    # microseconds and the pid: two answers in one second must never share a file
+    overflow_file = _OVERFLOW_DIR / f"overflow_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}.txt"
     overflow_file.write_text(text)
     return f"{text[:_OVERFLOW_THRESHOLD]}\n\n... Full results ({len(text)} chars) at: {overflow_file}"
 
 
 def _fmt(data) -> str:
-    """Format data as compact string. No JSON bloat. Overflows to file if > 10k chars."""
-    return overflow_to_file(_fmt_inner(data))
+    """Format data as compact string. No JSON bloat. It renders only: the ONE overflow of an answer is the
+    tool's (`overflow_to_file` around the tool's result), so an operation or a render that calls `_fmt`
+    never writes a file, and the file the tool writes holds the whole text."""
+    return _fmt_inner(data)
 
 from .carton_render import render_answer
 
@@ -545,13 +549,13 @@ def _check_observation_geometry(observation_data: dict) -> str | None:
 @_carton_api.operation("add_concept")
 def _op_add_concept(
     concept_name: str,
-    is_a: List[str],
-    part_of: List[str],
-    instantiates: List[str],
-    produces: List[str],
-    domain: str,
-    subdomain: str,
-    personal_domain: str,
+    is_a: Optional[List[str]] = None,
+    part_of: Optional[List[str]] = None,
+    instantiates: Optional[List[str]] = None,
+    produces: Optional[List[str]] = None,
+    domain: Optional[str] = None,
+    subdomain: Optional[str] = None,
+    personal_domain: Optional[str] = None,
     concept: str = None,
     relationships: Optional[List[ConceptRelationship]] = None,
     desc_update_mode: str = "append",
@@ -566,13 +570,14 @@ def _op_add_concept(
     domain_part_of: Optional[str] = None,
     subdomain_about: Optional[str] = None,
 ) -> str:
-    """The operation behind the `add_concept` tool — runs where the graph is; the tool renders its answer."""
-    # Shape gate (inert unless CARTON_NAME_EXPECTATIONS is set): if the agent fumbled a name whose
-    # partials we already know for sure, bounce a self-correction message back as the NORMAL result.
-    rej = _check_name_expectations(concept_name)
-    if rej:
-        return rej
-    if personal_domain not in PERSONAL_DOMAINS:
+    """The operation behind the `add_concept` tool — runs where the graph is; the tool renders its answer.
+
+    The SDK's contract for a PROGRAM: the four core relations and the three domains are optional here
+    (a program's record carries what it has; `add_concept_tool_func` has always kept them optional for
+    internal callers). The TOOL requires them of an agent. A None is "not given": no relationship is
+    built for it; an empty list given is written as given.
+    """
+    if personal_domain is not None and personal_domain not in PERSONAL_DOMAINS:
         return (
             f"❌ Invalid personal_domain '{personal_domain}'. Must be one of: "
             f"{', '.join(PERSONAL_DOMAINS)}"
@@ -584,6 +589,11 @@ def _op_add_concept(
         description = concept
         # desc_update_mode="path": concept field is a file path, read contents as description
         if desc_update_mode == "path" and description:
+            # A path is the CALLER's: the tool reads it on the caller's machine before calling. The
+            # process serving the API never reads its own disk for a caller.
+            if _carton_api.SERVING:
+                return ("ERROR: desc_update_mode='path' names a file on the caller's machine; the tool "
+                        "reads it there and sends the content — the server reads no file for a caller")
             from pathlib import Path as _Path
             p = _Path(description)
             if p.exists() and p.is_file():
@@ -591,16 +601,16 @@ def _op_add_concept(
                 desc_update_mode = "replace"  # file content replaces existing desc
             else:
                 return f"ERROR: desc_update_mode='path' but file not found: {description}"
-        # Build relationships from required params + optional custom rels
-        relationships_dict = [
-            {"relationship": "is_a", "related": list(is_a)},
-            {"relationship": "part_of", "related": list(part_of)},
-            {"relationship": "instantiates", "related": list(instantiates)},
-            {"relationship": "produces", "related": list(produces)},
-            {"relationship": "has_domain", "related": [domain]},
-            {"relationship": "has_subdomain", "related": [subdomain]},
-            {"relationship": "has_personal_domain", "related": [personal_domain]},
-        ]
+        # Build relationships from the core params that were GIVEN + optional custom rels
+        relationships_dict = []
+        for rel, given in (("is_a", is_a), ("part_of", part_of), ("instantiates", instantiates),
+                           ("produces", produces)):
+            if given is not None:
+                relationships_dict.append({"relationship": rel, "related": list(given)})
+        for rel, given in (("has_domain", domain), ("has_subdomain", subdomain),
+                           ("has_personal_domain", personal_domain)):
+            if given is not None:
+                relationships_dict.append({"relationship": rel, "related": [given]})
         if relationships:
             relationships_dict.extend([rel.model_dump() for rel in relationships])
 
@@ -725,6 +735,18 @@ def add_concept(
     Returns:
         Formatted result showing success/failure of file and Neo4j operations
     """
+    # Shape gate (inert unless CARTON_NAME_EXPECTATIONS is set, on the AGENT's machine): a fumbled
+    # name whose partials are known is bounced back as the NORMAL result, before anything is sent.
+    rej = _check_name_expectations(concept_name)
+    if rej:
+        return rej
+    # A path names a file on the AGENT's machine: read it here, send the content.
+    if desc_update_mode == "path" and concept:
+        from pathlib import Path as _Path
+        p = _Path(concept)
+        if not (p.exists() and p.is_file()):
+            return f"ERROR: desc_update_mode='path' but file not found: {concept}"
+        concept, desc_update_mode = p.read_text(), "replace"
     return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("add_concept", {"concept_name": concept_name, "is_a": is_a, "part_of": part_of, "instantiates": instantiates, "produces": produces, "domain": domain, "subdomain": subdomain, "personal_domain": personal_domain, "concept": concept, "relationships": relationships, "desc_update_mode": desc_update_mode, "hide_youknow": hide_youknow, "clear_stash": clear_stash, "source": source, "typed_values": typed_values, "old_str_for_edit_case": old_str_for_edit_case, "properties": properties, "soma_run_id": soma_run_id, "domain_about": domain_about, "domain_part_of": domain_part_of, "subdomain_about": subdomain_about})))
 
 
@@ -1261,8 +1283,9 @@ def _op_observe_from_identity_pov(observation_data: dict, agent_identity: str = 
         geometry_warning = _check_observation_geometry(observation_data)
 
         observation_data["hide_youknow"] = hide_youknow
-        # Env var takes priority (hardcoded identity). If unset, accept input.
-        resolved_identity = os.getenv('AGENT_IDENTITY') or agent_identity
+        # The identity is the CALLER's: the tool resolves its own AGENT_IDENTITY and passes it; this
+        # process's environment answers only when nothing was passed (the self-hosted case).
+        resolved_identity = agent_identity or os.getenv('AGENT_IDENTITY')
         if not resolved_identity:
             return "❌ No agent identity: set AGENT_IDENTITY env var or pass agent_identity param"
         agent_identity = resolved_identity
@@ -1381,6 +1404,8 @@ def observe_from_identity_pov(observation_data: dict, agent_identity: str = None
     Returns:
         Summary
     """
+    # Env var takes priority (hardcoded identity) — the AGENT's environment, resolved here, where the agent is.
+    agent_identity = os.getenv('AGENT_IDENTITY') or agent_identity
     return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("observe_from_identity_pov", {"observation_data": observation_data, "agent_identity": agent_identity, "hide_youknow": hide_youknow})))
 
 
@@ -2014,7 +2039,11 @@ def query_cb_math(cb_command: str) -> str:
     Returns:
         The CB shell's rendered view string (or a loud error string on failure).
     """
-    return overflow_to_file(_carton_api.as_text(_carton_api.call_carton("query_cb_math", {"cb_command": cb_command})))
+    # THE CB SHELL IS THE AGENT'S, not the box's: it listens on the agent's machine (CARTON_CB_FLOW_URL,
+    # default localhost:3000) with the agent's key file, and the operation touches no graph — so the tool
+    # runs the passthrough HERE. Hosted, a box holds no CB service; the operation stays registered for the
+    # self-hosted process, where "here" and "the box" are the same machine.
+    return overflow_to_file(_op_query_cb_math(cb_command))
 
 @_carton_api.operation("get_concept_network")
 def _op_get_concept_network(concept_name: str, depth: int = 1, rel_types: List[str] = None) -> dict:

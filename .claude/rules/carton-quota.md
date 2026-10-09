@@ -5,6 +5,11 @@ limit a tenant can read, unset or edit is not a limit.
 
 NO-OP UNLESS `CARTON_MAX_NODES` IS SET. Unset means no gate, no import, zero queries. A quota never appears uninvited.
 
+THE LIMIT IS READ ONCE, FROM THE ENVIRONMENT THE BOX STARTED WITH. `call_gate` snapshots `os.environ` at load and
+counts with that snapshot; a write into the worker's live environment — from the wire or from any operation — lifts
+nothing (`substrate_projector` type `env` refuses in the serving process besides). A limit a tenant can write is not a
+limit.
+
 REFUSE GROWTH, NOT REFINEMENT. The gate fires on `add_concept` only. At or over quota, an `add_concept` of an
 EXISTING concept still passes — `add_concept` is also the update path — and `set_properties` and every read pass at
 any size; only a NEW concept raises `QuotaExceeded`, answered as 402 with the limit, the count and the upgrade path.

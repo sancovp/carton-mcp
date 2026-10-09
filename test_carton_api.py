@@ -18,7 +18,7 @@ WHAT IT PINS:
   t_f  the metering seam: CARTON_CALL_GATE refuses with 402; unset, there is no gate; a bad spec fails loud
   t_g  call_carton with no CARTON_URL runs in-process; with one, it crosses the wire and the server's
        HEAVEN_DATA_DIR is the one written — the two-machine split: the box writes, the client never does
-  t_h  proxy_tools makes every MCP tool a remote call and keeps its schema; the result is the server's
+  t_h  every MCP tool is call_carton(<its name>, <its arguments>) + a render; the result is the server's
   t_i  a real operation end to end: add_concept over the wire lands in the SERVER's queue and
        query_wiki_graph answers rows (ladybug; skipped without it)
 """

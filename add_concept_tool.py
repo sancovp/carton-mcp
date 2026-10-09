@@ -2848,6 +2848,23 @@ def add_concept_tool_func(
     if not relationships or len(relationships) == 0:
         raise Exception("ERROR: There is no reason you cannot put a WIP is_a, part_of, or has_type. Relationships cannot be empty or none.")
 
+    # THE SDK'S WRITE FRONT DOOR ROUTES ITSELF. With `CARTON_URL` set this process is a client of a
+    # box — SOMA's vault, the summarizers, dragonbones, every program that calls this function — and
+    # the write is the box's `add_concept` operation, which runs THIS function in the box (the breaker,
+    # SOMA, the guards, the queue all happen there). The process that serves the API never routes.
+    # What travels is the SDK's own parameters; the local-only ones (the cache, the connection, the
+    # healing flag, the target descriptions, CB guidance) stay here, where they have meaning.
+    from carton_mcp import carton_api
+    if carton_api.remote() and not carton_api.SERVING:
+        return carton_api.call_carton("add_concept", {
+            "concept_name": concept_name, "concept": description, "relationships": relationships,
+            "desc_update_mode": desc_update_mode, "hide_youknow": hide_youknow, "source": source,
+            "typed_values": typed_values, "old_str_for_edit_case": old_str_for_edit_case,
+            "properties": properties, "domain": domain, "subdomain": subdomain,
+            "personal_domain": personal_domain, "produces": produces, "domain_about": domain_about,
+            "domain_part_of": domain_part_of, "subdomain_about": subdomain_about,
+        })
+
     # CIRCUIT BREAKER (sancrev issue 62 — Isaac's ruling, verbatim: "The circuit
     # breaker just has to be on add_concept it has to like actually tell them when
     # it errors to stop calling and report this to the user. then heaven agents

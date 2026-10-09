@@ -1626,7 +1626,17 @@ class CartOnUtils:
             return {"success": False, "error": str(e)}
 
     def query_wiki_graph(self, cypher_query: str, parameters: dict = None) -> dict:
-        """Execute arbitrary Cypher query on :Wiki namespace (read-only)"""
+        """Execute arbitrary Cypher query on :Wiki namespace (read-only).
+
+        THE SDK'S READ FRONT DOOR ROUTES ITSELF: with `CARTON_URL` set this process is a client of a
+        box, so the read is the box's `query_wiki_graph` operation — every program that holds
+        `CartOnUtils` reaches its box without knowing. The process that serves the API never routes
+        (it IS the box).
+        """
+        from carton_mcp import carton_api
+        if carton_api.remote() and not carton_api.SERVING:
+            return carton_api.call_carton("query_wiki_graph",
+                                          {"cypher_query": cypher_query, "parameters": parameters or {}})
         logger.info(f"Executing wiki graph query: {cypher_query[:100]}...")
         try:
             validation = self._validate_query_safety(cypher_query)

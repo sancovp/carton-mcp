@@ -317,7 +317,16 @@ def project_to_registry(substrate: RegistrySubstrate, content: str) -> str:
 
 
 def project_to_env(substrate: EnvSubstrate, content: str) -> str:
-    """Project content to environment variable"""
+    """Project content to environment variable — in the caller's own process, never the server's.
+
+    The process serving CartON's API is the box's worker, and its environment is the operator's
+    configuration (the key, the paths, the metering); a projection into it from the wire is refused.
+    """
+    from carton_mcp import carton_api
+    if carton_api.SERVING:
+        raise ValueError(
+            f"env projection of {substrate.var_name!r} refused: this process serves CartON's API and its "
+            "environment is the operator's; project into an environment you run")
     os.environ[substrate.var_name] = content
     return f"Set env var {substrate.var_name}"
 

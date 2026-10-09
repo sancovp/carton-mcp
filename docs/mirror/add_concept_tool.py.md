@@ -12,7 +12,7 @@
 - **sealed:** v4, key `d240df2fbf17db8b`, commit `b80684b69`, valid from 2026-10-01T07:39:36
 - **ranges in this module** (layer order):
  - `L0 enqueue` · `add_concept_tool.py:3383-3456` — the queue payload built by the front door after the SOMA POST: raw_concept with is_soup, is_code, is_system_type, unmet_dchains, fired_chains, release_effects, fillable_requests, composed_triples, compose_suggestions and the merged properties, handed to submit_queue_entry
- - `L0 enqueue` · `add_concept_tool.py:838-864` — get_observation_queue_dir and submit_queue_entry: the ONE writer of the queue directory inside carton, local file when KUZU_QUERY_URL is empty, POST to the box enqueue route otherwise; Isaac 2026-09-26: the queue only exists inside carton and is never used by anything that is not carton or SOMA
+ - `L0 enqueue` · `add_concept_tool.py:838-864` — get_observation_queue_dir and submit_queue_entry: the ONE writer of the queue directory inside carton, always a local file — the queue exists only on the machine that holds the graph (the box's worker drains it); a program off the box reaches it through `add_concept_tool_func`, which is `call_carton("add_concept", …)` when `CARTON_URL` is set; the queue is never used by anything that is not carton or SOMA
 - **also passes through:** `observation_worker_daemon.py`
 
 ### Carton_Soma_Verdict_Relay — feature boundary of `Carton_Soma_Verdict_Relay`
